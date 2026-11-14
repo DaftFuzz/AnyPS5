@@ -1,11 +1,14 @@
 #include "prx/libSceAgcDriver/Backend/include/GpuBackend.h"
+#include "prx/libSceAgcDriver/Backend/include/NestedChanges.hpp"
 
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
+#include <shared_mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -131,11 +134,58 @@ void ChainsCallsLabelsAndFlips() {
     api->destroy(backend);
 }
 
+struct SentNotice {
+    char kind;
+    bool lockFree;
+    bool operator==(const SentNotice&) const = default;
+};
+
+void NestedChangeNotices(bool defer, std::vector<SentNotice>& sent, std::size_t& heldInside) {
+    std::shared_mutex lock;
+    AgcDriver::Kyty::NestedChanges<char> changes;
+    const auto take = [&] { lock.lock(); };
+    const auto release = [&] { lock.unlock(); };
+    const auto send = [&](char kind) {
+        bool lockFree = false;
+        std::thread reader([&] {
+            lockFree = lock.try_lock_shared();
+            if (lockFree) lock.unlock_shared();
+        });
+        reader.join();
+        sent.push_back(SentNotice{kind, lockFree});
+    };
+    changes.Notify(defer, 'a', send);
+    changes.Begin(take);
+    changes.Notify(defer, 'u', send);
+    changes.Begin(take);
+    changes.End(release, send);
+    changes.Notify(defer, 'm', send);
+    heldInside = changes.Held();
+    Require(changes.Open(), "the outer change is still open after the nested one ends");
+    changes.End(release, send);
+    changes.Notify(defer, 'p', send);
+    Require(!changes.Open() && changes.Held() == 0, "nothing is held once the outer change ends");
+}
+
+void NestedChangesReachTheBackendAfterTheLock() {
+    std::vector<SentNotice> sent;
+    std::size_t heldInside = 0;
+    NestedChangeNotices(true, sent, heldInside);
+    Require(heldInside == 2, "the nested unmap and map wait for the outer change");
+    Require(sent == std::vector<SentNotice>{{'a', true}, {'u', true}, {'m', true}, {'p', true}}, "every notice is sent with the protection lock free, in the order the changes made them");
+
+    sent.clear();
+    NestedChangeNotices(false, sent, heldInside);
+    Require(heldInside == 0, "without deferral nothing is held");
+    Require(sent == std::vector<SentNotice>{{'a', true}, {'u', false}, {'m', false}, {'p', true}}, "without deferral the nested notices are sent under the lock");
+}
+
 }
 
 int main() {
     try {
         ChainsCallsLabelsAndFlips();
+        NestedChangesReachTheBackendAfterTheLock();
     } catch (const std::exception& error) {
         std::cerr << "null GPU backend test failed: " << error.what() << "\n";
         return 1;

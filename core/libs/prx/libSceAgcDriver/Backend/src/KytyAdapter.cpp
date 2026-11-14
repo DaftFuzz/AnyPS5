@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Backend/include/KytyAdapter.hpp"
 #include "prx/libSceAgcDriver/Backend/include/GpuBackend.h"
+#include "prx/libSceAgcDriver/Backend/include/NestedChanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameDumpIo.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -104,7 +105,7 @@ void Print(const char* format, auto... args) {
     std::fflush(stderr);
 }
 
-enum class PendingKind { Unmap, Map, Shader };
+enum class PendingKind { Unmap, Map, Shader, Protect };
 
 struct PendingChange {
     PendingKind kind = PendingKind::Map;
@@ -239,7 +240,17 @@ class Adapter;
 std::atomic<Adapter*> g_adapter{nullptr};
 std::atomic<void*> g_selfCheckPage{nullptr};
 std::atomic<bool> g_selfCheckServed{false};
-thread_local int g_changeDepth = 0;
+thread_local NestedChanges<PendingChange> g_changes;
+
+bool DeferNestedChanges() {
+    static const bool defer = [] {
+        const char* value = std::getenv("APS5_KYTY_NO_DEFERRED_UNMAP");
+        const bool off = value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+        if (off) Print("[kyty] APS5_KYTY_NO_DEFERRED_UNMAP: backend notices of nested memory changes are sent under the protection lock\n");
+        return !off;
+    }();
+    return defer;
+}
 
 class Adapter {
 public:
@@ -315,7 +326,18 @@ public:
         case PendingKind::Shader:
             if (api->register_shader(backend, &change.shader) != APS5_GPU_OK) throw std::runtime_error("the GPU backend refused a shader");
             break;
+        case PendingKind::Protect:
+            api->memory_protect(backend, change.address, change.bytes, change.protection);
+            break;
         }
+    }
+
+    void Notice(const PendingChange& change) {
+        if (change.kind != PendingKind::Protect) {
+            Deliver(change);
+            return;
+        }
+        if (Created()) Send(change);
     }
 
     std::string backendSource;
@@ -684,7 +706,7 @@ int HostProtectGuest(void*, std::uint64_t address, std::uint64_t bytes, std::uin
     if (!AbOn(AbSwitch::LeanCounters)) adapter.counts.protectGuest.fetch_add(1, std::memory_order_relaxed);
     DWORD previous = 0;
     const auto protect = [&] { return VirtualProtect(reinterpret_cast<void*>(address), static_cast<SIZE_T>(bytes), protection, &previous) ? APS5_GPU_OK : APS5_GPU_ERROR; };
-    if (g_changeDepth != 0) return protect();
+    if (g_changes.Open()) return protect();
     if (AbOn(AbSwitch::ProtectSrw)) {
         AcquireSRWLockShared(&adapter.protectSrw);
         const int result = protect();
@@ -727,30 +749,34 @@ const char* HostAppContentVersion(void*) {
 
 void ChangeBegin(std::uintptr_t address, std::size_t bytes, std::uint32_t kind, bool hadPages) {
     auto& adapter = A();
+    const auto send = [&](const PendingChange& change) { adapter.Notice(change); };
     if (kind != GuestArena::GuestArenaChangeProtect && hadPages) {
-        adapter.Deliver(PendingChange{PendingKind::Unmap, address, bytes, 0, 0, {}});
+        g_changes.Notify(DeferNestedChanges(), PendingChange{PendingKind::Unmap, address, bytes, 0, 0, {}}, send);
         adapter.counts.unmaps.fetch_add(1, std::memory_order_relaxed);
         adapter.generation.fetch_add(1, std::memory_order_acq_rel);
     }
-    if (g_changeDepth++ == 0) {
+    g_changes.Begin([&] {
         adapter.protectLock.lock();
         AcquireSRWLockExclusive(&adapter.protectSrw);
-    }
+    });
 }
 
 void ChangeEnd(std::uintptr_t address, std::size_t bytes, std::uint32_t kind, std::uint32_t protection, std::uint64_t directOffset, bool succeeded) {
     auto& adapter = A();
-    if (--g_changeDepth == 0) {
-        ReleaseSRWLockExclusive(&adapter.protectSrw);
-        adapter.protectLock.unlock();
-    }
+    const auto send = [&](const PendingChange& change) { adapter.Notice(change); };
+    g_changes.End(
+        [&] {
+            ReleaseSRWLockExclusive(&adapter.protectSrw);
+            adapter.protectLock.unlock();
+        },
+        send);
     if (!succeeded) return;
     if (kind == GuestArena::GuestArenaChangeMap) {
-        adapter.Deliver(PendingChange{PendingKind::Map, address, bytes, protection, directOffset == GuestArena::GuestArenaNoSectionOffset ? APS5_GPU_NOT_DIRECT : directOffset, {}});
+        g_changes.Notify(DeferNestedChanges(), PendingChange{PendingKind::Map, address, bytes, protection, directOffset == GuestArena::GuestArenaNoSectionOffset ? APS5_GPU_NOT_DIRECT : directOffset, {}}, send);
         adapter.counts.maps.fetch_add(1, std::memory_order_relaxed);
         adapter.generation.fetch_add(1, std::memory_order_acq_rel);
     } else if (kind == GuestArena::GuestArenaChangeProtect) {
-        if (adapter.Created()) adapter.api->memory_protect(adapter.backend, address, bytes, protection);
+        g_changes.Notify(DeferNestedChanges(), PendingChange{PendingKind::Protect, address, bytes, protection, 0, {}}, send);
         adapter.counts.protects.fetch_add(1, std::memory_order_relaxed);
     }
 }
