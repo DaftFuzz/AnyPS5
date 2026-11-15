@@ -329,9 +329,14 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 		if (threads % 64u != 0u) reason = "partial wave";
 		// One invocation per guest lane: 1024 invocations leave 64 registers each (65536 per SM),
 		// which measured slower than two lanes per invocation (fc6f8c56 1.92 -> 2.04 ms).
-		if (threads > 512u) reason = "over 512 threads (register cap)";
+		// (Over 512 threads the rule pairs only under KYTY_PERF_PAIR_MULTIWAVE_THREADS=1024.)
+		if (threads > 512u && !(program.pair_by_rule && !listed)) reason = "over 512 threads (register cap)";
 		if (state.program.info.compute_derivatives) reason = "compute derivatives";
 		if (program.dispatcher_fallback) reason = "dispatcher";
+		// Several waves per workgroup: the two subgroups of a wave meet only in the spin exchanges, so a lane-ordered
+		// returning LDS atomic (EmitAtomic32) would lose its order between the halves.
+		const bool multiwave = threads > 64u && !listed;
+		if (multiwave && state.program.info.ordered_lds_atomics) reason = "ordered LDS atomics (multi-wave)";
 		for (const auto* block: program.blocks) {
 			for (const auto& inst: *block) {
 				switch (inst.GetOpcode()) {
@@ -349,15 +354,17 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 			// Barrier exchanges: one guest wave per workgroup only (larger groups' waves may branch apart).
 			const bool spin = (input_info.compute->compute_variant & ComputeVariantPairSpin) != 0;
 			state.pair_barrier = threads == 64u && !spin;
+			state.pair_lds_handshake = !state.pair_barrier && multiwave;
 			if (!listed) NoteRulePaired(program.shader_hash);
 		}
 		// (The pair rule pairs many compute shaders: their lines are capped.)
 		static std::atomic_uint rule_logged {0};
 		if (listed || Common::EnvRead::PerfLines() || rule_logged.fetch_add(1, std::memory_order_relaxed) < 64u) {
-			std::fprintf(stderr, "WAVE64_PAIR hash=%016llx threads=%u %s%s%s%s\n",
+			std::fprintf(stderr, "WAVE64_PAIR hash=%016llx threads=%u %s%s%s%s%s\n",
 			             static_cast<unsigned long long>(program.shader_hash), threads,
 			             reason == nullptr ? "paired" : "kept two lanes: ", reason == nullptr ? "" : reason,
-			             state.pair_barrier ? " barrier" : "", listed ? "" : " (rule)");
+			             state.pair_barrier ? " barrier" : "", state.pair_lds_handshake ? " lds_handshake" : "",
+			             listed ? "" : " (rule)");
 		}
 	}
 	DefineModule(state);

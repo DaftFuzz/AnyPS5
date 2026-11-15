@@ -1,5 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
+#include "common/shaderEnv.h"
+
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -154,8 +156,46 @@ bool WavePairRequested(uint64_t shader_hash) {
 // the halves (EmitPairLdsWriteSync), without which the blur CS 099c56ee made black particles.
 constexpr size_t PairRuleMinWords = 2048;
 
+// KYTY_PERF_PAIR_MULTIWAVE=<guest code words>: also pair a compute shader whose workgroup is several whole guest waves
+// (64 < threads <= 512) once its guest code has that many words. Such a workgroup cannot take the barrier exchanges
+// (its guest waves branch apart), so it uses the spin exchanges, and the LDS order between the two halves of a wave is
+// kept by a pair handshake instead of the barrier (EmitPairLdsBarrier). Driver time is the reason: a two-lane module
+// doubles the ALU of every block, and the giants of this form spend 9-19 s each in vkCreateComputePipelines.
+uint32_t PairMultiwaveMinWords() {
+	static const uint32_t words = [] {
+		const char* value = Common::ShaderEnv::Read("KYTY_PERF_PAIR_MULTIWAVE");
+		if (value == nullptr || value[0] == '\0') return 0u;
+		char*               end    = nullptr;
+		const unsigned long number = std::strtoul(value, &end, 10);
+		if (end == value || *end != '\0' || number > 0xffffffffull) {
+			std::fprintf(stderr, "PERF_PAIR_MULTIWAVE='%s' is not a decimal number of guest code words; off\n", value);
+			return 0u;
+		}
+		if (number != 0) std::fprintf(stderr, "PERF_PAIR_MULTIWAVE enabled min_words=%lu\n", number);
+		return static_cast<uint32_t>(number);
+	}();
+	return words;
+}
+
+// KYTY_PERF_PAIR_MULTIWAVE_THREADS: the largest workgroup the multi-wave rule pairs (default 512; 1024 leaves 64
+// registers per invocation, which measured slower on the GPU for smaller shaders: a compile-time measurement).
+uint32_t PairMultiwaveMaxThreads() {
+	static const uint32_t threads = [] {
+		const char* value = Common::ShaderEnv::Read("KYTY_PERF_PAIR_MULTIWAVE_THREADS");
+		const auto  limit = value == nullptr ? 512ul : std::strtoul(value, nullptr, 10);
+		return limit >= 1024ul ? 1024u : 512u;
+	}();
+	return threads;
+}
+
+bool WavePairMultiwave(uint32_t threads, size_t code_words) {
+	const auto min_words = PairMultiwaveMinWords();
+	return min_words != 0u && threads > 64u && threads <= PairMultiwaveMaxThreads() && threads % 64u == 0u &&
+	       code_words >= min_words;
+}
+
 bool WavePairRule(uint32_t threads, size_t code_words) {
-	return threads == 64u && code_words >= PairRuleMinWords;
+	return (threads == 64u && code_words >= PairRuleMinWords) || WavePairMultiwave(threads, code_words);
 }
 
 // The shaders the rule paired (KYTY_DIAG_TWIN_DISPATCH=rule twins them).
@@ -234,7 +274,7 @@ void EmitPairInitialize(EmitterState& state) {
 	                                                 spv::MemorySemanticsWorkgroupMemoryMask));
 }
 
-uint32_t EmitPairExchange(EmitterState& state, uint32_t value) {
+uint32_t EmitPairExchange(EmitterState& state, uint32_t value, uint32_t memory) {
 	// Both halves of a guest wave execute the same exchanges in the same order (all branches are
 	// whole-wave decisions), so a per-invocation sequence number pairs them. Two parity slots
 	// suffice: a half overwrites a slot only after reading its partner's next value, which the
@@ -251,9 +291,9 @@ uint32_t EmitPairExchange(EmitterState& state, uint32_t value) {
 	const auto scope    = ConstantU32(state, spv::ScopeWorkgroup);
 	const auto relaxed  = ConstantU32(state, spv::MemorySemanticsMaskNone);
 	const auto release  = ConstantU32(state, spv::MemorySemanticsReleaseMask |
-	                                             spv::MemorySemanticsWorkgroupMemoryMask);
+	                                             spv::MemorySemanticsWorkgroupMemoryMask | memory);
 	const auto acquire  = ConstantU32(state, spv::MemorySemanticsAcquireMask |
-	                                             spv::MemorySemanticsWorkgroupMemoryMask);
+	                                             spv::MemorySemanticsWorkgroupMemoryMask | memory);
 	// The value (a vote, a ballot, one lane's value) and the sequence number are the same in the whole subgroup, so every
 	// invocation publishes them: no branch. The order against the partner comes from the barrier or the spin below.
 	state.builder.AddFunction(spv::OpAtomicStore,
