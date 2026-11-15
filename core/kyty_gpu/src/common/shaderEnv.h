@@ -98,6 +98,7 @@ inline constexpr const char* OutputOnlyNames[] = {
     "KYTY_PERF_NULL_SLOT_RUNTIME_FORMAT",
     "KYTY_PERF_NULL_SLOT_SEED",
     // The background compiles' reuse store (shaderPrecompile.cpp): the same SPIR-V, made earlier.
+    "KYTY_PERF_SAMPLER_PAD",
     "KYTY_PERF_SHADER_REUSE_MB",
     // Table-mode pipelines made in the background: the key a lookup asks for, not what a key makes.
     "KYTY_PERF_TABLE_ASYNC",
