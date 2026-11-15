@@ -5810,13 +5810,13 @@ bool BufferCache::CopyHandbackOn() {
 }
 
 bool BufferCache::DeadRingWouldFree(uint64_t vaddr) {
-	if (vaddr < 0x2002600000ull || vaddr >= 0x2010000000ull || g_ring_frames < 3) return false;
-	const uint64_t page       = vaddr & ~uint64_t {0xfff};
-	const uint64_t prev_start = g_ring_frame_ticks[(g_ring_frames - 2) % g_ring_frame_ticks.size()];
-	bool           live       = false;
-	m_gpu_modified_ranges.ForEachInRange(page, 4096, [&](uint64_t start, uint64_t end) {
-		const uint64_t tick = QueryWriteTick(start, end);
-		if (!(tick != 0 && tick < prev_start)) live = true;
+	const uint64_t write_frame = g_ring_game_write_frame.load(std::memory_order_acquire);
+	if (vaddr < 0x2002600000ull || vaddr >= 0x2010000000ull || write_frame < 2) return false;
+	if (RingDeadDownload() != 0) return false;
+	bool live = false;
+	m_gpu_modified_ranges.ForEachInRange(vaddr & ~uint64_t {0xfff}, 4096, [&](uint64_t start, uint64_t end) {
+		const uint64_t frame1 = QueryTicks(m_write_frames, start, end);
+		if (!(frame1 != 0 && frame1 + 1u <= write_frame)) live = true;
 	});
 	return !live;
 }

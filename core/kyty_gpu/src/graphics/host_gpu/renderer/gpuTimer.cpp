@@ -313,7 +313,6 @@ void Accumulate(State& s, const Chunk& chunk) {
 			if (it == by_marker.end()) by_marker.push_back({to - from, marker});
 			else it->first += to - from;
 			// The buffer's programs: (kind, hash) as in the GPUTIME_TOP lines, with their time and calls in this buffer.
-			const auto& command = chunk.commands[index];
 			auto prog = std::find_if(by_program.begin(), by_program.end(),
 			                         [&](const auto& e) { return e.kind == command.kind && e.a == command.a; });
 			if (prog == by_program.end()) by_program.push_back({command.kind, command.a, to - from, 1u});

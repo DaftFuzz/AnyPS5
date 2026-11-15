@@ -46,6 +46,7 @@ void RenderDocOnGuestFlip(RenderContext& /*renderer*/) {}
 
 // As perfSampler.cpp's own build without the sampler.
 void PerfSamplerStartForCurrentThread() {}
+void PerfSamplerStartForResolveThread() {}
 void PerfReportTcLockPcs() {}
 void CpuProbeReport() {}
 
