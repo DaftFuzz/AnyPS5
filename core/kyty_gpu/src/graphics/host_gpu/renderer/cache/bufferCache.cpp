@@ -1600,6 +1600,14 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 						*defer                = plan.tick;
 						*copy_defer           = plan.copy_tick;
 						caller_timer.deferred = true;
+						// KYTY_PERF_COPY_CHAIN: the hand-back copy starts now and the GPU runs it once the tick finished;
+						// the faulting thread waits for the tick, its priority completions and the copy, then applies.
+						if (plan.buffer != nullptr && CopyHandbackOn() && CopyChainOn()) {
+							if (const uint64_t copy_tick = StartCopyReadback(plan, vaddr, is_write, true); copy_tick != 0) {
+								*copy_defer = copy_tick;
+								m_caller_stats.copy_chained.fetch_add(1, std::memory_order_relaxed);
+							}
+						}
 						return;
 					}
 					m_caller_stats.exhausted.fetch_add(1, std::memory_order_relaxed);
@@ -1875,6 +1883,14 @@ BufferCache::CallerPlan BufferCache::PlanCallerWait(uint64_t vaddr, uint64_t siz
 		return plan;
 	}
 	plan.tick = newest;
+	if (CopyChainOn()) { // KYTY_PERF_COPY_CHAIN: the download it would make once `newest` finished
+		plan.buffer    = &buffer;
+		plan.lo        = lo;
+		plan.hi        = hi;
+		plan.newest    = newest;
+		plan.total     = total;
+		plan.intervals = std::move(intervals);
+	}
 	return plan;
 }
 
@@ -5977,13 +5993,39 @@ bool BufferCache::DeadRingWouldFree(uint64_t vaddr) {
 	return !live;
 }
 
-uint64_t BufferCache::StartCopyReadback(CallerPlan& plan, uint64_t vaddr, bool is_write) {
+// KYTY_PERF_COPY_CHAIN=1 (G3, design-gpuwait 2.2; default 0, off; live A/B switch; with KYTY_PERF_COPY_HANDBACK): a
+// guest fault whose bytes still wait for their write tick T starts its hand-back copy in the first trip, submitted to wait
+// for T, instead of handing back with T and starting the copy when the request comes again. The window enters the
+// hand-back state at issue, as for a copy of finished bytes (barGpuCopy.h), and the faulting thread waits for T, the
+// priority completions up to it and the copy, then applies. Declined (the plain hand-back with T) as StartCopyReadback
+// declines, and also while an asynchronous publish of guest bytes (NotePendingGuestWrite) over the window is pending:
+// such a publish runs after its tick on the CPU and must not land after the copy.
+static uint32_t CopyChainFixed() {
+	static const uint32_t value = [] {
+		const char* text = std::getenv("KYTY_PERF_COPY_CHAIN");
+		const bool  on   = text != nullptr && text[0] == '1';
+		if (on) std::fprintf(stderr, "PERF_COPY_CHAIN=1: hand-back copies of unfinished bytes start at the first request, chained to the write tick\n");
+		return on ? 1u : 0u;
+	}();
+	return value;
+}
+
+bool BufferCache::CopyChainOn() {
+	return Common::LiveAb::Gate(Common::LiveAb::Switch::CopyChain, CopyChainFixed()) != 0;
+}
+
+uint64_t BufferCache::StartCopyReadback(CallerPlan& plan, uint64_t vaddr, bool is_write, bool chained) {
 	auto&      s       = m_caller_stats;
 	const auto decline = [&] {
 		s.copy_declined.fetch_add(1, std::memory_order_relaxed);
 		return uint64_t {0};
 	};
 	if (plan.buffer == nullptr || plan.intervals.empty() || !g_bar_copy_queue || !m_append_pools.empty()) return decline();
+	if (chained) {
+		for (const auto& write: m_pending_guest_writes) {
+			if (write.start < plan.hi && plan.lo < write.end && !write.done->load(std::memory_order_acquire)) return decline();
+		}
+	}
 	// Only what TryBarDownload would copy with the GPU; a smaller download is read from the mapping at once.
 	const uint32_t gpu_copy_kb = Common::LiveAb::Gate(Common::LiveAb::Switch::BarGpuCopy, BarGpuCopyFixed());
 	if (!((gpu_copy_kb != 0 && plan.total >= (uint64_t {gpu_copy_kb} << 10u)) || plan.total > BarMaxBytes)) return decline();

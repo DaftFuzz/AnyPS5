@@ -628,7 +628,7 @@ private:
 		// KYTY_PERF_COPY_HANDBACK: copies started and handed back; requests handed back for a copy already under way;
 		// requests it could have served but did not (small, no plan, no slot, dead ring, overlap); waits of the GPU
 		// thread for such a copy (its own readers, a download over the window).
-		std::atomic<uint64_t> copy_issued {0}, copy_joined {0}, copy_declined {0}, copy_exec_waits {0};
+		std::atomic<uint64_t> copy_issued {0}, copy_joined {0}, copy_declined {0}, copy_exec_waits {0}, copy_chained {0};
 	};
 	CallerWaitStats m_caller_stats;
 	// KYTY_RECORD_KEYED_VERIFY: pages of the written record-keyed ranges listed per frame (a ring of frames, rotated by
@@ -921,7 +921,8 @@ private:
 	// the window without GPU-dirty bytes and without bytes of another unfinished readback leave the GPU-modified
 	// state, run by run. DeadRingWouldFree: DropDeadRingBytes's answer for the page, without changing anything.
 	[[nodiscard]] static bool CopyHandbackOn();
-	[[nodiscard]] uint64_t    StartCopyReadback(CallerPlan& plan, uint64_t vaddr, bool is_write);
+	[[nodiscard]] static bool CopyChainOn(); // KYTY_PERF_COPY_CHAIN (bufferCache.cpp, before StartCopyReadback)
+	[[nodiscard]] uint64_t    StartCopyReadback(CallerPlan& plan, uint64_t vaddr, bool is_write, bool chained = false);
 	[[nodiscard]] bool        EagerDone(const EagerReadback& entry) const;
 	void                      UnmarkPublishedWindow(uint64_t lo, uint64_t hi);
 	[[nodiscard]] bool        DeadRingWouldFree(uint64_t vaddr);

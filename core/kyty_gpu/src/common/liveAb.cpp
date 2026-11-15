@@ -102,6 +102,9 @@ constexpr SwitchInfo Switches[] = {
     // Per adoption check: whether guest commands queued during its GPU waits run inside the wait (the check then runs
     // again) or after the operation; the verdict is that of a pass without commands either way.
     {Switch::ServeInWait, "KYTY_PERF_SERVE_IN_WAIT", 1},
+    // Per request: whether a hand-back copy of unfinished bytes starts at the first request (chained to the write tick)
+    // or at the second; either way the window is in the hand-back state while the copy is under way.
+    {Switch::CopyChain, "KYTY_PERF_COPY_CHAIN", 1},
     // Project 15 way B P1 (test switch): a read-only buffer binding with a ready plan entry whose proof holds takes the
     // binding the helper computed (handle, aligned offset, range, offset byte, record stride) instead of RebindBuffers'.
 };
