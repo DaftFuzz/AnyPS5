@@ -826,6 +826,7 @@ void DeclareBdaEntryShare(EmitterState& state);
 void FindScalarLoadGroups(EmitterState& state);
 void DefineIndirectFormattedLoadFunctions(ValueEmitContext& ctx);
 void DefineIndirectRawDword(ValueEmitContext& ctx);
+void ApplyHelperInline(EmitterState& state, std::vector<uint32_t>& module);
 void DefineIndirectStoreFunctions(ValueEmitContext& ctx);
 void DefineBvhIntersect(EmitterState& state);
 // Upstream bfd4c34b8 / 5eab0ec73 (spirvEmitterTrinityBvh.cpp): BVH8 intersections and the BVH stack.

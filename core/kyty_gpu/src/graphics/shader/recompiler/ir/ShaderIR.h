@@ -1057,6 +1057,36 @@ enum class EmitLds : uint8_t { None, Function, Workgroup, Storage };
 	}
 }
 
+enum class HelperInlineRule : uint8_t { Loads, Size, All };
+
+[[nodiscard]] inline const char* HelperInlineRuleName(HelperInlineRule rule) {
+	switch (rule) {
+		case HelperInlineRule::Size: return "size";
+		case HelperInlineRule::All: return "all";
+		default: return "loads";
+	}
+}
+
+struct HelperInlineStats {
+	HelperInlineRule rule       = HelperInlineRule::Loads;
+	uint16_t         helpers    = 0;
+	uint16_t         inlined    = 0;
+	uint16_t         by_loads   = 0;
+	uint16_t         by_size    = 0;
+	uint16_t         kept_share = 0;
+	uint16_t         kept_sites = 0;
+};
+
+[[nodiscard]] inline std::array<char, 192> HelperInlineFields(const HelperInlineStats& stats) {
+	std::array<char, 192> text {};
+	std::snprintf(text.data(), text.size(),
+	              "inline_rule=%s helpers=%u inlined=%u inline_loads=%u inline_size=%u kept_share=%u kept_sites=%u",
+	              HelperInlineRuleName(stats.rule), static_cast<unsigned>(stats.helpers), static_cast<unsigned>(stats.inlined),
+	              static_cast<unsigned>(stats.by_loads), static_cast<unsigned>(stats.by_size),
+	              static_cast<unsigned>(stats.kept_share), static_cast<unsigned>(stats.kept_sites));
+	return text;
+}
+
 struct CompiledShaderInfo {
 	ShaderType                    stage               = ShaderType::Unknown;
 	uint64_t                      shader_hash         = 0;
@@ -1071,6 +1101,7 @@ struct CompiledShaderInfo {
 	EmitForm                      emit_form           = EmitForm::Unknown;
 	EmitLds                       emit_lds            = EmitLds::None;
 	uint32_t                      spirv_words         = 0;
+	HelperInlineStats             helper_inline;
 };
 
 struct UniformFillPlan {
@@ -1230,6 +1261,7 @@ struct Program: ResourcePlan {
 	Bindings                      bindings;
 	EmitForm                      emit_form = EmitForm::Unknown;
 	EmitLds                       emit_lds  = EmitLds::None;
+	HelperInlineStats             helper_inline;
 
 };
 

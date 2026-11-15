@@ -2919,6 +2919,163 @@ static spv::FunctionControlMask IndirectRawControl(const EmitterState& state) {
 	return loads <= RawInlineMaxLoads ? spv::FunctionControlInlineMask : spv::FunctionControlDontInlineMask;
 }
 
+namespace {
+
+struct HelperInlineSettings {
+	IR::HelperInlineRule rule          = IR::HelperInlineRule::Loads;
+	uint32_t             share_percent = 15;
+	uint32_t             max_sites     = 128;
+};
+
+bool SwitchOn(const char* value) {
+	return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+uint32_t SettingNumber(const char* name, const char* value, uint32_t fallback) {
+	if (value == nullptr || value[0] == '\0') return fallback;
+	char*               end    = nullptr;
+	const unsigned long number = std::strtoul(value, &end, 10);
+	if (end == value || *end != '\0' || number > 0xffffffffull) {
+		std::fprintf(stderr, "PERF_INLINE_BY_SIZE %s='%s' is not a decimal number; %u used\n", name, value, fallback);
+		return fallback;
+	}
+	return static_cast<uint32_t>(number);
+}
+
+const HelperInlineSettings& InlineSettings() {
+	static const HelperInlineSettings settings = [] {
+		HelperInlineSettings result;
+		if (SwitchOn(Common::ShaderEnv::Read("KYTY_DIAG_INLINE_ALL"))) {
+			result.rule = IR::HelperInlineRule::All;
+		} else if (SwitchOn(Common::ShaderEnv::Read("KYTY_PERF_INLINE_BY_SIZE"))) {
+			result.rule = IR::HelperInlineRule::Size;
+		}
+		result.share_percent =
+		    SettingNumber("KYTY_PERF_INLINE_SHARE", Common::ShaderEnv::Read("KYTY_PERF_INLINE_SHARE"), result.share_percent);
+		result.max_sites = SettingNumber("KYTY_PERF_INLINE_MAX_SITES", Common::ShaderEnv::Read("KYTY_PERF_INLINE_MAX_SITES"),
+		                                 result.max_sites);
+		if (result.rule == IR::HelperInlineRule::All) {
+			std::fprintf(stderr, "DIAG_INLINE_ALL enabled (every raw-load helper Inline, measurement only)\n");
+		} else if (result.rule == IR::HelperInlineRule::Size) {
+			std::fprintf(stderr, "PERF_INLINE_BY_SIZE enabled share=%u%% max_sites=%u\n", result.share_percent,
+			             result.max_sites);
+		}
+		return result;
+	}();
+	return settings;
+}
+
+struct InlineHelper {
+	uint32_t id      = 0;
+	size_t   control = 0;
+	uint64_t words   = 0;
+	uint64_t sites   = 0;
+	bool     decided = false;
+	bool     inlined = false;
+};
+
+struct InlineCall {
+	uint32_t caller = 0;
+	uint32_t callee = 0;
+	uint64_t count  = 0;
+};
+
+} // namespace
+
+void ApplyHelperInline(EmitterState& state, std::vector<uint32_t>& module) {
+	std::vector<InlineHelper> helpers;
+	const auto add = [&](uint32_t id) {
+		if (id != 0u && std::ranges::none_of(helpers, [&](const InlineHelper& h) { return h.id == id; })) {
+			helpers.push_back({.id = id});
+		}
+	};
+	add(state.indirect_raw_function);
+	add(state.indirect_raw_coherent_function);
+	for (const auto id: state.indirect_raw_group_functions) add(id);
+	auto& stats = state.program.helper_inline;
+	stats       = {};
+	stats.rule  = InlineSettings().rule;
+	if (helpers.empty()) return;
+	const auto find = [&](uint32_t id) -> InlineHelper* {
+		for (auto& h: helpers) {
+			if (h.id == id) return &h;
+		}
+		return nullptr;
+	};
+	std::vector<InlineCall> calls;
+	uint32_t                current = 0;
+	size_t                  start   = 0;
+	for (size_t i = 5; i < module.size();) {
+		const uint32_t count  = module[i] >> spv::WordCountShift;
+		const uint32_t opcode = module[i] & spv::OpCodeMask;
+		EXIT_IF(count == 0u || i + count > module.size());
+		if (opcode == spv::OpFunction) {
+			current = module[i + 2];
+			start   = i;
+			if (auto* h = find(current)) h->control = i + 3;
+		} else if (opcode == spv::OpFunctionEnd) {
+			if (auto* h = find(current)) h->words = i + 1 - start;
+			current = 0;
+		} else if (opcode == spv::OpFunctionCall && find(module[i + 3]) != nullptr) {
+			const uint32_t callee = module[i + 3];
+			auto it = std::ranges::find_if(calls, [&](const InlineCall& c) { return c.caller == current && c.callee == callee; });
+			if (it == calls.end()) {
+				calls.push_back({.caller = current, .callee = callee, .count = 1});
+			} else {
+				++it->count;
+			}
+		}
+		i += count;
+	}
+	const auto&    settings = InlineSettings();
+	const uint64_t total    = module.size();
+	constexpr auto     Inline   = static_cast<uint32_t>(spv::FunctionControlInlineMask);
+	constexpr auto     Hints    = Inline | static_cast<uint32_t>(spv::FunctionControlDontInlineMask);
+	for (bool progress = true; progress;) {
+		progress = false;
+		for (auto& h: helpers) {
+			if (h.decided || h.control == 0u) continue;
+			const bool ready = std::ranges::all_of(calls, [&](const InlineCall& c) {
+				const auto* caller = c.callee == h.id ? find(c.caller) : nullptr;
+				return caller == nullptr || caller->decided;
+			});
+			if (!ready) continue;
+			h.sites = 0;
+			for (const auto& c: calls) {
+				if (c.callee != h.id) continue;
+				const auto* caller = find(c.caller);
+				h.sites += c.count * (caller != nullptr && caller->inlined ? caller->sites : 1u);
+			}
+			h.decided      = true;
+			progress       = true;
+			const auto old = module[h.control];
+			if ((old & Inline) != 0u) {
+				h.inlined = true;
+				++stats.by_loads;
+			} else if (settings.rule == IR::HelperInlineRule::All) {
+				h.inlined = true;
+			} else if (settings.rule == IR::HelperInlineRule::Size) {
+				if (h.sites > settings.max_sites) {
+					++stats.kept_sites;
+				} else if (h.sites * h.words * 100u > static_cast<uint64_t>(settings.share_percent) * total) {
+					++stats.kept_share;
+				} else {
+					h.inlined = true;
+				}
+			}
+			if (h.inlined && (old & spv::FunctionControlInlineMask) == 0u) {
+				module[h.control] = (old & ~Hints) | spv::FunctionControlInlineMask;
+				++stats.by_size;
+			}
+		}
+	}
+	for (const auto& h: helpers) {
+		if (h.control == 0u) continue;
+		++stats.helpers;
+		if (h.inlined) ++stats.inlined;
+	}
+}
+
 void DefineIndirectRawDword(ValueEmitContext& ctx) {
 	auto& state = ctx.state;
 	if (state.bda_pointer_function == 0u) return;

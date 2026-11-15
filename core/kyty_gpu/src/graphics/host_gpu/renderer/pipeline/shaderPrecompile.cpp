@@ -2750,11 +2750,11 @@ void ShaderPrecompiler::Compile(const PrecompileStageRecord& record, uint64_t ke
 		                         std::max(record.compute.threads_num[2], 1u);
 		std::fprintf(stderr,
 		             "SHADER_PRECOMPILE hash=0x%016llx %.0fms (driver %.0fms) spirv_words=%zu key=%s kind=compute form=%s "
-		             "lds=%s lds_dwords=%u threads=%u wave=%u forced_lds=%d created=%d replaced=%d\n",
+		             "lds=%s lds_dwords=%u threads=%u wave=%u forced_lds=%d created=%d replaced=%d %s\n",
 		             static_cast<unsigned long long>(record.shader_hash), ms, create_ms, spirv_words, HexKey(key).c_str(),
 		             ShaderRecompiler::IR::EmitFormName(program.emit_form), ShaderRecompiler::IR::EmitLdsName(program.emit_lds),
 		             record.compute.lds_size_dwords, threads, program.wave_size, forced_lds ? 1 : 0, created ? 1 : 0,
-		             replaced ? 1 : 0);
+		             replaced ? 1 : 0, ShaderRecompiler::IR::HelperInlineFields(program.helper_inline).data());
 		std::fflush(stderr);
 	} else if (ms >= 1000.0 || replaced) {
 		std::fprintf(stderr, "SHADER_PRECOMPILE hash=0x%016llx %.0fms (driver %.0fms) spirv_words=%zu%s\n",

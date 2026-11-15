@@ -40,6 +40,7 @@ inline constexpr const char* Names[] = {
     "KYTY_DIAG_BINDLESS_PLACEHOLDER_CENSUS",
     "KYTY_DIAG_INDIRECT_FORMAT_CENSUS",
     "KYTY_DIAG_INDIRECT_FORMAT_CENSUS_HASHES",
+    "KYTY_DIAG_INLINE_ALL",
     "KYTY_DIAG_MOV_NO_FLOAT_MODS",
     "KYTY_DIAG_NULL_FORMATTED_STICKY",
     "KYTY_DIAG_PROBE",
@@ -59,6 +60,9 @@ inline constexpr const char* Names[] = {
     "KYTY_PERF_BDA_ENTRY_SHARE_HASHES",
     "KYTY_PERF_BINDLESS_CLASSES",
     "KYTY_PERF_F16_CVT_PLAIN",
+    "KYTY_PERF_INLINE_BY_SIZE",
+    "KYTY_PERF_INLINE_MAX_SITES",
+    "KYTY_PERF_INLINE_SHARE",
     "KYTY_PERF_SPIRV_STORE_OUTLINE",
     "KYTY_PERF_SRT_GPU_WORDS",
     // pipelineCache.cpp: the driver cache's signature (the warm list file is dropped with it).

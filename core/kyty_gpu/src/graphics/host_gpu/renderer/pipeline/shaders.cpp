@@ -992,12 +992,15 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 			const auto* ps       = ps_active && ps_input_info->stage ? ps_input_info->stage.program : nullptr;
 			std::fprintf(stderr,
 			             "PIPELINE_TIME %s vs=0x%016llx ps=0x%016llx %.0fms created_ago=%.0f/%.0fms kind=graphics source=%s "
-			             "vs_spirv_words=%u ps_spirv_words=%u vs_form=%s vs_lds=%s\n",
+			             "vs_spirv_words=%u ps_spirv_words=%u vs_form=%s vs_lds=%s vs_inlined=%u/%u ps_inlined=%u/%u\n",
 			             background ? "graphics-background" : "graphics", static_cast<unsigned long long>(stats_vs),
 			             static_cast<unsigned long long>(stats_ps), create_ms, ShaderCreatedMsAgo(stats_vs),
 			             ShaderCreatedMsAgo(stats_ps), background ? "precompile" : "runtime", vs.spirv_words,
 			             ps != nullptr ? ps->spirv_words : 0u, ShaderRecompiler::IR::EmitFormName(vs.emit_form),
-			             ShaderRecompiler::IR::EmitLdsName(vs.emit_lds));
+			             ShaderRecompiler::IR::EmitLdsName(vs.emit_lds), static_cast<unsigned>(vs.helper_inline.inlined),
+			             static_cast<unsigned>(vs.helper_inline.helpers),
+			             ps != nullptr ? static_cast<unsigned>(ps->helper_inline.inlined) : 0u,
+			             ps != nullptr ? static_cast<unsigned>(ps->helper_inline.helpers) : 0u);
 		} else {
 			std::fprintf(stderr, "PIPELINE_TIME %s vs=0x%016llx ps=0x%016llx %.0fms created_ago=%.0f/%.0fms\n",
 			             background ? "graphics-background" : "graphics", static_cast<unsigned long long>(stats_vs),
@@ -1163,12 +1166,12 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 			                         std::max(input_info.threads_num[2], 1u);
 			std::fprintf(stderr,
 			             "PIPELINE_TIME %s cs=0x%016llx %.0fms created_ago=%.0fms kind=compute source=%s spirv_words=%u "
-			             "form=%s lds=%s lds_dwords=%u threads=%u wave=%u\n",
+			             "form=%s lds=%s lds_dwords=%u threads=%u wave=%u %s\n",
 			             background ? "compute-background" : "compute", static_cast<unsigned long long>(stats_cs),
 			             create_ms, ShaderCreatedMsAgo(stats_cs), background ? "precompile" : "runtime", program.spirv_words,
 			             ShaderRecompiler::IR::EmitFormName(program.emit_form),
 			             ShaderRecompiler::IR::EmitLdsName(program.emit_lds), input_info.lds_size_dwords, threads,
-			             program.wave_size);
+			             program.wave_size, ShaderRecompiler::IR::HelperInlineFields(program.helper_inline).data());
 		} else {
 			std::fprintf(stderr, "PIPELINE_TIME %s cs=0x%016llx %.0fms created_ago=%.0fms\n",
 			             background ? "compute-background" : "compute",

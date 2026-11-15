@@ -154,6 +154,7 @@ CompiledShaderInfo Program::TakeCompiledInfo() && {
 	    .bindings        = std::move(bindings),
 	    .emit_form       = emit_form,
 	    .emit_lds        = emit_lds,
+	    .helper_inline   = helper_inline,
 	};
 	for (const auto& output: result.info.outputs) {
 		if (output.kind == StageOutputKind::Parameter && output.index < 32) {
