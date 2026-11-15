@@ -438,7 +438,10 @@ int HandleFault(Aps5GpuBackend* /*backend*/, uint64_t address, uint32_t access) 
 	if (!Libs::LibKernel::Memory::HandleGpuFault(kind, address)) {
 		return APS5_GPU_FAULT_NOT_MINE;
 	}
-	if (trace_start != 0) Graphics::HTrace::NoteFault(Graphics::HTrace::FaultLayer::Outer, kind == Graphics::PageFaultAccess::Write, trace_start);
+	if (trace_start != 0) {
+		Graphics::HTrace::NoteFault(Graphics::HTrace::FaultLayer::Outer, kind == Graphics::PageFaultAccess::Write, trace_start);
+		Graphics::HTrace::NoteFaultPage(address, kind == Graphics::PageFaultAccess::Write);
+	}
 	b.counts.faults_handled.fetch_add(1, std::memory_order_relaxed);
 	if (!Graphics::GuestGpu::IsGpuThread() && b.counts.guest_faults.fetch_add(1, std::memory_order_relaxed) == 0) {
 		Log("first tracker fault served on a thread of AnyPS5's: address 0x%llx, %s",

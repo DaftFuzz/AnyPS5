@@ -53,12 +53,23 @@ struct State {
 	Counter               fault_exec;
 	Counter               fault_other;
 	Counter               fault_outer;
+	Counter               fault_outer_write;
 	Counter               flip_wait;
 	std::atomic<uint64_t> pac_ranges {0};
 	std::atomic<uint64_t> pac_changed {0};
 	std::mutex                             pages_mutex;
 	std::unordered_map<uint64_t, uint32_t> pages;
 	int64_t                                pages_report_us = 0;
+	struct FaultPage {
+		uint32_t faults = 0;
+		uint32_t writes = 0;
+		uint32_t frames = 0;
+		uint64_t last_flip = 0;
+	};
+	std::mutex                              fault_pages_mutex;
+	std::unordered_map<uint64_t, FaultPage> fault_pages;
+	uint64_t                                fault_pages_first_flip = 0;
+	int64_t                                 fault_pages_report_us  = 0;
 };
 
 State& S() {
@@ -146,11 +157,12 @@ void NoteFlipDone() {
 	const auto fe       = s.fault_exec.Take();
 	const auto fo       = s.fault_other.Take();
 	const auto fx       = s.fault_outer.Take();
+	const auto fxw      = s.fault_outer_write.Take();
 	const auto fw       = s.flip_wait.Take();
 	const auto flip     = s.flips.fetch_add(1, std::memory_order_relaxed) + 1;
 	std::fprintf(stderr,
 	             "HT f=%llu t=%lld rd=%lld rp=%lld pd=%lld q0r=%lld q0d=%lld anyr=%lld sub=%llu/%llu fg=%llu/%llu fe=%llu/%llu "
-	             "fo=%llu/%llu fx=%llu/%llu fw=%llu/%llu pac=%llu/%llu\n",
+	             "fo=%llu/%llu fx=%llu/%llu fxw=%llu/%llu fw=%llu/%llu pac=%llu/%llu\n",
 	             static_cast<unsigned long long>(flip), static_cast<long long>(now), static_cast<long long>(Since(now, ready)),
 	             static_cast<long long>(Since(present, ready)), static_cast<long long>(Since(now, present)),
 	             static_cast<long long>(q0_ready), static_cast<long long>(Since(q0_done, previous)),
@@ -161,6 +173,7 @@ void NoteFlipDone() {
 	             static_cast<unsigned long long>(fe.first), static_cast<unsigned long long>(fe.second),
 	             static_cast<unsigned long long>(fo.first), static_cast<unsigned long long>(fo.second),
 	             static_cast<unsigned long long>(fx.first), static_cast<unsigned long long>(fx.second),
+	             static_cast<unsigned long long>(fxw.first), static_cast<unsigned long long>(fxw.second),
 	             static_cast<unsigned long long>(fw.first), static_cast<unsigned long long>(fw.second),
 	             static_cast<unsigned long long>(s.pac_changed.exchange(0, std::memory_order_relaxed)),
 	             static_cast<unsigned long long>(s.pac_ranges.exchange(0, std::memory_order_relaxed)));
@@ -181,15 +194,80 @@ void NoteFlipDone() {
 		}
 		std::fprintf(stderr, "\n");
 	}
+	std::vector<std::pair<uint64_t, State::FaultPage>> fault_top;
+	uint64_t                                           window_frames = 0;
+	{
+		std::scoped_lock lock(s.fault_pages_mutex);
+		if (s.fault_pages_first_flip == 0) {
+			s.fault_pages_first_flip = flip;
+			s.fault_pages_report_us  = now;
+		} else if (now - s.fault_pages_report_us >= 5000000) {
+			window_frames            = flip - s.fault_pages_first_flip;
+			s.fault_pages_first_flip = flip;
+			s.fault_pages_report_us  = now;
+			fault_top.assign(s.fault_pages.begin(), s.fault_pages.end());
+			s.fault_pages.clear();
+		}
+	}
+	if (window_frames != 0) {
+		uint64_t faults = 0;
+		uint64_t every  = 0;
+		uint64_t every_faults = 0;
+		uint64_t band_pages[4] {};
+		uint64_t band_faults[4] {};
+		uint64_t band_writes[4] {};
+		for (const auto& [page, stat]: fault_top) {
+			faults += stat.faults;
+			if (stat.frames * 10u >= window_frames * 9u) {
+				every++;
+				every_faults += stat.faults;
+			}
+			const uint64_t share = stat.frames * 100u / window_frames;
+			const int      band  = share >= 90u ? 0 : share >= 40u ? 1 : share >= 10u ? 2 : 3;
+			band_pages[band]++;
+			band_faults[band] += stat.faults;
+			band_writes[band] += stat.writes;
+		}
+		std::fprintf(stderr, "HT_FAULT_BANDS frames=%llu", static_cast<unsigned long long>(window_frames));
+		static constexpr const char* BandNames[4] = {"ge90", "40to90", "10to40", "lt10"};
+		for (int band = 0; band < 4; band++) {
+			std::fprintf(stderr, " %s=pages:%llu,faults:%llu,writes:%llu", BandNames[band], static_cast<unsigned long long>(band_pages[band]),
+			             static_cast<unsigned long long>(band_faults[band]), static_cast<unsigned long long>(band_writes[band]));
+		}
+		std::fprintf(stderr, "\n");
+		std::sort(fault_top.begin(), fault_top.end(), [](const auto& a, const auto& b) { return a.second.faults > b.second.faults; });
+		std::fprintf(stderr, "HT_FAULT_PAGES frames=%llu pages=%zu faults=%llu every_frame_pages=%llu every_frame_faults=%llu top",
+		             static_cast<unsigned long long>(window_frames), fault_top.size(), static_cast<unsigned long long>(faults),
+		             static_cast<unsigned long long>(every), static_cast<unsigned long long>(every_faults));
+		for (size_t i = 0; i < fault_top.size() && i < 24u; i++) {
+			std::fprintf(stderr, " 0x%llx:%u/%u:w%u", static_cast<unsigned long long>(fault_top[i].first << 12u),
+			             fault_top[i].second.faults, fault_top[i].second.frames, fault_top[i].second.writes);
+		}
+		std::fprintf(stderr, "\n");
+	}
+}
+
+void NoteFaultPage(uint64_t address, bool write) {
+	if (!Enabled()) return;
+	auto&            s    = S();
+	const auto       flip = s.flips.load(std::memory_order_relaxed) + 1;
+	std::scoped_lock lock(s.fault_pages_mutex);
+	auto&            page = s.fault_pages[address >> 12u];
+	page.faults++;
+	if (write) page.writes++;
+	if (page.last_flip != flip) {
+		page.last_flip = flip;
+		page.frames++;
+	}
 }
 
 void NoteFault(FaultLayer layer, bool write, int64_t start_us) {
-	(void)write;
 	if (!Enabled()) return;
 	auto&      s     = S();
 	const auto spent = NowUs() - start_us;
 	if (layer == FaultLayer::Outer) {
 		s.fault_outer.Add(spent);
+		if (write) s.fault_outer_write.Add(spent);
 	} else if (GuestGpu::IsGpuThread()) {
 		s.fault_exec.Add(spent);
 	} else if (LibKernel::PthreadSelfOrNull() != nullptr) {

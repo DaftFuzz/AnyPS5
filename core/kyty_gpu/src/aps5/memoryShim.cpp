@@ -55,6 +55,19 @@ static bool IsGpuAddressRange(uint64_t vaddr, uint64_t size) {
 	return Graphics::GuestRange {vaddr, size}.Valid();
 }
 
+// KYTY_PERF_COMPARE_LOCKFREE=1 (default 0; live A/B switch): CompareBackingBatch finds each span's backing bytes in the
+// calling thread's cached slot (TryCachedOffset, as TryReadBacking does) without the map's shared lock; a span the slot
+// does not hold, and every span after it, takes the locked lookup as before. Same bytes compared, same verdict.
+static uint32_t CompareLockFreeFixed() {
+	static const uint32_t value = [] {
+		const char* text = std::getenv("KYTY_PERF_COMPARE_LOCKFREE");
+		const bool  on   = text != nullptr && text[0] == '1';
+		if (on) std::fprintf(stderr, "PERF_COMPARE_LOCKFREE=1: read-log compares use the cached backing slot without the map lock\n");
+		return on ? 1u : 0u;
+	}();
+	return value;
+}
+
 // Based on TheCruZ/KytyPS5-GTA daaf45201 (memory.cpp), GPL-2.0, as in Kyty's memory.cpp: one bit per committed 4 KiB page
 // of the GPU-visible windows, so that the GPU threads clamp the buffers they bind without a lock.
 class CommittedPageMap {
@@ -383,10 +396,28 @@ public:
 		if (!IsAvailable()) {
 			return CompareResult::Unknown;
 		}
+		size_t start = 0;
+		if (Common::LiveAb::Gate(Common::LiveAb::Switch::CompareLockFree, CompareLockFreeFixed()) != 0) {
+			for (; start < count; ++start) {
+				const auto& span   = spans[start];
+				uint64_t    offset = 0;
+				if (span.expected == nullptr || span.size == 0 || UINT64_MAX - span.vaddr < span.size ||
+				    !TryCachedOffset(span.vaddr, span.size, &offset)) {
+					break;
+				}
+				*first_bad = start;
+				if (std::memcmp(m_backing_base + offset, span.expected, static_cast<size_t>(span.size)) != 0) {
+					return CompareResult::Different;
+				}
+			}
+			if (start == count) {
+				return CompareResult::Equal;
+			}
+		}
 		std::shared_lock lock(m_mutex);
 		Entry            mapping {};
 		bool             have_mapping = false;
-		for (size_t i = 0; i < count; ++i) {
+		for (size_t i = start; i < count; ++i) {
 			const auto& span = spans[i];
 			*first_bad       = i;
 			if (span.expected == nullptr || span.size == 0 || UINT64_MAX - span.vaddr < span.size) {

@@ -13,10 +13,13 @@ namespace Libs::Graphics::HTrace {
 //      q0d=<previous done->first queue-0 submission after it, before this done>
 //      anyr=<as q0r, for a submission of any queue> sub=<queue-0 submissions>/<other queues>
 //      fg=<guest-thread faults>/<us in the handler> fe=<execution-thread faults>/<us> fo=<other threads' faults>/<us>
-//      fx=<faults served by the outer handler>/<us there> fw=<flip-done waits>/<us> pac=<ranges changed after copy>/<ranges>
+//      fx=<faults served by the outer handler>/<us there> fxw=<the write faults among them>/<us> fw=<flip-done waits>/<us> pac=<ranges changed after copy>/<ranges>
 // where "ready" is the flip's GPU work done (CompleteFlip), "present start" the moment the presenter takes the frame
 // and "done" the moment the flip is visible to the guest (its flip status counts it). The per-frame counts cover the
-// time since the previous HT line. Every ~5 s an "HT_PAC" line lists the 64 KiB pages with the most changed ranges.
+// time since the previous HT line. Every ~5 s an "HT_PAC" line lists the 64 KiB pages with the most changed ranges, and
+// an "HT_FAULT_PAGES" line the 4 KiB pages the outer fault handler served in that window: frames in the window, distinct
+// pages, faults, pages that faulted in at least 90 % of the frames (and their faults), then the top pages as
+// address:faults/frames-with-a-fault:w<writes>.
 [[nodiscard]] bool Enabled();
 [[nodiscard]] int64_t NowUs();
 
@@ -27,6 +30,7 @@ void NoteFlipReady();
 void NoteFlipPresentBegin();
 void NoteFlipDone();
 void NoteFault(FaultLayer layer, bool write, int64_t start_us);
+void NoteFaultPage(uint64_t address, bool write);
 void NoteFlipWait(int64_t start_us);
 void NotePacRanges(uint64_t ranges);
 void NotePacChanged(uint64_t address, uint64_t size);

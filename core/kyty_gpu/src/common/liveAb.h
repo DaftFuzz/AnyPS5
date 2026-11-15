@@ -48,6 +48,7 @@ enum class Switch : uint32_t {
 	DiagTablesAssume,          // KYTY_DIAG_TABLES_ASSUME_UNCHANGED (measurement only, APPROXIMATION)
 	DiagAdoptAssume,           // KYTY_DIAG_ADOPT_ASSUME_UNCHANGED (measurement only, APPROXIMATION)
 	AdoptRuns,
+	CompareLockFree,       // KYTY_PERF_COMPARE_LOCKFREE (aps5/memoryShim.cpp, CompareBackingBatch)
 	Count
 };
 
