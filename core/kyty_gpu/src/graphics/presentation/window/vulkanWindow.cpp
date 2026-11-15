@@ -933,6 +933,26 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		extended_dynamic_state.pNext = const_cast<void*>(create_info.pNext);
 		create_info.pNext = &extended_dynamic_state;
 	}
+	vk::PhysicalDeviceDynamicRenderingUnusedAttachmentsFeaturesEXT unused_attachments {};
+	graphics.unused_attachments_enabled = false;
+	if (HasExtension(device_extensions, VK_EXT_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_EXTENSION_NAME)) {
+		vk::PhysicalDeviceDynamicRenderingUnusedAttachmentsFeaturesEXT supported_unused {};
+		vk::PhysicalDeviceFeatures2                                    unused_query {};
+		unused_query.pNext = &supported_unused;
+		physical_device.getFeatures2(&unused_query);
+		if (supported_unused.dynamicRenderingUnusedAttachments == VK_TRUE) {
+			unused_attachments.dynamicRenderingUnusedAttachments = VK_TRUE;
+			unused_attachments.pNext                             = const_cast<void*>(create_info.pNext);
+			create_info.pNext                                    = &unused_attachments;
+			graphics.unused_attachments_enabled                  = true;
+		} else {
+			std::erase_if(enabled_extensions, [](const char* name) {
+				return std::strcmp(name, VK_EXT_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_EXTENSION_NAME) == 0;
+			});
+		}
+	}
+	std::fprintf(stderr, "PERF_SHARE_ATTACHMENT_SETS switch=%d unused_attachments=%d\n",
+	             Common::EnvRead::ShareAttachmentSets() ? 1 : 0, graphics.unused_attachments_enabled ? 1 : 0);
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
 	create_info.enabledExtensionCount   = static_cast<uint32_t>(enabled_extensions.size());
@@ -1410,6 +1430,10 @@ void WindowContext::CreateVulkan() {
 		    HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
+		}
+		if (Common::EnvRead::ShareAttachmentSets() &&
+		    HasExtension(available_extensions, VK_EXT_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_EXTENSION_NAME);
 		}
 		Vr::OpenXrAppendExtensions(device_extensions, available_extensions, true);
 	}

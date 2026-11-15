@@ -1169,6 +1169,86 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 extern "C" int __llvm_profile_write_file(void);
 #endif
 
+namespace {
+
+struct FrameGapTotals {
+	uint64_t frames   = 0;
+	uint64_t gaps100  = 0;
+	uint64_t gaps250  = 0;
+	uint64_t gaps1000 = 0;
+	double   sum100   = 0.0;
+	double   sum250   = 0.0;
+	double   sum1000  = 0.0;
+	double   freeze   = 0.0;
+	double   longest  = 0.0;
+
+	void Add(double ms) {
+		frames++;
+		if (ms >= 100.0) {
+			gaps100++;
+			sum100 += ms;
+			freeze += ms - 33.0;
+		}
+		if (ms >= 250.0) {
+			gaps250++;
+			sum250 += ms;
+		}
+		if (ms >= 1000.0) {
+			gaps1000++;
+			sum1000 += ms;
+		}
+		longest = std::max(longest, ms);
+	}
+
+	void Print(const char* scope, double age, double span_s) const {
+		std::fprintf(stderr,
+		             "FRAME_GAP %s t=%.1f span_s=%.1f frames=%llu gaps100=%llu/%.0fms gaps250=%llu/%.0fms "
+		             "gaps1000=%llu/%.0fms freeze_ms=%.0f longest_ms=%.0f\n",
+		             scope, age, span_s, static_cast<unsigned long long>(frames), static_cast<unsigned long long>(gaps100),
+		             sum100, static_cast<unsigned long long>(gaps250), sum250, static_cast<unsigned long long>(gaps1000),
+		             sum1000, freeze, longest);
+	}
+};
+
+void TraceFrameGap(uint32_t frame) {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_TRACE_FRAME_GAP");
+		return Common::EnvRead::PerfLines() || (value != nullptr && value[0] == '1');
+	}();
+	if (!on) return;
+	static FrameGapTotals window;
+	static FrameGapTotals total;
+	static bool           started = false;
+	static auto           last    = std::chrono::steady_clock::now();
+	static auto           window_start = last;
+	static auto           total_start  = last;
+	const auto            now          = std::chrono::steady_clock::now();
+	if (!started) {
+		started      = true;
+		last         = now;
+		window_start = now;
+		total_start  = now;
+		return;
+	}
+	const double ms = std::chrono::duration<double, std::milli>(now - last).count();
+	last            = now;
+	window.Add(ms);
+	total.Add(ms);
+	const double age = Common::StartupTrace::ProcessAge();
+	if (ms >= 100.0) {
+		std::fprintf(stderr, "FRAME_GAP gap frame=%u t=%.2f ms=%.0f\n", frame, age, ms);
+	}
+	if (now - window_start >= std::chrono::seconds(10)) {
+		window.Print("window", age, std::chrono::duration<double>(now - window_start).count());
+		total.Print("total", age, std::chrono::duration<double>(now - total_start).count());
+		std::fflush(stderr);
+		window       = {};
+		window_start = now;
+	}
+}
+
+} // namespace
+
 static void TraceFrameTime(uint32_t frame) {
 #if defined(KYTY_PGO_GENERATE)
 	// KYTY_PGO_WRITE_FRAME=<n> (instrumented PGO builds only): write the profile (LLVM_PROFILE_FILE) at every n-th
@@ -1182,6 +1262,7 @@ static void TraceFrameTime(uint32_t frame) {
 		std::fprintf(stderr, "PGO_PROFILE_WRITTEN frame=%u result=%d\n", frame, result);
 	}
 #endif
+	TraceFrameGap(frame);
 	static const bool on = [] {
 		const char* value = std::getenv("KYTY_TRACE_FRAMETIME");
 		return value != nullptr && value[0] == '1';

@@ -2592,6 +2592,8 @@ void GuestGpu::Enqueue(Submission submission) {
 		if (m_ring_after_sp && submission.type == SubmissionType::Graphics) m_ring_after_sp = false;
 	}
 	RingGameWriteFrame(m_ring_after_sp ? m_ring_sp_count - 1u : m_ring_sp_count);
+	if (submission.type == SubmissionType::Graphics) m_graphics_enqueued.fetch_add(1, std::memory_order_relaxed);
+	if (submission.type == SubmissionType::SuspendPoint) m_frames_enqueued.fetch_add(1, std::memory_order_relaxed);
 	m_queues[submission.queue_id].push_back(std::move(submission));
 	m_submission_count++;
 	m_work_epoch.fetch_add(1, std::memory_order_release);
@@ -2822,6 +2824,8 @@ void GuestGpu::ThreadRun(void* data) {
 			gpu->m_queues[submission.queue_id].push_front(std::move(submission));
 			gpu->m_submission_count++;
 		} else {
+			if (submission.type == SubmissionType::Graphics) gpu->m_graphics_completed.fetch_add(1, std::memory_order_relaxed);
+			if (submission.type == SubmissionType::SuspendPoint) gpu->m_frames_completed.fetch_add(1, std::memory_order_relaxed);
 			for (auto& queue: gpu->m_queues) {
 				if (!queue.empty()) {
 					queue.front().blocked = false;
@@ -4394,6 +4398,22 @@ bool GuestGpu::IsGpuThread() noexcept {
 uint32_t GuestGpu::PendingWriteKind(uint64_t /*address*/) {
 	// The deferred-label map this read is gone (the write journal replaced it); the report says 0 (unknown).
 	return 0u;
+}
+
+void GuestGpu::NoteCompileDepth(const char* kind, uint64_t hash) {
+	if (!PerfEnabled() || !g_gpu_thread) return;
+	const GuestGpu* gpu = g_gpu_state;
+	if (gpu == nullptr) return;
+	const uint64_t graphics_enqueued  = gpu->m_graphics_enqueued.load(std::memory_order_relaxed);
+	const uint64_t graphics_completed = gpu->m_graphics_completed.load(std::memory_order_relaxed);
+	const uint64_t frames_enqueued    = gpu->m_frames_enqueued.load(std::memory_order_relaxed);
+	const uint64_t frames_completed   = gpu->m_frames_completed.load(std::memory_order_relaxed);
+	std::fprintf(stderr,
+	             "SCOUT_DEPTH kind=%s hash=0x%016llx resolved=%zu operations=%zu cp_graphics=%llu cp_frames=%llu frame=%u\n",
+	             kind, static_cast<unsigned long long>(hash), gpu->m_resolved.SizeApprox(), gpu->m_operations.SizeApprox(),
+	             static_cast<unsigned long long>(graphics_enqueued >= graphics_completed ? graphics_enqueued - graphics_completed : 0u),
+	             static_cast<unsigned long long>(frames_enqueued >= frames_completed ? frames_enqueued - frames_completed : 0u),
+	             DebugPresentCount().load(std::memory_order_relaxed));
 }
 
 } // namespace Libs::Graphics

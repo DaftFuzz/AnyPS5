@@ -89,6 +89,14 @@ namespace Common::EnvRead {
 	return on;
 }
 
+[[nodiscard]] inline bool ShareAttachmentSets() {
+	static const bool on = [] {
+		const char* value = ShaderEnv::Read("KYTY_PERF_SHARE_ATTACHMENT_SETS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return on;
+}
+
 [[nodiscard]] inline bool ProxyCounts() {
 	return std::getenv("KYTY_TRACE_PROXY_COUNTS") != nullptr;
 }

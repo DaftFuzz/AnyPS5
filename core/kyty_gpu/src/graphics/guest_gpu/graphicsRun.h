@@ -104,6 +104,7 @@ public:
 	// `address`: 1 a deferred end-of-pipe label (KYTY_FIX_LABEL_AT_COMPLETION), 2 a command-processor write the host GPU
 	// has not run (KYTY_PERF_DIRECT_RANGES); 0 none.
 	[[nodiscard]] static uint32_t PendingWriteKind(uint64_t address);
+	static void NoteCompileDepth(const char* kind, uint64_t hash);
 
 private:
 	static constexpr uint32_t ComputePipeCount     = 7;
@@ -192,6 +193,10 @@ private:
 	bool            m_ring_after_sp  = false;
 	uint64_t        m_ring_announced = ~uint64_t {0};
 	uint64_t        m_emitted   = 0;
+	std::atomic<uint64_t> m_graphics_enqueued {0};
+	std::atomic<uint64_t> m_graphics_completed {0};
+	std::atomic<uint64_t> m_frames_enqueued {0};
+	std::atomic<uint64_t> m_frames_completed {0};
 	Common::ProgressCounter m_executed;
 	// The pipeline: operations ring from the command processor thread to the resolve thread and from there to the execution
 	// thread, which also serves m_commands and so may sleep on the bell, not in the ring.

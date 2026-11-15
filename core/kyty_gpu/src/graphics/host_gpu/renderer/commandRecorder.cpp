@@ -825,6 +825,8 @@ template <typename T>
 	X(vkCmdSetStencilWriteMask, false)                                                             \
 	X(vkCmdSetStencilReference, false)                                                             \
 	X(vkCmdSetAttachmentFeedbackLoopEnableEXT, false)                                              \
+	X(vkCmdSetCullMode, false)                                                                     \
+	X(vkCmdSetFrontFace, false)                                                                    \
 	X(vkCmdSetCheckpointNV, false)
 
 // Pool calls: the worker may be recording into a buffer of the pool.

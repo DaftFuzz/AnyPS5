@@ -208,6 +208,8 @@ public:
 			StencilBack,
 			ColorWrite,
 			FeedbackLoop,
+			CullMode,
+			FrontFace,
 			PipelineBind,
 			KindCount
 		};
@@ -236,6 +238,8 @@ public:
 		uint32_t                                color_write_count = 0;
 		std::array<vk::Bool32, RENDER_COLOR_ATTACHMENTS_MAX> color_write {};
 		vk::ImageAspectFlags                    feedback;
+		vk::CullModeFlags                       cull_mode;
+		vk::FrontFace                           front_face = vk::FrontFace::eCounterClockwise;
 		// The record packets: which copy of this state the draws of the command buffer use (renderDraw.cpp): 0 none
 		// yet, 1 this one (the recording side's), 2 the recording thread's (the draws' dynamic-state packets). A draw that
 		// switches forgets both copies first.

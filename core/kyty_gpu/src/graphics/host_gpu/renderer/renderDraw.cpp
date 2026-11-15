@@ -184,7 +184,7 @@ constexpr const char* kDynStateNames[] = {
     "viewports",       "scissors",      "line_width",    "blend_constants", "depth_test",
     "depth_write",     "depth_compare", "depth_bounds_test", "depth_bounds", "depth_bias_enable",
     "depth_bias",      "stencil_test",  "stencil_front", "stencil_back",    "color_write",
-    "feedback_loop",   "pipeline_bind"};
+    "feedback_loop",   "cull_mode",     "front_face",    "pipeline_bind"};
 static_assert(std::size(kDynStateNames) == kDynStateKinds);
 
 struct DrawStateFilterOptions {
@@ -315,6 +315,9 @@ struct DynamicParams {
 	uint32_t                                             color_write_count = 0;
 	std::array<vk::Bool32, RENDER_COLOR_ATTACHMENTS_MAX> color_write {};
 	vk::ImageAspectFlags                                 feedback;
+	vk::CullModeFlags                                    cull_mode;
+	vk::FrontFace                                        front_face   = vk::FrontFace::eCounterClockwise;
+	bool                                                 cull_dynamic = false;
 	bool                                                 depth_bounds_enable = false; // the bounds are set only then
 	bool                                                 depth_bias_enable   = false; // the bias is set only then
 	bool                                                 stencil_enable      = false; // the faces are set only then
@@ -329,7 +332,8 @@ using DrawScissors  = std::array<vk::Rect2D, DynState::ViewportSlots>;
 static void MakeGraphicsDynamicParams(const CommandBuffer& buffer, const ShaderVertexInputInfo& vs_input_info,
                                       const RenderDepthInfo& depth, const RenderState& rendering,
                                       const DrawDynamicRegs& regs, vk::ImageAspectFlags feedback_aspects,
-                                      DynamicParams& params, DrawViewports& viewports, DrawScissors& scissors) {
+                                      const PipelineCache::Pipeline& pipeline, DynamicParams& params,
+                                      DrawViewports& viewports, DrawScissors& scissors) {
 	KYTY_PROFILER_FUNCTION();
 
 	const auto&        vp  = regs.viewport;
@@ -426,13 +430,22 @@ static void MakeGraphicsDynamicParams(const CommandBuffer& buffer, const ShaderV
 
 #if !defined(__APPLE__)
 	// MoltenVK has no VK_EXT_color_write_enable (see EmitGraphicsDynamicParams).
-	params.color_write_count = rendering.num_color_attachments;
-	for (uint32_t slot = 0; slot < rendering.num_color_attachments; slot++) {
-		params.color_write[slot] = rendering.color_attachments[slot].image_view != nullptr;
+	params.color_write_count = std::max(rendering.num_color_attachments, pipeline.color_count);
+	for (uint32_t slot = 0; slot < params.color_write_count; slot++) {
+		params.color_write[slot] =
+		    slot < rendering.num_color_attachments && rendering.color_attachments[slot].image_view != nullptr ? VK_TRUE : VK_FALSE;
 	}
 #endif
 	params.feedback_set = buffer.GetGraphics().attachment_feedback_loop_enabled;
 	params.feedback     = feedback_aspects;
+	params.cull_dynamic = pipeline.cull_dynamic;
+	if (pipeline.cull_dynamic) {
+		const bool rect_list = Prospero::IsRectList(regs.prim_type);
+		params.cull_mode     = vk::CullModeFlagBits::eNone;
+		if (!rect_list && regs.mode.cull_back) params.cull_mode |= vk::CullModeFlagBits::eBack;
+		if (!rect_list && regs.mode.cull_front) params.cull_mode |= vk::CullModeFlagBits::eFront;
+		params.front_face = regs.mode.face ? vk::FrontFace::eClockwise : vk::FrontFace::eCounterClockwise;
+	}
 }
 
 // KYTY_FIX_IMAGE_MEMORY_OWNER: the rectangle a draw can write in its colour targets, before they are acquired: the union
@@ -622,6 +635,23 @@ static void EmitGraphicsDynamicParams(DynState& known, vk::CommandBuffer sink, c
 		known.Forget(DynState::ColorWrite);
 	}
 #endif
+	if (params.cull_dynamic) {
+		const vk::CullModeFlags cull_mode = params.cull_mode;
+		if (rec.Needs(DynState::CullMode, [&] { return known.cull_mode == cull_mode; })) {
+			sink.setCullMode(cull_mode);
+			known.cull_mode = cull_mode;
+			known.Set(DynState::CullMode);
+		}
+		const vk::FrontFace front_face = params.front_face;
+		if (rec.Needs(DynState::FrontFace, [&] { return known.front_face == front_face; })) {
+			sink.setFrontFace(front_face);
+			known.front_face = front_face;
+			known.Set(DynState::FrontFace);
+		}
+	} else {
+		known.Forget(DynState::CullMode);
+		known.Forget(DynState::FrontFace);
+	}
 	// The attachment feedback loop aspects a draw sets after its dynamic state.
 	if (params.feedback_set) {
 		const vk::ImageAspectFlags aspects = params.feedback;
@@ -3360,7 +3390,7 @@ void RenderExecutor::CommitPreparedDraw(DrawPlan& plan) {
 		DrawViewports dyn_viewports;
 		DrawScissors  dyn_scissors;
 		MakeGraphicsDynamicParams(buffer, vertex_stages.back(), state.depth_info, rendering, plan.regs, feedback_aspects,
-		                          dyn_params, dyn_viewports, dyn_scissors);
+		                          pipeline, dyn_params, dyn_viewports, dyn_scissors);
 		CommitGraphicsDynamicParams(buffer, vk_buffer, dyn_params, dyn_viewports, dyn_scissors);
 	}
 	commit_census.reset();
