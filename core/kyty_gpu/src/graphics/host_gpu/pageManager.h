@@ -89,6 +89,17 @@ public:
 	// Whether the page's watchers alone let the access through (false without a tracker region).
 	[[nodiscard]] bool WatchersAllow(uint64_t vaddr, bool is_write) const;
 
+	// KYTY_PERF_DEFER_READ_PROTECT (graphics/host_gpu/faultPath.h), calling thread only: 0 applies every protection at
+	// once; 1 keeps the no-access runs of new access watchers and image read watches (merged with an adjacent kept run)
+	// until FlushDeferredReadProtect; 2 applies them at once and keeps their ranges as check windows until the flush.
+	static void SetReadProtectDeferral(uint32_t mode) noexcept;
+	// Applies the calling thread's kept runs: each page takes the protection its watchers and image read watch give now,
+	// under its region's lock (2: the check windows are dropped). The second form only when a kept run overlaps the range.
+	static void FlushDeferredReadProtect() noexcept;
+	static void FlushDeferredReadProtect(uint64_t vaddr, uint64_t size) noexcept;
+	// Check mode: a fault (any thread) inside a check window is counted.
+	static void NoteWindowFault(uint64_t vaddr, bool is_write, bool gpu_thread) noexcept;
+
 private:
 	struct Impl;
 	std::unique_ptr<Impl> m_impl;

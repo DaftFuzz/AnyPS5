@@ -31,6 +31,7 @@
 #include "common/workaroundHits.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/faultPath.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/cache/textureCacheShared.h"
@@ -3597,6 +3598,38 @@ void BufferCache::CommitUploadBatch(BatchCommit reason) {
 		RecordBufferUpload(buffer, source, copies);
 	}
 	// Protect what is still writable, then re-check this commit's ranges.
+	const uint32_t async_reprotect = pac_sample || HTrace::Enabled() || UploadClobberCheck() ? 0u : FaultPath::AsyncReprotectMode();
+	if (async_reprotect != 0u) {
+		std::vector<FaultPath::ArCheck> posted;
+		posted.reserve(rechecks.size() - recheck_base);
+		uint64_t staged = 0;
+		for (size_t k = recheck_base; k < rechecks.size(); k++) {
+			posted.push_back({rechecks[k].address, rechecks[k].size, rechecks[k].hash});
+			staged += rechecks[k].size;
+		}
+		rechecks.resize(recheck_base);
+		std::vector<RegionManager*> regions;
+		regions.swap(batch.regions);
+		if (!regions.empty() || !posted.empty()) {
+			FaultPath::ArPost(m_memory_tracker, std::move(regions), std::move(posted), staged);
+		}
+		FaultPath::ArReport();
+		g_pac_commits.fetch_add(1, std::memory_order_relaxed);
+		entries.clear();
+		ranges.clear();
+		if (batch.entries.empty()) batch.entries.swap(entries);
+		if (batch.ranges.empty()) batch.ranges.swap(ranges);
+		stats.commits.fetch_add(1, std::memory_order_relaxed);
+		stats.region_updates.fetch_add(updated, std::memory_order_relaxed);
+		stats.reasons[static_cast<size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+		if (timed) {
+			stats.commit_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+			                                                    std::chrono::steady_clock::now() - began)
+			                                                    .count()),
+			                          std::memory_order_relaxed);
+		}
+		return;
+	}
 	std::vector<Recheck>                       checks(rechecks.begin() + static_cast<ptrdiff_t>(recheck_base),
 	                                                  rechecks.end());
 	rechecks.resize(recheck_base);
@@ -3808,6 +3841,7 @@ const ObtainMemoEntry* ObtainMemoFind(uint64_t vaddr, uint64_t size) {
 		miss[2]++;
 		return nullptr;
 	}
+	FaultPath::ArObserveRegions(e.region, e.regions);
 	auto* table = g_cpu_dirty_region_epochs.load(std::memory_order_acquire);
 	for (uint32_t i = 0; i < e.regions; i++) {
 		if (table[e.region + i].load(std::memory_order_acquire) != e.epochs[i]) {
@@ -3898,6 +3932,7 @@ WriteMemoEntry* WriteMemoFind(uint64_t vaddr, uint64_t size, uint32_t& reason) {
 	if (e.regions == 0 || e.vaddr != vaddr || e.size != size) return nullptr;
 	reason = 2;
 	if (e.buffer_epoch != DrawRepeat::g_buffer_registry_epoch.load(std::memory_order_acquire)) return nullptr;
+	FaultPath::ArObserveRegions(e.region, e.regions);
 	auto* cpu = g_cpu_dirty_region_epochs.load(std::memory_order_acquire);
 	auto* gpu = g_gpu_clean_region_epochs.load(std::memory_order_acquire);
 	for (uint32_t i = 0; i < e.regions; i++) {
@@ -4031,6 +4066,7 @@ uint32_t BufferCache::PeekProofFail(const BufferPeek& peek, uint64_t vaddr, uint
 		// W2.2: and the direct ranges as the peek saw them (the mode is checked where the answer is taken)
 		return peek.direct_gen == g_direct_generation.load(std::memory_order_acquire) ? 0 : 1;
 	}
+	FaultPath::ArObserveRegions(peek.region, peek.regions);
 	auto* table = g_cpu_dirty_region_epochs.load(std::memory_order_acquire);
 	for (uint32_t i = 0; i < peek.regions; i++) {
 		if (table[peek.region + i].load(std::memory_order_acquire) != peek.epochs[i]) return 2;
@@ -6863,6 +6899,53 @@ void ReportCountExact() {
 }
 } // namespace
 
+// ---- KYTY_PERF_COUNT_GUEST (exec-profile cut E, the reads G2 declines) ------------------------------------------------
+// Every GPU write into a cached buffer either makes its bytes GPU-dirty (ObtainBuffer for writing, NoteObtainedWrite) or
+// copies a GPU-written image into it (SynchronizeBufferFromImage: the image stays GPU-modified, its pages under the image
+// read watch). Uploads, joins and CP write-throughs leave the buffer equal to guest memory. So bytes that are not
+// CPU-dirty, not GPU-dirty (nor in an unfinished readback), with no write obtained but not recorded and no GPU-modified
+// image over them, are in guest memory exactly as the buffer holds them once all recorded work ran: the instance-count
+// read takes them from the backing without recording a copy or waiting. 1 = on (live A/B switch), 2 = check (start value
+// only): the copy is made too and the two compared (PERF_COUNT_GUEST_MISMATCH); the copy's bytes are returned.
+namespace {
+uint32_t CountGuestFixed() {
+	static const uint32_t value = [] {
+		const char*    text = std::getenv("KYTY_PERF_COUNT_GUEST");
+		const uint32_t v    = text != nullptr ? static_cast<uint32_t>(std::strtoul(text, nullptr, 10)) : 0u;
+		if (v != 0) std::fprintf(stderr, "KYTY_PERF_COUNT_GUEST=%u: clean instance-count bytes read from guest memory%s\n", v, v == 2 ? " (check: copy compared)" : "");
+		return v;
+	}();
+	return value;
+}
+
+enum CountGuestWay : uint32_t { CgDirty, CgReadback, CgImage, CgOther, CgWays };
+
+struct CountGuestStats {
+	std::atomic<uint64_t> calls {0}, served {0}, checked {0}, mismatched {0}, mismatch_lines {0};
+	std::atomic<uint64_t> ways[CgWays] {};
+	std::atomic<int64_t>  window_start {0};
+};
+CountGuestStats g_count_guest;
+
+void ReportCountGuest() {
+	if (!PerfEnabled()) return;
+	auto&         s     = g_count_guest;
+	const int64_t now   = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+	int64_t       start = s.window_start.load(std::memory_order_relaxed);
+	if (start == 0) {
+		s.window_start.compare_exchange_strong(start, now, std::memory_order_relaxed);
+		return;
+	}
+	if (now - start < 5000 || !s.window_start.compare_exchange_strong(start, now, std::memory_order_relaxed)) return;
+	const auto take = [](std::atomic<uint64_t>& c) { return static_cast<unsigned long long>(c.exchange(0, std::memory_order_relaxed)); };
+	std::fprintf(stderr,
+	             "PERF count_guest calls=%llu served=%llu declined(dirty,readback,image,other)=%llu,%llu,%llu,%llu checked=%llu "
+	             "mismatched=%llu (per ~5 s)\n",
+	             take(s.calls), take(s.served), take(s.ways[CgDirty]), take(s.ways[CgReadback]), take(s.ways[CgImage]),
+	             take(s.ways[CgOther]), take(s.checked), take(s.mismatched));
+}
+} // namespace
+
 bool BufferCache::ReadCountExact(Buffer& buffer, uint64_t vaddr, uint64_t size, void* out) {
 	auto&      s    = g_count_exact;
 	const auto way  = [&](CountExactWay w) {
@@ -6940,6 +7023,58 @@ bool BufferCache::ReadGpuCopy(uint64_t vaddr, uint64_t size, void* out) {
 	if (!buffer.IsInBounds(vaddr, size) || m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
 		return false;
 	}
+	const uint32_t guest_fixed = CountGuestFixed();
+	const uint32_t guest = size <= 64u ? Common::LiveAb::Gate(Common::LiveAb::Switch::CountGuest, guest_fixed == 2u ? 1u : guest_fixed) : 0u;
+	if (guest == 0u) return ReadGpuCopyFrom(buffer, vaddr, size, out);
+	std::array<uint8_t, 64> guest_bytes {};
+	g_count_guest.calls.fetch_add(1, std::memory_order_relaxed);
+	const bool guest_ok = ReadCountGuest(vaddr, size, guest_bytes.data());
+	ReportCountGuest();
+	if (guest_ok && guest_fixed != 2u) {
+		std::memcpy(out, guest_bytes.data(), size);
+		return true;
+	}
+	if (!ReadGpuCopyFrom(buffer, vaddr, size, out)) return false;
+	if (guest_ok) {
+		g_count_guest.checked.fetch_add(1, std::memory_order_relaxed);
+		if (std::memcmp(out, guest_bytes.data(), size) != 0) {
+			g_count_guest.mismatched.fetch_add(1, std::memory_order_relaxed);
+			if (g_count_guest.mismatch_lines.fetch_add(1, std::memory_order_relaxed) < 32u) {
+				uint32_t a = 0, b = 0;
+				std::memcpy(&a, out, std::min<uint64_t>(size, 4));
+				std::memcpy(&b, guest_bytes.data(), std::min<uint64_t>(size, 4));
+				std::fprintf(stderr, "PERF_COUNT_GUEST_MISMATCH addr=0x%llx size=%llu copy=0x%08x guest=0x%08x frame=%u\n",
+				             static_cast<unsigned long long>(vaddr), static_cast<unsigned long long>(size), a, b,
+				             DebugPresentCount().load());
+			}
+		}
+	}
+	return true;
+}
+
+bool BufferCache::ReadCountGuest(uint64_t vaddr, uint64_t size, void* out) {
+	auto&      s       = g_count_guest;
+	const auto decline = [&](CountGuestWay w) {
+		s.ways[w].fetch_add(1, std::memory_order_relaxed);
+		return false;
+	};
+	if (!GuestGpu::IsGpuThread() || InDirectRange(vaddr, size)) return decline(CgOther);
+	if (HasGpuDirtyBytes(vaddr, size, DirtyReader::IndirectArgs)) return decline(CgDirty);
+	if (HasPendingReadback(vaddr, size)) return decline(CgReadback);
+	if (std::ranges::any_of(m_bar_pending_writes, [&](const auto& w) { return w.first < vaddr + size && vaddr < w.first + w.second; })) {
+		return decline(CgDirty);
+	}
+	if (LibKernel::Memory::GuestImageReadArmed(vaddr, size)) return decline(CgImage);
+	if (const auto selected = m_texture_cache.FindImageFromRange(vaddr, size); selected) {
+		std::scoped_lock lock {m_texture_cache.m_lock};
+		if (m_texture_cache.m_slot_images[selected].IsGpuModified()) return decline(CgImage);
+	}
+	if (!LibKernel::Memory::TryReadBacking(vaddr, out, size)) return decline(CgOther);
+	s.served.fetch_add(1, std::memory_order_relaxed);
+	return true;
+}
+
+bool BufferCache::ReadGpuCopyFrom(Buffer& buffer, uint64_t vaddr, uint64_t size, void* out) {
 	const uint32_t exact = size <= 64u ? Common::LiveAb::Gate(Common::LiveAb::Switch::CountExact, CountExactFixed()) : 0u;
 	std::array<uint8_t, 64> fast {};
 	bool                    fast_ok = false;

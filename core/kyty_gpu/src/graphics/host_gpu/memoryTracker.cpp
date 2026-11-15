@@ -83,6 +83,7 @@ RangeSet MemoryTracker::TakeBdaSync() {
 }
 
 bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
+	FaultPath::ArJoinRange(vaddr, size);
 	CheckNotInUploadCallback();
 	return Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		if (!manager->MaybeModified<DirtySource::Cpu>()) {
@@ -94,6 +95,7 @@ bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 bool MemoryTracker::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
+	FaultPath::ArJoinRange(vaddr, size);
 	CheckNotInUploadCallback();
 	return Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		if (!manager->MaybeModified<DirtySource::Gpu>()) {
@@ -105,6 +107,7 @@ bool MemoryTracker::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
+	FaultPath::ArJoinRange(vaddr, size);
 	CheckNotInUploadCallback();
 	Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);
@@ -113,6 +116,7 @@ void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 void MemoryTracker::MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
+	FaultPath::ArJoinRange(vaddr, size);
 	CheckNotInUploadCallback();
 	Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);
@@ -124,6 +128,7 @@ void MemoryTracker::MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 void MemoryTracker::UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
+	FaultPath::ArJoinRange(vaddr, size);
 	CheckNotInUploadCallback();
 	Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);
@@ -135,6 +140,7 @@ void MemoryTracker::UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 bool MemoryTracker::ReleaseGpuToCpu(uint64_t vaddr, uint64_t size) {
+	FaultPath::ArJoinRange(vaddr, size);
 	CheckNotInUploadCallback();
 	bool merged = true;
 	// As MarkRegionAsCpuModified: a missing region is created (UnmarkRegionAsGpuModified would skip it; it holds no
@@ -152,6 +158,7 @@ bool MemoryTracker::ReleaseGpuToCpu(uint64_t vaddr, uint64_t size) {
 }
 
 void MemoryTracker::UntrackMemory(uint64_t vaddr, uint64_t size) {
+	FaultPath::ArJoinRange(vaddr, size);
 	CheckNotInUploadCallback();
 	NoteGpuCleanRange(vaddr, size); // the write memo
 	std::vector<RegionManager*> managers;

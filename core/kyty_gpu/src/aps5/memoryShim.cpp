@@ -1399,6 +1399,7 @@ void ReadGuestPlain(void* dst, uint64_t vaddr, uint64_t size) {
 		std::memcpy(dst, reinterpret_cast<const void*>(vaddr), size);
 		return;
 	}
+	Graphics::PageManager::FlushDeferredReadProtect(vaddr, size);
 	constexpr uint64_t page_size = 0x1000;
 	const auto&        pages     = g_gpu_resources->GetPageManager();
 	const uint64_t     last      = vaddr + size;
