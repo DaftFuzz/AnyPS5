@@ -226,8 +226,10 @@ public:
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size, DirtyReader reader = DirtyReader::Other);
 	void               ReportInFlightReadPerf();
 	// HasGpuDirtyBytes for another thread (the resolve thread): the dirty-byte set changes only
-	// through GpuDirtyAdd/GpuDirtySubtract, which take m_gpu_dirty_mutex exclusively; this always takes it shared.
+	// through GpuDirtyAdd/GpuDirtySubtract, which take m_gpu_dirty_mutex exclusively; this always takes it shared. Bytes of
+	// an unfinished readback copy (m_in_flight_ranges, changed under the same lock) count as dirty.
 	[[nodiscard]] bool HasGpuDirtyBytesShared(uint64_t vaddr, uint64_t size);
+	void               WaitCopyReadbacks(uint64_t vaddr, uint64_t size);
 	// Publishes pending asynchronous (eager) readbacks overlapping the range: their bytes already left
 	// the GPU-dirty set but reach guest memory only when the copy completes. True: the caller puts ApplyDirectCpWrites
 	// over what it reads (WaitDirectGpuWrites with `cp_overlay`).
@@ -895,7 +897,6 @@ private:
 	[[nodiscard]] static bool CopyHandbackOn();
 	[[nodiscard]] uint64_t    StartCopyReadback(CallerPlan& plan, uint64_t vaddr, bool is_write);
 	[[nodiscard]] bool        EagerDone(const EagerReadback& entry) const;
-	void                      WaitCopyReadbacks(uint64_t vaddr, uint64_t size);
 	void                      UnmarkPublishedWindow(uint64_t lo, uint64_t hi);
 	[[nodiscard]] bool        DeadRingWouldFree(uint64_t vaddr);
 	// KYTY_PERF_BAR_GPU_COPY_VERIFY=1 with a hand-back copy: when the finished readback is applied, its bytes in the
@@ -906,6 +907,8 @@ private:
 	[[nodiscard]] bool PendingReadbackCovers(uint64_t vaddr, uint64_t size) const;
 	[[nodiscard]] uint32_t InFlightReadbackKinds(uint64_t vaddr, uint64_t size) const;
 	std::atomic<uint64_t>  m_in_flight_reads[2][static_cast<uint32_t>(DirtyReader::Count)] {};
+	std::atomic<uint64_t>  m_in_flight_ahead_reads {0};
+	void                   InFlightRebuild();
 	void        RecordHotRead(uint64_t vaddr);
 	void        BumpHotGeneration(uint64_t vaddr, uint64_t size);
 	void        ApplyEagerReadbacks(uint64_t vaddr, uint64_t size, bool wait);
@@ -986,6 +989,7 @@ private:
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
+	RangeSet                                          m_in_flight_ranges;
 	// Every mutation of m_gpu_modified_ranges goes through these two, under the lock (the resolve thread
 	// read the set while the GPU thread changes it).
 	void                                              GpuDirtyAdd(uint64_t vaddr, uint64_t size);

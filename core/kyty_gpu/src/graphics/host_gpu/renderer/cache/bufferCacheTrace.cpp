@@ -470,6 +470,8 @@ void BufferCache::ReportInFlightReadPerf() {
 		             take(kind, DirtyReader::ImageHeap), take(kind, DirtyReader::GpuWord),
 		             take(kind, DirtyReader::CpWriteUnmark), take(kind, DirtyReader::Other));
 	}
+	std::fprintf(stderr, "PERF in_flight_reads_offthread ahead=%llu\n",
+	             static_cast<unsigned long long>(m_in_flight_ahead_reads.exchange(0)));
 }
 
 void BufferCache::TakeCensus(Census& census) {

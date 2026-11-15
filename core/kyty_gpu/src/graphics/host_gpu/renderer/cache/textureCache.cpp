@@ -4102,6 +4102,7 @@ bool TextureCache::DownloadImageMemory(ImageId id, bool evicting, std::shared_pt
 bool TextureCache::RecordImageDownload(ImageId id, Buffer& destination, uint64_t offset, uint8_t* mapped) {
 	auto&      image = m_slot_images[id];
 	const auto range = image.info.data;
+	m_buffer_cache.WaitCopyReadbacks(range.address, range.size);
 	if (!LibKernel::Memory::TryReadBacking(range.address, mapped, range.size)) {
 		return false;
 	}
