@@ -59,6 +59,16 @@ struct State {
 	std::mutex                             pages_mutex;
 	std::unordered_map<uint64_t, uint32_t> pages;
 	int64_t                                pages_report_us = 0;
+	struct FaultPage {
+		uint32_t faults = 0;
+		uint32_t writes = 0;
+		uint32_t frames = 0;
+		uint64_t last_flip = 0;
+	};
+	std::mutex                              fault_pages_mutex;
+	std::unordered_map<uint64_t, FaultPage> fault_pages;
+	uint64_t                                fault_pages_first_flip = 0;
+	int64_t                                 fault_pages_report_us  = 0;
 };
 
 State& S() {
@@ -180,6 +190,56 @@ void NoteFlipDone() {
 			std::fprintf(stderr, " 0x%llx0000x%u", static_cast<unsigned long long>(top[i].first), top[i].second);
 		}
 		std::fprintf(stderr, "\n");
+	}
+	std::vector<std::pair<uint64_t, State::FaultPage>> fault_top;
+	uint64_t                                           window_frames = 0;
+	{
+		std::scoped_lock lock(s.fault_pages_mutex);
+		if (s.fault_pages_first_flip == 0) {
+			s.fault_pages_first_flip = flip;
+			s.fault_pages_report_us  = now;
+		} else if (now - s.fault_pages_report_us >= 5000000) {
+			window_frames            = flip - s.fault_pages_first_flip;
+			s.fault_pages_first_flip = flip;
+			s.fault_pages_report_us  = now;
+			fault_top.assign(s.fault_pages.begin(), s.fault_pages.end());
+			s.fault_pages.clear();
+		}
+	}
+	if (window_frames != 0) {
+		uint64_t faults = 0;
+		uint64_t every  = 0;
+		uint64_t every_faults = 0;
+		for (const auto& [page, stat]: fault_top) {
+			faults += stat.faults;
+			if (stat.frames * 10u >= window_frames * 9u) {
+				every++;
+				every_faults += stat.faults;
+			}
+		}
+		std::sort(fault_top.begin(), fault_top.end(), [](const auto& a, const auto& b) { return a.second.faults > b.second.faults; });
+		std::fprintf(stderr, "HT_FAULT_PAGES frames=%llu pages=%zu faults=%llu every_frame_pages=%llu every_frame_faults=%llu top",
+		             static_cast<unsigned long long>(window_frames), fault_top.size(), static_cast<unsigned long long>(faults),
+		             static_cast<unsigned long long>(every), static_cast<unsigned long long>(every_faults));
+		for (size_t i = 0; i < fault_top.size() && i < 24u; i++) {
+			std::fprintf(stderr, " 0x%llx:%u/%u:w%u", static_cast<unsigned long long>(fault_top[i].first << 12u),
+			             fault_top[i].second.faults, fault_top[i].second.frames, fault_top[i].second.writes);
+		}
+		std::fprintf(stderr, "\n");
+	}
+}
+
+void NoteFaultPage(uint64_t address, bool write) {
+	if (!Enabled()) return;
+	auto&            s    = S();
+	const auto       flip = s.flips.load(std::memory_order_relaxed) + 1;
+	std::scoped_lock lock(s.fault_pages_mutex);
+	auto&            page = s.fault_pages[address >> 12u];
+	page.faults++;
+	if (write) page.writes++;
+	if (page.last_flip != flip) {
+		page.last_flip = flip;
+		page.frames++;
 	}
 }
 
