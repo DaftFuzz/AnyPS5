@@ -108,6 +108,11 @@ constexpr SwitchInfo Switches[] = {
     // Per binding: a direct-range SRT word under a pending GPU write reaches its word-stream slot by a GPU copy recorded
     // there or by the CPU read after the wait; nothing outlives the binding.
     {Switch::RingWordsGpu, "KYTY_PERF_RING_WORDS_GPU", 1},
+    // Per WAIT_REG_MEM on a direct-range word that passes as read: whether the command processor drains the execution
+    // thread before it reads the word again, or (no operation in flight can write buffer memory) waits for the word's
+    // recorded GPU writes itself; the word reads the same either way. The listed writes are published whenever the
+    // switch can be on, so either phase finds them; nothing else outlives the wait.
+    {Switch::DrainFreeWait, "KYTY_PERF_DRAIN_FREE_WAIT", 1},
     // Project 15 way B P1 (test switch): a read-only buffer binding with a ready plan entry whose proof holds takes the
     // binding the helper computed (handle, aligned offset, range, offset byte, record stride) instead of RebindBuffers'.
 };

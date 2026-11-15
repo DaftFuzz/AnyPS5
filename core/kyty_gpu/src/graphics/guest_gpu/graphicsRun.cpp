@@ -427,6 +427,13 @@ static GuestGpu* StreamGpu() noexcept {
 	return g_stream_gpu;
 }
 
+// KYTY_PERF_DRAIN_FREE_WAIT: the GPU whose operations the resolve side gives write verdicts for (one GuestGpu).
+static std::atomic<GuestGpu*> g_verdict_gpu {nullptr};
+
+static void PublishOperationWrites(uint64_t sequence, uint8_t verdict) {
+	if (auto* const gpu = g_verdict_gpu.load(std::memory_order_acquire); gpu != nullptr) gpu->NoteOperationWrites(sequence, verdict);
+}
+
 
 // KYTY_TRACE_PERF: what the pipeline did and where its threads waited. Several threads: atomic.
 namespace {
@@ -629,6 +636,8 @@ GuestGpu::GuestGpu(RenderContext& renderer)
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	GraphicsInitJmpTables();
 	m_pending_writes = std::make_unique<GuestWrite[]>(PendingWriteCapacity);
+	m_operation_writes = std::make_unique<std::atomic<uint64_t>[]>(OperationWritesSize);
+	g_verdict_gpu.store(this, std::memory_order_release);
 	m_neutral_context.Reset();
 	m_neutral_user_config.Reset();
 	m_neutral_shaders.Reset();
@@ -646,6 +655,8 @@ GuestGpu::GuestGpu(RenderContext& renderer)
 
 GuestGpu::~GuestGpu() {
 	Shutdown();
+	GuestGpu* self = this;
+	g_verdict_gpu.compare_exchange_strong(self, nullptr, std::memory_order_acq_rel);
 }
 
 void GuestGpu::Shutdown() {
@@ -1420,6 +1431,7 @@ void GuestGpu::ResolveThread() {
 	auto&          hs         = m_helper_stats;
 	auto           report_at  = std::chrono::steady_clock::now();
 	const bool     scout      = CompileScoutEnabled();
+	const bool     drain_free_possible = BufferCache::DrainFreeWaitPossible(); // KYTY_PERF_DRAIN_FREE_WAIT
 	size_t         scout_ahead = 0;
 	auto           jobs_report_at = std::chrono::steady_clock::now();
 	if (scout) {
@@ -1574,6 +1586,8 @@ void GuestGpu::ResolveThread() {
 				task.async_compute = operation->processor->IsAsyncComputeQueue();
 			}
 			auto& slot = executor.TakeResolvedSlot();
+			task.op_sequence    = operation->sequence;
+			task.writes_verdict = drain_free_possible ? &PublishOperationWrites : nullptr;
 			if (check) {
 				// The reference: this thread resolves it as the helper will (the same function), the helper's result is
 				// compared with it before the operation executes; the operation uses the reference.
@@ -1592,7 +1606,8 @@ void GuestGpu::ResolveThread() {
 				}
 				auto& helper_slot = executor.TakeResolvedSlot();
 				RenderExecutor::SetResolvedCheckSlot(&slot, &helper_slot);
-				task.slot  = &helper_slot;
+				task.slot           = &helper_slot;
+				task.writes_verdict = nullptr;
 				task.fault = fault_each != 0 && ++members % fault_each == 0 ? static_cast<uint32_t>(members / fault_each) : 0u;
 			} else {
 				task.slot = &slot;
@@ -2099,6 +2114,140 @@ void GuestGpu::ReadDecisionMemory(const volatile void* address, void* value, siz
 	ApplyPendingWrites(address, value, size, scope, covered);
 }
 
+// ---- KYTY_PERF_DRAIN_FREE_WAIT (cache/bufferCache.h) ------------------------------------------------------------------
+namespace {
+struct DrainFreeStats {
+	std::atomic<uint64_t> skipped {0}, drained {0}, resolve_waits {0}, resolve_ns {0}, tick_waits {0}, tick_ns {0};
+	std::atomic<uint64_t> in_flight {0}, compared {0}, differ_verdicts {0}, differ_values {0}, differ_lines {0};
+	std::atomic<uint64_t> judged_none {0}, broken {0}, broken_lines {0};
+	std::array<std::atomic<uint64_t>, static_cast<size_t>(GuestGpu::DrainFreeFallback::Count)> fallback {};
+	std::atomic<int64_t> window_start {0};
+};
+DrainFreeStats g_drain_free;
+
+void ReportDrainFree() {
+	if (!PerfEnabled()) return;
+	auto&         s     = g_drain_free;
+	const int64_t now   = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+	int64_t       start = s.window_start.load(std::memory_order_relaxed);
+	if (start == 0) {
+		s.window_start.compare_exchange_strong(start, now, std::memory_order_relaxed);
+		return;
+	}
+	if (now - start < 5000 || !s.window_start.compare_exchange_strong(start, now, std::memory_order_relaxed)) return;
+	const auto take = [](std::atomic<uint64_t>& c) { return static_cast<unsigned long long>(c.exchange(0, std::memory_order_relaxed)); };
+	const auto skipped = take(s.skipped), drained = take(s.drained);
+	const auto writer = take(s.fallback[0]), unknown = take(s.fallback[1]), timeout = take(s.fallback[2]);
+	const auto window = take(s.fallback[3]), open = take(s.fallback[4]);
+	const auto resolve_waits = take(s.resolve_waits), resolve_ns = take(s.resolve_ns), tick_waits = take(s.tick_waits);
+	const auto tick_ns = take(s.tick_ns), in_flight = take(s.in_flight), compared = take(s.compared);
+	const auto differ_verdicts = take(s.differ_verdicts), differ_values = take(s.differ_values);
+	const auto judged_none = take(s.judged_none), broken = take(s.broken);
+	const auto decided = skipped + writer + unknown + timeout + window + open;
+	std::fprintf(stderr,
+	             "PERF drain_free_wait mode=%u skipped=%llu drained=%llu fallback[writer|unknown|resolve_timeout|window|open_buffer]="
+	             "%llu|%llu|%llu|%llu|%llu in_flight_mean=%.1f resolve_waits=%llu resolve_wait_ms=%.2f tick_waits=%llu "
+	             "tick_wait_ms=%.2f compared=%llu differ_verdicts=%llu differ_values=%llu judged_none_ops=%llu broken=%llu (per ~5 s)\n",
+	             BufferCache::DrainFreeWaitMode(), skipped, drained, writer, unknown, timeout, window, open,
+	             decided != 0 ? static_cast<double>(in_flight) / static_cast<double>(decided) : 0.0, resolve_waits,
+	             static_cast<double>(resolve_ns) / 1e6, tick_waits, static_cast<double>(tick_ns) / 1e6, compared, differ_verdicts,
+	             differ_values, judged_none, broken);
+}
+
+int64_t DrainFreeNowNs() {
+	return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+void NoteDrainFreeJudged(const GpuOperation& operation, bool listed_write) {
+	auto& s = g_drain_free;
+	s.judged_none.fetch_add(1, std::memory_order_relaxed);
+	if (!listed_write) return;
+	s.broken.fetch_add(1, std::memory_order_relaxed);
+	if (s.broken_lines.fetch_add(1, std::memory_order_relaxed) < 32u) {
+		std::fprintf(stderr, "PERF_DRAIN_FREE_BROKEN sequence=%llu kind=%u: an operation judged unable to write listed a direct-range write\n",
+		             static_cast<unsigned long long>(operation.sequence), static_cast<uint32_t>(operation.kind));
+	}
+}
+
+void NoteDrainFreeCompare(uint64_t address, uint64_t free_value, uint64_t drained_value, bool free_pass, bool drained_pass) {
+	auto& s = g_drain_free;
+	s.compared.fetch_add(1, std::memory_order_relaxed);
+	if (free_pass != drained_pass) s.differ_verdicts.fetch_add(1, std::memory_order_relaxed);
+	if (free_value != drained_value) s.differ_values.fetch_add(1, std::memory_order_relaxed);
+	if ((free_pass != drained_pass || free_value != drained_value) && s.differ_lines.fetch_add(1, std::memory_order_relaxed) < 32u) {
+		std::fprintf(stderr, "PERF_DRAIN_FREE_DIFFER addr=0x%llx free=0x%llx drained=0x%llx free_pass=%d drained_pass=%d\n",
+		             static_cast<unsigned long long>(address), static_cast<unsigned long long>(free_value),
+		             static_cast<unsigned long long>(drained_value), free_pass ? 1 : 0, drained_pass ? 1 : 0);
+	}
+}
+} // namespace
+
+void GuestGpu::NoteOperationWrites(uint64_t sequence, uint8_t verdict) noexcept {
+	m_operation_writes[sequence & (OperationWritesSize - 1u)].store((sequence << 2u) | (verdict & 3u), std::memory_order_release);
+}
+
+uint8_t GuestGpu::OperationWrites(uint64_t sequence) const noexcept {
+	const uint64_t entry = m_operation_writes[sequence & (OperationWritesSize - 1u)].load(std::memory_order_acquire);
+	return (entry >> 2u) == sequence ? static_cast<uint8_t>(entry & 3u) : 0u;
+}
+
+bool GuestGpu::TryDrainFreeDirectWait(uint64_t address, uint64_t size, DrainFreeFallback* reason) {
+	auto&      s    = g_drain_free;
+	const auto fail = [&](DrainFreeFallback why) {
+		*reason = why;
+		s.fallback[static_cast<size_t>(why)].fetch_add(1, std::memory_order_relaxed);
+		return false;
+	};
+	// A command-processor write of bytes known only when its operation executes: that operation first (it lists its GPU
+	// write then), as the read after a drain would have it.
+	WaitForPendingWrites(address, size, true);
+	const uint64_t executed = m_executed.Load();
+	const uint64_t emitted  = m_emitted;
+	const uint64_t pending  = emitted > executed ? emitted - executed : 0u;
+	s.in_flight.fetch_add(pending, std::memory_order_relaxed);
+	if (pending >= OperationWritesSize) return fail(DrainFreeFallback::Window);
+	constexpr int64_t ResolveLimitNs = 20'000'000;
+	int64_t           resolve_start  = 0;
+	for (uint64_t sequence = executed + 1u; sequence <= emitted; sequence++) {
+		uint8_t verdict = OperationWrites(sequence);
+		if (verdict == 0u && m_executed.Load() < sequence) {
+			if (resolve_start == 0) resolve_start = DrainFreeNowNs();
+			for (Common::SpinWait spin; (verdict = OperationWrites(sequence)) == 0u && m_executed.Load() < sequence;) {
+				if (DrainFreeNowNs() - resolve_start > ResolveLimitNs) {
+					s.resolve_waits.fetch_add(1, std::memory_order_relaxed);
+					s.resolve_ns.fetch_add(static_cast<uint64_t>(DrainFreeNowNs() - resolve_start), std::memory_order_relaxed);
+					return fail(DrainFreeFallback::ResolveTimeout);
+				}
+				if (!spin.Spin()) std::this_thread::yield();
+			}
+		}
+		// An operation that executed meanwhile listed its writes before its sequence was published.
+		if (verdict == 0u || verdict == 1u || m_executed.Load() >= sequence) continue;
+		if (resolve_start != 0) {
+			s.resolve_waits.fetch_add(1, std::memory_order_relaxed);
+			s.resolve_ns.fetch_add(static_cast<uint64_t>(DrainFreeNowNs() - resolve_start), std::memory_order_relaxed);
+		}
+		return fail(verdict == 2u ? DrainFreeFallback::Writer : DrainFreeFallback::Unknown);
+	}
+	if (resolve_start != 0) {
+		s.resolve_waits.fetch_add(1, std::memory_order_relaxed);
+		s.resolve_ns.fetch_add(static_cast<uint64_t>(DrainFreeNowNs() - resolve_start), std::memory_order_relaxed);
+	}
+	// Every write the operations up to here list is published; none after them can list one over the word.
+	auto&          master = m_renderer.GetCommandScheduler().GetMasterSemaphore();
+	const uint64_t tick   = m_renderer.GetBufferCache().PublishedDirectTick(address, size);
+	if (tick != 0u && !master.IsFree(tick)) {
+		// The open command buffer's tick: only the execution thread can submit it.
+		if (tick >= master.CurrentTick()) return fail(DrainFreeFallback::OpenBuffer);
+		const int64_t t0 = DrainFreeNowNs();
+		master.Wait(tick);
+		s.tick_waits.fetch_add(1, std::memory_order_relaxed);
+		s.tick_ns.fetch_add(static_cast<uint64_t>(DrainFreeNowNs() - t0), std::memory_order_relaxed);
+	}
+	s.skipped.fetch_add(1, std::memory_order_relaxed);
+	return true;
+}
+
 CommandProcessor::CommandProcessor(RenderContext& renderer, int interrupt_event_id)
     : m_renderer(renderer), m_interrupt_event_id(interrupt_event_id) {}
 
@@ -2211,6 +2360,11 @@ uint64_t CommandProcessor::Emit(GpuOperation&& operation) {
 	const auto sequence = operation.sequence;
 	if (g_cp_thread) {
 		if (ChunkLead::On()) operation.emit_tsc = ChunkLead::Tsc(); // KYTY_TRACE_CHUNK_LEAD
+		static const bool drain_free_possible = BufferCache::DrainFreeWaitPossible(); // KYTY_PERF_DRAIN_FREE_WAIT
+		if (drain_free_possible &&
+		    (operation.kind == GpuOperationKind::Callback || operation.kind == GpuOperationKind::StateCallback)) {
+			g_stream_gpu->NoteOperationWrites(sequence, 1u);
+		}
 		g_stream_gpu->EmitOperation(std::move(operation));
 	} else {
 		Execute(operation);
@@ -2287,6 +2441,11 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 	}
 	auto& executor = m_renderer.GetRenderExecutor();
 	if (operation.resolved != nullptr) executor.UseResolvedDraw(operation.resolved);
+	// KYTY_PERF_DRAIN_FREE_WAIT: a draw or dispatch judged unable to write lists no GPU write of unknown bytes.
+	static const bool drain_free_watch = BufferCache::DrainFreeWaitPossible();
+	const bool        drain_free_judged = drain_free_watch && g_gpu_state != nullptr && operation.kind != GpuOperationKind::Callback &&
+	                               operation.kind != GpuOperationKind::StateCallback && g_gpu_state->OperationWrites(operation.sequence) == 1u;
+	const uint64_t    direct_writes0 = drain_free_judged ? m_renderer.GetBufferCache().DirectShaderWrites() : 0u;
 	switch (operation.kind) {
 		case GpuOperationKind::DrawIndex: ExecuteDrawIndex(operation, operation.draw_index); break;
 		case GpuOperationKind::DrawAuto: ExecuteDrawAuto(operation, operation.draw_auto); break;
@@ -2303,6 +2462,7 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 			if (operation.callback) operation.callback();
 			break;
 	}
+	if (drain_free_judged) NoteDrainFreeJudged(operation, m_renderer.GetBufferCache().DirectShaderWrites() != direct_writes0);
 	if (operation.resolved != nullptr) {
 		executor.UseResolvedDraw(nullptr);
 		RenderExecutor::ReleaseResolvedDraw(operation.resolved);
@@ -2445,10 +2605,26 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 		// have passed (the stream passes later instead; 0 of 92 160 in the walk).
 		static const bool drain_check = std::getenv("KYTY_DIAG_REGMEM_DRAIN_CHECK") != nullptr;
 		if (TestWaitRegMemValue(value, ref, mask, func)) {
-			RunOnExecution(GpuDrain::DirectWrites, [this, addr] {
-				m_renderer.GetBufferCache().WaitDirectGpuWrites(reinterpret_cast<uint64_t>(addr), sizeof(T));
-			});
-			read();
+			// KYTY_PERF_DRAIN_FREE_WAIT: no drain when nothing in flight can write and the word's listed GPU writes were
+			// waited for here (=2: drained anyway, the two reads compared).
+			static const bool drain_free_possible = BufferCache::DrainFreeWaitPossible();
+			const uint32_t    drain_free          = g_cp_thread && drain_free_possible ? BufferCache::DrainFreeWaitMode() : 0u;
+			GuestGpu::DrainFreeFallback fallback {};
+			const bool skip = drain_free != 0u && g_stream_gpu->TryDrainFreeDirectWait(reinterpret_cast<uint64_t>(addr), sizeof(T), &fallback);
+			if (skip) read();
+			if (!skip || drain_free == 2u) {
+				const T free_value = value;
+				RunOnExecution(GpuDrain::DirectWrites, [this, addr] {
+					m_renderer.GetBufferCache().WaitDirectGpuWrites(reinterpret_cast<uint64_t>(addr), sizeof(T));
+				});
+				read();
+				if (drain_free_possible) g_drain_free.drained.fetch_add(1, std::memory_order_relaxed);
+				if (skip) {
+					NoteDrainFreeCompare(reinterpret_cast<uint64_t>(addr), free_value, value, TestWaitRegMemValue(free_value, ref, mask, func),
+					                     TestWaitRegMemValue(value, ref, mask, func));
+				}
+			}
+			if (drain_free_possible) ReportDrainFree();
 		} else if (drain_check) {
 			const uint64_t wref = ref, wmask = mask;
 			EmitCallback([this, addr, wref, wmask, func] {

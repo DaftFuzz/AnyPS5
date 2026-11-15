@@ -53,6 +53,7 @@ enum class Switch : uint32_t {
 	ServeInWait,           // KYTY_PERF_SERVE_IN_WAIT (cache/bufferCache.h)
 	CopyChain,             // KYTY_PERF_COPY_CHAIN (cache/bufferCache.cpp, StartCopyReadback)
 	RingWordsGpu,          // KYTY_PERF_RING_WORDS_GPU (cache/bufferCache.h, RecordDirectWordCopy)
+	DrainFreeWait,         // KYTY_PERF_DRAIN_FREE_WAIT (guest_gpu/graphicsRun.cpp, WaitRegMem)
 	Count
 };
 
