@@ -316,6 +316,8 @@ void BarCopyTickWait(uint64_t tick);
 bool BarGpuCopyVerify();
 uint32_t BarGpuCopyVerifyMode();
 bool HandbackRedoOn();
+bool CopyPredictPossible();
+uint32_t CopyPredictFixed();
 
 void BarCensusCopy(uint64_t bytes, uint64_t ns) {
 	auto&           s = BarCensus();
@@ -1570,6 +1572,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			// A write into a data-ring page whose GPU bytes are all dead (DropDeadRingBytes below drops them without a
 			// download) waits for nothing: the caller wait would only delay the same outcome (walk 9.11: ~150 waits of
 			// ~3.4 ms per ring half every other frame, with the GPU-read SRT words).
+			if (caller_eligible && !is_write && CopyPredictPossible()) NotePredictFault(vaddr); // KYTY_PERF_COPY_PREDICT
 			const bool ring_all_dead = caller_eligible && is_write && RingBytesAllDead(vaddr);
 			if (caller_eligible && !ring_all_dead) {
 				auto plan = PlanCallerWait(vaddr, size, is_write);
@@ -1802,9 +1805,35 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 // before). Requests the host-mapped read cannot serve (unknown write tick, more than 1 MiB, unmapped buffer, write not
 // recorded yet) are served as before.
 
+// ---- KYTY_PERF_COPY_PREDICT (bufferCache.h) ---------------------------------------------------------------------------
+namespace {
+uint32_t CopyPredictFixed() {
+	static const uint32_t value = [] {
+		const char*    text = std::getenv("KYTY_PERF_COPY_PREDICT");
+		const uint32_t v    = text != nullptr ? static_cast<uint32_t>(std::strtoul(text, nullptr, 10)) : 0u;
+		if (v != 0) std::fprintf(stderr, "KYTY_PERF_COPY_PREDICT=%u: hand-back copies of predicted read windows start when their write is submitted%s\n", v, v == 2 ? " (check: every applied predicted window verified)" : "");
+		return v;
+	}();
+	return value;
+}
+bool CopyPredictPossible() {
+	static const bool value = Common::LiveAb::Possible(Common::LiveAb::Switch::CopyPredict, CopyPredictFixed());
+	return value;
+}
+struct PredictStats {
+	uint64_t faults = 0, queued = 0, issued = 0, declined = 0, waiting = 0, applied = 0, joined = 0, bytes = 0, frames = 0;
+};
+PredictStats g_predict; // GPU thread
+} // namespace
+
 BufferCache::CallerPlan BufferCache::PlanCallerWait(uint64_t vaddr, uint64_t size, bool is_write) {
 	CallerPlan plan;
 	if (!m_scheduler.Active() || m_scheduler.Current().IsInvalid()) return plan;
+	if (CopyPredictPossible()) {
+		for (const auto& entry: m_eager_readbacks) {
+			if (entry.predicted && vaddr < entry.end && entry.start < vaddr + size) g_predict.joined++;
+		}
+	}
 	// 1. Pending eager copies of the bytes, which ReadMemory waits for first (ApplyEagerReadbacks). The download is
 	// planned by the next request, once they published.
 	for (const auto& entry: m_eager_readbacks) {
@@ -5057,8 +5086,8 @@ void BufferCache::ApplyEagerReadbacks(uint64_t vaddr, uint64_t size, bool wait) 
 			// so it keeps none of its own pages.
 			const uint64_t lo = entry.start;
 			const uint64_t hi = entry.end;
-			if (HandbackRedoOn()) RedoHandbackWrittenDuringFlight(entry); // KYTY_FIX_HANDBACK_REDO
-			if (BarGpuCopyVerify()) VerifyCopyReadback(entry); // KYTY_PERF_BAR_GPU_COPY_VERIFY (diagnostic)
+			if (HandbackRedoOn() || entry.predicted) RedoHandbackWrittenDuringFlight(entry); // KYTY_FIX_HANDBACK_REDO, KYTY_PERF_COPY_PREDICT
+			if (BarGpuCopyVerify() || (entry.predicted && CopyPredictFixed() == 2u)) VerifyCopyReadback(entry); // KYTY_PERF_BAR_GPU_COPY_VERIFY
 			entry = std::move(m_eager_readbacks.back());
 			m_eager_readbacks.pop_back();
 			InFlightRebuild();
@@ -5273,6 +5302,7 @@ void BufferCache::NoteGpuWriteTick(uint64_t vaddr, uint64_t size) {
 	// KYTY_PERF_EXACT_WALKER / _FAULTS (cache/exactTicks.h): every raise also notes the exact range in the learned
 	// granules, before the same-tick skip below (a granule learned since the noted range was raised needs its entry).
 	if (ExactTicks::Kept()) ExactNote(vaddr, size, tick);
+	if (!m_predict_keys.empty() && GuestGpu::IsGpuThread()) PredictNoteWrite(WriteTickKey(vaddr), WriteTickKey(vaddr + size - 1)); // KYTY_PERF_COPY_PREDICT
 	// A range inside one already raised to this tick needs no new loop.
 	bool noted = false;
 	for (const auto& note: m_granule_notes) {
@@ -6138,7 +6168,7 @@ bool BufferCache::CopyChainOn() {
 	return Common::LiveAb::Gate(Common::LiveAb::Switch::CopyChain, CopyChainFixed()) != 0;
 }
 
-uint64_t BufferCache::StartCopyReadback(CallerPlan& plan, uint64_t vaddr, bool is_write, bool chained) {
+uint64_t BufferCache::StartCopyReadback(CallerPlan& plan, uint64_t vaddr, bool is_write, bool chained, bool predicted) {
 	auto&      s       = m_caller_stats;
 	const auto decline = [&] {
 		s.copy_declined.fetch_add(1, std::memory_order_relaxed);
@@ -6152,7 +6182,7 @@ uint64_t BufferCache::StartCopyReadback(CallerPlan& plan, uint64_t vaddr, bool i
 	}
 	// Only what TryBarDownload would copy with the GPU; a smaller download is read from the mapping at once.
 	const uint32_t gpu_copy_kb = Common::LiveAb::Gate(Common::LiveAb::Switch::BarGpuCopy, BarGpuCopyFixed());
-	if (!((gpu_copy_kb != 0 && plan.total >= (uint64_t {gpu_copy_kb} << 10u)) || plan.total > BarMaxBytes)) return decline();
+	if (!predicted && !((gpu_copy_kb != 0 && plan.total >= (uint64_t {gpu_copy_kb} << 10u)) || plan.total > BarMaxBytes)) return decline();
 	// A write fault whose page the dead-ring rule frees downloads nothing.
 	if (is_write && DeadRingWouldFree(vaddr)) return decline();
 	// A hand-back copy still under way over the window: the request's download waits for it (WaitCopyReadbacks).
@@ -6186,10 +6216,172 @@ uint64_t BufferCache::StartCopyReadback(CallerPlan& plan, uint64_t vaddr, bool i
 	}
 	m_eager_readbacks.push_back({.start = plan.lo, .end = plan.hi, .generation = 0, .tick = plan.newest,
 	                             .done = std::make_shared<std::atomic_bool>(false), .bytes = std::move(plan.intervals),
-	                             .copy_tick = copy_tick, .source = reinterpret_cast<uint64_t>(static_cast<VkBuffer>(buffer.Handle())),
+	                             .copy_tick = copy_tick, .predicted = predicted, .source = reinterpret_cast<uint64_t>(static_cast<VkBuffer>(buffer.Handle())),
 	                             .frame = DebugPresentCount().load()});
 	s.copy_issued.fetch_add(1, std::memory_order_relaxed);
 	return copy_tick;
+}
+
+uint32_t BufferCache::CopyPredictMode() {
+	return Common::LiveAb::Gate(Common::LiveAb::Switch::CopyPredict, CopyPredictFixed());
+}
+
+void BufferCache::NotePredictFault(uint64_t vaddr) {
+	const uint64_t key = WriteTickKey(vaddr);
+	auto           it  = m_predict.find(key);
+	if (it == m_predict.end()) {
+		if (m_predict.size() >= 4096u) return;
+		it = m_predict.emplace(key, PredictGranule {}).first;
+	}
+	it->second.frames |= 1u;
+	it->second.pages |= static_cast<uint16_t>(1u << ((vaddr >> 12u) & 15u));
+	g_predict.faults++;
+}
+
+void BufferCache::PredictNoteWrite(uint64_t first_key, uint64_t last_key) {
+	auto it = std::lower_bound(m_predict_keys.begin(), m_predict_keys.end(), first_key);
+	for (; it != m_predict_keys.end() && *it <= last_key; ++it) {
+		if (std::find(m_predict_dirty.begin(), m_predict_dirty.end(), *it) == m_predict_dirty.end()) {
+			m_predict_dirty.push_back(*it);
+			g_predict.queued++;
+		}
+		const auto g = m_predict.find(*it);
+		if (g != m_predict.end()) g->second.idle = 0;
+		s_predict_work = true;
+	}
+}
+
+void BufferCache::PredictFrame() {
+	const bool on = CopyPredictMode() != 0u;
+	m_predict_keys.clear();
+	for (auto it = m_predict.begin(); it != m_predict.end();) {
+		auto& g = it->second;
+		if (std::popcount(static_cast<uint32_t>(g.frames & 0x0fu)) >= 2) g.predicted = true;
+		if (g.predicted && ++g.idle > 8u) {
+			g.predicted = false;
+			g.pages     = 0;
+			g.idle      = 0;
+		}
+		g.frames = static_cast<uint8_t>(g.frames << 1u);
+		if (g.frames == 0 && !g.predicted) {
+			it = m_predict.erase(it);
+			continue;
+		}
+		if (on && g.predicted && g.pages != 0 && m_predict_keys.size() < 256u) m_predict_keys.push_back(it->first);
+		++it;
+	}
+	std::ranges::sort(m_predict_keys);
+	if (!on) m_predict_dirty.clear();
+	if ((++g_predict.frames % 90u) == 0 && Common::EnvRead::PerfLines()) {
+		auto& s = g_predict;
+		std::fprintf(stderr,
+		             "PERF copy_predict granules=%zu predicted=%zu faults=%llu queued=%llu issued=%llu declined=%llu waiting=%llu "
+		             "applied=%llu joined=%llu kb=%llu (per ~90 frames)\n",
+		             m_predict.size(), m_predict_keys.size(), static_cast<unsigned long long>(s.faults),
+		             static_cast<unsigned long long>(s.queued), static_cast<unsigned long long>(s.issued),
+		             static_cast<unsigned long long>(s.declined), static_cast<unsigned long long>(s.waiting),
+		             static_cast<unsigned long long>(s.applied), static_cast<unsigned long long>(s.joined),
+		             static_cast<unsigned long long>(s.bytes >> 10u));
+		const uint64_t frames = s.frames;
+		s                     = PredictStats {};
+		s.frames              = frames;
+	}
+}
+
+void BufferCache::IssuePredictedCopies() {
+	s_predict_work = false;
+	if (!m_scheduler.Active() || m_scheduler.Current().IsInvalid()) {
+		s_predict_work = !m_predict_dirty.empty();
+		return;
+	}
+	// Finished predicted copies are applied now: their pages open without a fault.
+	bool     in_flight = false;
+	uint32_t restarts  = 0;
+	for (size_t i = 0; i < m_eager_readbacks.size(); i++) {
+		const auto& entry = m_eager_readbacks[i];
+		if (!entry.predicted) continue;
+		if (!EagerDone(entry)) {
+			in_flight = true;
+			continue;
+		}
+		const uint64_t lo = entry.start, hi = entry.end;
+		ApplyEagerReadbacks(lo, hi - lo, false);
+		g_predict.applied++;
+		if (++restarts > 256u) break;
+		i = static_cast<size_t>(-1);
+	}
+	const uint64_t current = m_scheduler.CurrentTick();
+	const bool     on      = CopyPredictMode() != 0u;
+	for (size_t i = 0; i < m_predict_dirty.size();) {
+		const uint64_t key  = m_predict_dirty[i];
+		const auto     keep = [&] {
+			g_predict.waiting++;
+			s_predict_work = true;
+			++i;
+		};
+		const auto drop = [&] {
+			m_predict_dirty[i] = m_predict_dirty.back();
+			m_predict_dirty.pop_back();
+		};
+		const auto tick = GranuleWriteTick(key);
+		const auto g    = m_predict.find(key);
+		if (!on || !tick || g == m_predict.end() || g->second.pages == 0) {
+			drop();
+			continue;
+		}
+		if (*tick >= current) {
+			keep();
+			continue;
+		}
+		const uint32_t pages = g->second.pages;
+		const uint64_t lo    = (key << 16u) + uint64_t {static_cast<uint32_t>(std::countr_zero(pages))} * TRACKER_PAGE_SIZE;
+		const uint64_t hi    = (key << 16u) + uint64_t {32u - static_cast<uint32_t>(std::countl_zero(pages))} * TRACKER_PAGE_SIZE;
+		const auto*    owner = m_page_table.Find(lo >> PageTable::kPageBits);
+		if (owner == nullptr || !*owner || !m_memory_tracker.IsRegionGpuModified(lo, hi - lo)) {
+			drop();
+			continue;
+		}
+		auto& buffer = m_slot_buffers[*owner];
+		if (buffer.is_deleted || !buffer.IsInBounds(lo, hi - lo) || buffer.Mapped().empty() ||
+		    std::ranges::any_of(m_eager_readbacks, [&](const EagerReadback& e) { return e.start < hi && lo < e.end; })) {
+			drop();
+			continue;
+		}
+		CallerPlan plan;
+		uint64_t   newest = 0, total = 0;
+		if (ScanBarDownload(buffer, lo, hi - lo, plan.intervals, newest, total) >= 0) {
+			drop();
+			continue;
+		}
+		const auto ready = m_buffer_ready_tick.find(reinterpret_cast<uint64_t>(static_cast<VkBuffer>(buffer.Handle())));
+		if (ready == m_buffer_ready_tick.end() || total > BarReadMaxBytes(BarMaxBytes)) {
+			drop();
+			continue;
+		}
+		newest = std::max(newest, ready->second);
+		const bool pending = std::ranges::any_of(plan.intervals, [&](const auto& in) {
+			return std::ranges::any_of(m_bar_pending_writes, [&](const auto& w) { return w.first < in.second && in.first < w.first + w.second; });
+		});
+		if (newest >= current || pending) {
+			keep();
+			continue;
+		}
+		plan.buffer = &buffer;
+		plan.lo     = lo;
+		plan.hi     = hi;
+		plan.newest = newest;
+		plan.total  = total;
+		if (StartCopyReadback(plan, lo, false, true, true) != 0) {
+			g_predict.issued++;
+			g_predict.bytes += total;
+			g->second.frames |= 1u;
+			in_flight = true;
+		} else {
+			g_predict.declined++;
+		}
+		drop();
+	}
+	if (in_flight) s_predict_work = true;
 }
 
 void BufferCache::RedoHandbackWrittenDuringFlight(const EagerReadback& entry) {
@@ -7177,6 +7369,7 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 
 void BufferCache::RunGarbageCollector() {
 	CommitUploadBatch(BatchCommit::Collector); // (no scope is open here; defensive)
+	if (CopyPredictPossible()) PredictFrame(); // KYTY_PERF_COPY_PREDICT
 	if (!m_direct_ranges.empty()) ReportDirectStats(m_direct_gpu_writes.size()); // KYTY_PERF_DIRECT_RANGES, per frame
 	if (D6C0Mode() != 0u && !RecordKeyedVerifyEnabled()) {
 		// KYTY_D6_C0: a new frame of listed pages (as below); a summary every 64 frames.

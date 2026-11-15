@@ -1346,6 +1346,7 @@ void GuestGpu::ExecutionThread() {
 				RunCommands();
 			}
 		}
+		if (BufferCache::PredictWork()) m_renderer.GetBufferCache().IssuePredictedCopies(); // KYTY_PERF_COPY_PREDICT
 		if (++unnotified >= NotifyInterval) {
 			m_executed.Notify();
 			unnotified = 0;
