@@ -331,6 +331,10 @@ public:
 		// N7.2: a GPU indirect packet (the SGPR layout made: indirect_draw.enabled) and its arguments
 		bool                   gpu_indirect = false;
 		DrawIndirectGpuArgs    indirect_args {};
+		// KYTY_PERF_DRAIN_FREE_WAIT: the operation's sequence and where its write verdict goes (PipelineCache::ResolvedWrites,
+		// 3 for an empty resolution), published before the slot is ready; null: not published (a check slot).
+		uint64_t               op_sequence = 0;
+		void                   (*writes_verdict)(uint64_t sequence, uint8_t verdict) = nullptr;
 	};
 	// The helper (or, with KYTY_CHECK_RESOLVE=2, the resolve thread for the reference): resolves the task into `slot`
 	// (the draw's pre-check included) and marks it ready (empty when there was nothing to resolve).

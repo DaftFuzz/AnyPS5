@@ -116,6 +116,11 @@ constexpr SwitchInfo Switches[] = {
     // Per label: published by the completion thread (a plain store into a direct range with no earlier publish still
     // queued) or handed to the execution thread; the value and the order of publishes are the same.
     {Switch::LabelsOffThread, "KYTY_PERF_LABELS_OFF_THREAD", 1},
+    // Per WAIT_REG_MEM on a direct-range word that passes as read: whether the command processor drains the execution
+    // thread before it reads the word again, or (no operation in flight can write buffer memory) waits for the word's
+    // recorded GPU writes itself; the word reads the same either way. The listed writes are published whenever the
+    // switch can be on, so either phase finds them; nothing else outlives the wait.
+    {Switch::DrainFreeWait, "KYTY_PERF_DRAIN_FREE_WAIT", 1},
     // Project 15 way B P1 (test switch): a read-only buffer binding with a ready plan entry whose proof holds takes the
     // binding the helper computed (handle, aligned offset, range, offset byte, record stride) instead of RebindBuffers'.
 };

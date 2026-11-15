@@ -85,6 +85,9 @@ struct ResolvedStage {
 	ShaderStageRuntime*                          out_stage   = nullptr; // where the stage's runtime went
 	ShaderProgram*                               out_program = nullptr;
 	uint64_t                                     shader_base = 0;
+	uint64_t                                     shader_hash = 0;
+	uint32_t                                     code_size   = 0;
+	std::vector<uint32_t>                        static_key;
 	std::array<uint32_t, 40>                     user_data {};
 	uint32_t                                     user_data_count = 0;
 	std::array<uint32_t, 3>                      workgroup_counts {}; // a compute stage's runtime
@@ -108,6 +111,19 @@ struct ResolveStats {
 	std::array<std::array<std::atomic<uint64_t>, static_cast<size_t>(ResolveMiss::Count)>, 2> walks {}, walk_ns {};
 	std::array<std::atomic<uint64_t>, 16> missing_by_stage {};
 } g_resolve_stats;
+struct StageCompileStats {
+	std::atomic<uint64_t> count {0}, us {0}, reused {0};
+};
+std::array<StageCompileStats, 2> g_stage_compile;
+std::atomic<uint64_t>            g_null_slot_prewarm {0};
+StageCompileStats                g_graphics_create;
+uint32_t NullSlotPrewarmMinWords() {
+	static const uint32_t words = [] {
+		const char* value = std::getenv("KYTY_PERF_NULL_SLOT_PREWARM_MIN_WORDS");
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 100000u;
+	}();
+	return words;
+}
 // Project 15 S2d (KYTY_CHECK_PEEK=2, diagnostic): PeekAdopt's prediction against what Adopt did (execution thread).
 struct PeekAdoptStats {
 	uint64_t calls = 0, keep = 0, refind = 0, compile = 0, not_adoptable = 0, reads_changed = 0, bad = 0, injected = 0, detected = 0;
@@ -147,6 +163,8 @@ struct ResolvedStages {
 	uint32_t                                                       ahead_distance    = 0;
 	std::array<const ShaderRecompiler::IR::CompiledShaderInfo*, 4> ahead_programs {};
 	std::array<ShaderProgram, 4>                                   ahead_handles {};
+	std::array<const void*, 4>                                     standin_permutations {};
+	std::array<bool, 4>                                            standin_missing {};
 
 	void Reset() {
 		ahead_valid       = false;
@@ -1307,6 +1325,20 @@ struct PipelineCache::ProgramCache {
 		if (precompile_key != 0) {
 			RecordPrecompileStage(stage, params, input_info, compile_push_start, permutation, precompile_key);
 		}
+		{
+			const double total = MillisecondsSince(translate_begin);
+			auto&        acc   = g_stage_compile[stage == ShaderType::Compute ? 1 : 0];
+			acc.count.fetch_add(1, std::memory_order_relaxed);
+			acc.us.fetch_add(static_cast<uint64_t>(total * 1000.0), std::memory_order_relaxed);
+			if (use_reused) acc.reused.fetch_add(1, std::memory_order_relaxed);
+		}
+		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			if (precompiler != nullptr && CompileJobsEnabled() && ShaderRecompiler::IR::NullSlotPrewarmEnabled() &&
+			    last_spirv_words >= NullSlotPrewarmMinWords()) {
+				PrewarmLiveVariants(params, input_info, compile_push_start, lookup_key.static_state, entry->second.resource_plan,
+				                    permutation.specialization);
+			}
+		}
 		// KYTY_TRACE_PERF: a shader preparation over 50 ms, split by step (the GPU thread waits for all of it).
 		if (PerfEnabled()) {
 			const double total_ms = MillisecondsSince(translate_begin);
@@ -1384,6 +1416,25 @@ struct PipelineCache::ProgramCache {
 		precompiler->Record(record);
 		// Compute ones too: GetComputePipeline marks the key warm once the pipeline exists.
 		precompile_stages[permutation.handle.id] = {.key = key, .spirv_hash = last_spirv_hash};
+	}
+
+	void PrewarmLiveVariants(const ShaderParams& params, const ShaderComputeInputInfo& input_info, uint32_t push_cursor,
+	                         std::span<const uint32_t> static_state, const ShaderRecompiler::IR::ResourcePlan& plan,
+	                         const ShaderRecompiler::IR::ResourceSpecialization& specialization) {
+		for (size_t i = 0; i < specialization.buffers.size() && i < plan.info.buffers.size(); i++) {
+			const auto& b = specialization.buffers[i];
+			if (!b.zero_stride_oob || static_cast<uint32_t>(b.descriptor_format) != 0u || b.descriptor_swizzle != 0u) continue;
+			for (const auto& guess: ShaderRecompiler::IR::NullSlotGuesses(plan, i)) {
+				auto  variant = specialization;
+				auto& slot    = variant.buffers[i];
+				slot.packed_stride      = (slot.packed_stride & ~0x3fffu) | (1u << 31u) | 1u;
+				slot.zero_stride_oob    = false;
+				slot.descriptor_format  = static_cast<Prospero::BufferFormat>(guess[0]);
+				slot.descriptor_swizzle = guess[1];
+				g_null_slot_prewarm.fetch_add(1, std::memory_order_relaxed);
+				QueueRuntimeCompile(params, input_info, push_cursor, static_state, &variant);
+			}
+		}
 	}
 
 	void QueueRuntimeCompile(const ShaderParams& params, const ShaderComputeInputInfo& input_info, uint32_t push_cursor,
@@ -1496,6 +1547,9 @@ struct PipelineCache::ProgramCache {
 		r.out_stage       = &input_info.stage;
 		r.out_program     = &out_program;
 		r.shader_base     = params.Base();
+		r.shader_hash     = params.hash;
+		r.code_size       = static_cast<uint32_t>(params.code.size());
+		r.static_key.assign(ahead_key.static_state.begin(), ahead_key.static_state.end());
 		r.user_data_count = params.user_data_count;
 		std::copy_n(params.user_data.begin(), params.user_data_count, r.user_data.begin());
 		r.taken = false;
@@ -1617,6 +1671,35 @@ struct PipelineCache::ProgramCache {
 			permutation->program.bindings.AdvancePushData(cursor);
 		}
 		return true;
+	}
+
+	[[nodiscard]] bool PeekStandIn(ResolvedStages& results) {
+		uint32_t cursor  = results.push_start;
+		bool     missing = false;
+		for (uint32_t i = 0; i < results.count && i < 4u; i++) {
+			const auto& r     = results.stages[i];
+			const auto& entry = *static_cast<const SourceEntry*>(r.entry);
+			if (!r.ok || entry.call_source) return false;
+			auto specialization = r.specialization;
+			if (!r.null_share_kinds.empty()) ShaderRecompiler::IR::PeekNullFormattedShare(*r.plan, r.null_share_kinds, specialization);
+			std::shared_lock   lock(programs_mutex);
+			const Permutation* permutation = entry.PeekPermutation(cursor, specialization);
+			results.standin_missing[i]      = permutation == nullptr;
+			results.standin_permutations[i] = permutation;
+			if (permutation == nullptr) {
+				if (entry.permutations.empty()) return false;
+				permutation = &entry.permutations.front();
+				missing     = true;
+			}
+			results.ahead_programs[i] = &permutation->program;
+			results.ahead_handles[i]  = permutation->handle;
+			permutation->program.bindings.AdvancePushData(cursor);
+		}
+		return missing;
+	}
+
+	[[nodiscard]] static const ShaderRecompiler::IR::ResourceSpecialization* PermutationSpecialization(const void* permutation) {
+		return permutation != nullptr ? &static_cast<const Permutation*>(permutation)->specialization : nullptr;
 	}
 
 	void NotePermutationRepeat(const char* stage_name, const ProgramKey& key, const SourceEntry& current,
@@ -2359,6 +2442,85 @@ static uint8_t ObjprimIdSlot(const HW::Context& context, const ShaderPixelInputI
 	return chosen;
 }
 
+namespace {
+bool IndirectCoverEnabled() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_PERF_INDIRECT_COVER");
+		const bool  enabled = value != nullptr && value[0] == '1';
+		if (enabled) std::fprintf(stderr, "PERF_INDIRECT_COVER on\n");
+		return enabled;
+	}();
+	return on;
+}
+struct IndirectCoverTable {
+	std::shared_mutex                                     mutex;
+	std::unordered_map<uint64_t, ShaderIndirectDrawInfo> layouts;
+	std::unordered_set<uint64_t>                          conflicts;
+	std::unordered_set<uint64_t>                          direct_first;
+	std::atomic<uint64_t>                                 learned {0}, conflicted {0}, rejected {0}, applied {0}, direct_first_count {0};
+} g_indirect_cover;
+
+void LearnIndirectCover(uint64_t hash, const ShaderVertexInputInfo& info) {
+	const auto& layout = info.indirect_draw;
+	if (!layout.enabled || info.logical_stage != ShaderType::Vertex || !info.fetch_embedded || !info.draw_base_once ||
+	    info.stage.program == nullptr) {
+		return;
+	}
+	const auto& program = *info.stage.program;
+	const auto  base    = static_cast<int32_t>(program.user_data_base);
+	const bool  match   = layout.draw_index == ShaderIndirectDrawInfo::NoSgpr && program.info.vertex_offset_sgpr >= base &&
+	                   program.info.instance_offset_sgpr >= base &&
+	                   program.info.vertex_offset_sgpr - base == static_cast<int32_t>(layout.base_vertex) &&
+	                   program.info.instance_offset_sgpr - base == static_cast<int32_t>(layout.base_instance);
+	auto& t = g_indirect_cover;
+	if (!match) {
+		t.rejected.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	{
+		std::shared_lock lock(t.mutex);
+		if (const auto it = t.layouts.find(hash); it != t.layouts.end() && it->second.Key() == layout.Key()) return;
+		if (t.conflicts.contains(hash)) return;
+	}
+	std::unique_lock lock(t.mutex);
+	if (const auto it = t.layouts.find(hash); it != t.layouts.end()) {
+		if (it->second.Key() != layout.Key()) {
+			t.layouts.erase(it);
+			t.conflicts.insert(hash);
+			t.conflicted.fetch_add(1, std::memory_order_relaxed);
+		}
+		return;
+	}
+	if (t.conflicts.contains(hash) || t.direct_first.contains(hash)) return;
+	t.layouts.emplace(hash, layout);
+	t.learned.fetch_add(1, std::memory_order_relaxed);
+}
+
+void ApplyIndirectCover(uint64_t hash, ShaderVertexInputInfo& info) {
+	auto& t = g_indirect_cover;
+	{
+		std::shared_lock lock(t.mutex);
+		if (const auto it = t.layouts.find(hash); it != t.layouts.end()) {
+			info.indirect_draw = it->second;
+			t.applied.fetch_add(1, std::memory_order_relaxed);
+			return;
+		}
+		if (t.direct_first.contains(hash)) return;
+	}
+	std::unique_lock lock(t.mutex);
+	if (t.layouts.contains(hash)) return;
+	if (t.direct_first.insert(hash).second) t.direct_first_count.fetch_add(1, std::memory_order_relaxed);
+}
+} // namespace
+
+void ReportIndirectCover() {
+	if (!IndirectCoverEnabled()) return;
+	const auto& t = g_indirect_cover;
+	std::fprintf(stderr, "PERF indirect_cover learned=%llu conflicted=%llu rejected=%llu applied=%llu direct_first=%llu\n",
+	             static_cast<unsigned long long>(t.learned.load()), static_cast<unsigned long long>(t.conflicted.load()),
+	             static_cast<unsigned long long>(t.rejected.load()), static_cast<unsigned long long>(t.applied.load()), static_cast<unsigned long long>(t.direct_first_count.load()));
+}
+
 // The program inputs of a draw (the part of GetGraphicsPrograms before the program lookups); the cursor before the
 // first stage in *push_data_cursor.
 static void GraphicsProgramInputs(const GraphicContext& graphics, const HW::VertexShaderInfo& vertex_regs,
@@ -2385,6 +2547,10 @@ static void GraphicsProgramInputs(const GraphicContext& graphics, const HW::Vert
 		vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]);
 		if (vertex_info[0].logical_stage == ShaderType::Vertex) {
 			vertex_info[0].indirect_draw = indirect_draw;
+			if (!indirect_draw.enabled && IndirectCoverEnabled() && vertex_info[0].fetch_embedded &&
+			    vertex_info[0].draw_base_once && user_config.GetIndexOffset() == 0u) {
+				ApplyIndirectCover(vertex_params[0].hash, vertex_info[0]);
+			}
 		}
 	}
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
@@ -2561,6 +2727,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
 		result.vertex[i] = m_program_cache->Get(vertex_params[i], vertex_info[i], push_data_cursor);
 	}
+	if (!tess_active && IndirectCoverEnabled()) LearnIndirectCover(vertex_params[0].hash, vertex_info[0]);
 	return result;
 }
 
@@ -2766,6 +2933,27 @@ void PipelineCache::RestoreAhead(ResolvedStages& results, const AheadSaved& save
 
 bool PipelineCache::StagesAdoptable(const ResolvedStages& results) {
 	return results.adoptable && results.count != 0;
+}
+
+namespace {
+bool InfoWrites(const ShaderRecompiler::IR::ShaderInfo& info) {
+	return info.uses_dma || std::ranges::any_of(info.buffers, [](const auto& b) { return b.written; }) ||
+	       std::ranges::any_of(info.images, [](const auto& i) { return i.written; }) ||
+	       std::ranges::any_of(info.indirect_ranges, [](const auto& r) { return r.written; });
+}
+} // namespace
+
+uint8_t PipelineCache::ResolvedWrites(const ResolvedStages& results) {
+	if (!results.adoptable || results.count == 0) return 3;
+	bool writes = false;
+	for (uint32_t i = 0; i < std::min(results.count, 4u); i++) {
+		const auto& r = results.stages[i];
+		if (!r.ok || r.plan == nullptr || r.entry == nullptr || r.permutation == nullptr) return 3;
+		if (static_cast<const ProgramCache::SourceEntry*>(r.entry)->call_source) return 3;
+		const auto& program = static_cast<const ProgramCache::Permutation*>(r.permutation)->program;
+		writes = writes || program.has_address_writes || InfoWrites(program.info) || InfoWrites(r.plan->info);
+	}
+	return writes ? 2 : 1;
 }
 
 bool PipelineCache::AheadProgramsOk(const ResolvedStages& results) {
@@ -3313,8 +3501,11 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
+		const auto create_begin = std::chrono::steady_clock::now();
 		CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
 		                       ps_input_info, programs, static_params, m_driver_cache);
+		g_graphics_create.count.fetch_add(1, std::memory_order_relaxed);
+		g_graphics_create.us.fetch_add(static_cast<uint64_t>(MillisecondsSince(create_begin) * 1000.0), std::memory_order_relaxed);
 	}
 	m_pipelines_since_save++;
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
@@ -3380,14 +3571,18 @@ void TableAsyncReport(TableAsyncStats& s, size_t pending, size_t queued) {
 }
 } // namespace
 
-bool CompileJobsEnabled() {
-	static const bool enabled = [] {
-		const char* value = std::getenv("KYTY_PERF_COMPILE_JOBS");
-		const bool  on    = value != nullptr && value[0] == '1';
-		if (on) std::fprintf(stderr, "PERF_COMPILE_JOBS on\n");
-		return on;
+uint32_t CompileJobsMode() {
+	static const uint32_t mode = [] {
+		const char*    value = std::getenv("KYTY_PERF_COMPILE_JOBS");
+		const uint32_t m     = value != nullptr && (value[0] == '1' || value[0] == '2') ? static_cast<uint32_t>(value[0] - '0') : 0u;
+		if (m != 0u) std::fprintf(stderr, "PERF_COMPILE_JOBS on (mode %u)\n", m);
+		return m;
 	}();
-	return enabled;
+	return mode;
+}
+
+bool CompileJobsEnabled() {
+	return CompileJobsMode() != 0u;
 }
 
 bool CompileScoutEnabled() {
@@ -3407,6 +3602,14 @@ struct AheadGraphicsStats {
 } // namespace
 
 void PipelineCache::ReportCompileJobs() const {
+	if (PerfEnabled()) {
+		ReportIndirectCover();
+		const auto u = [](const std::atomic<uint64_t>& v) { return static_cast<unsigned long long>(v.load(std::memory_order_relaxed)); };
+		std::fprintf(stderr, "PERF stage_compile graphics=%llu/%.0fms(reused %llu) compute=%llu/%.0fms(reused %llu) null_slot_prewarm=%llu graphics_create=%llu/%.0fms\n",
+		             u(g_stage_compile[0].count), static_cast<double>(u(g_stage_compile[0].us)) / 1000.0, u(g_stage_compile[0].reused),
+		             u(g_stage_compile[1].count), static_cast<double>(u(g_stage_compile[1].us)) / 1000.0, u(g_stage_compile[1].reused),
+		             u(g_null_slot_prewarm), u(g_graphics_create.count), static_cast<double>(u(g_graphics_create.us)) / 1000.0);
+	}
 	if (!PerfEnabled() || !CompileJobsEnabled()) return;
 	const auto& s = g_compile_scout;
 	const auto  n = [](const std::atomic<uint64_t>& v) { return static_cast<unsigned long long>(v.load(std::memory_order_relaxed)); };
@@ -3549,6 +3752,75 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipelineAsync(
 		job->done.store(true, std::memory_order_release);
 	});
 	return nullptr;
+}
+
+bool PipelineCache::PeekStandIn(ResolvedStages& results) {
+	if (results.count != 2u && results.count != 1u) return false;
+	return m_program_cache->PeekStandIn(results);
+}
+
+void PipelineCache::QueueAheadGraphicsMiss(const ResolvedStages& results, const GraphicsPipelineKey& key,
+                                           std::span<const ShaderVertexInputInfo> vertex_info,
+                                           const ShaderPixelInputInfo* ps_input_info) {
+	if (m_precompiler == nullptr || vertex_info.size() != 1u || vertex_info[0].logical_stage != ShaderType::Vertex) return;
+	const bool ps_active = ps_input_info != nullptr;
+	if (results.count != (ps_active ? 2u : 1u)) return;
+	uint64_t mark = GraphicsPipelineKeyHash {}(key) ^ (uint64_t {results.push_start} << 1u);
+	for (uint32_t i = 0; i < results.count; i++) {
+		mark = mark * 0x9e3779b97f4a7c15ull ^ results.stages[i].shader_hash ^ (results.standin_missing[i] ? 0x55u : 0u);
+		if (!results.standin_missing[i]) {
+			mark ^= reinterpret_cast<uintptr_t>(results.standin_permutations[i]);
+		} else {
+			mark ^= XXH3_64bits(results.stages[i].specialization.buffers.data(),
+			                    results.stages[i].specialization.buffers.size() * sizeof(results.stages[i].specialization.buffers[0]));
+		}
+	}
+	{
+		std::lock_guard lock(m_ahead_workers_mutex);
+		if (!m_ahead_miss_seen.insert(mark).second) return;
+	}
+	auto miss           = std::make_unique<PrecompileGraphicsMiss>();
+	miss->ps_active     = ps_active;
+	miss->push_start    = results.push_start;
+	miss->vertex        = vertex_info[0];
+	miss->vertex.stage  = {};
+	if (ps_active) {
+		miss->pixel       = *ps_input_info;
+		miss->pixel.stage = {};
+	}
+	miss->rendering     = key.rendering;
+	miss->vertex_input  = key.vertex_input;
+	miss->static_params = key.static_params;
+	for (uint32_t i = 0; i < results.count; i++) {
+		const auto& r = results.stages[i];
+		auto&       s = miss->stages[i];
+		s.missing     = results.standin_missing[i];
+		s.code_size   = r.code_size;
+		auto& rec     = s.record;
+		rec.stage       = r.stage;
+		rec.shader_hash = r.shader_hash;
+		rec.user_data.assign(r.user_data.begin(), r.user_data.begin() + r.user_data_count);
+		rec.static_key  = r.static_key;
+		rec.revision    = ShaderPrecompiler::Revision();
+		if (s.missing) {
+			const auto* code = reinterpret_cast<const uint32_t*>(r.shader_base);
+			if (code == nullptr || r.code_size == 0u) return;
+			rec.code.assign(code, code + r.code_size);
+			if (PrecompileCodeHash(rec.code, {}) != r.shader_hash) return;
+			rec.specialization = r.specialization;
+			if (!r.null_share_kinds.empty()) ShaderRecompiler::IR::PeekNullFormattedShare(*r.plan, r.null_share_kinds, rec.specialization);
+			if (i == 0) {
+				rec.vertex       = miss->vertex;
+			} else {
+				rec.pixel        = miss->pixel;
+			}
+		} else {
+			rec.specialization = *ProgramCache::PermutationSpecialization(results.standin_permutations[i]);
+			s.info             = results.ahead_programs[i];
+			s.module           = results.ahead_handles[i].module;
+		}
+	}
+	m_precompiler->EnqueueGraphicsMiss(std::move(miss));
 }
 
 void PipelineCache::QueueAheadGraphicsPipeline(const GraphicsPipelineKey& key, std::span<const ShaderVertexInputInfo> vertex_info,

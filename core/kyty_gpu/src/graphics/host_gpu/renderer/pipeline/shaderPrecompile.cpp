@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCacheTrace.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/ir/passes/NullSlot.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kytyGitVersion.h"
 #include "loader/systemContent.h"
@@ -2252,6 +2253,90 @@ bool ShaderPrecompiler::CoveringRecord(const PrecompileGraphicsRecord& wanted, P
 	return true;
 }
 
+size_t ShaderPrecompiler::CanonicalizeNullSlots(std::vector<PrecompileGraphicsRecord>& pipelines) {
+	if (!ShaderRecompiler::IR::NullSlotRuntimeForStage(ShaderType::Vertex)) return 0;
+	const auto null_slot = [](const ShaderRecompiler::IR::ResourceSpecialization::Buffer& b) {
+		return b.zero_stride_oob && static_cast<uint32_t>(b.descriptor_format) == 0u && b.descriptor_swizzle == 0u;
+	};
+	const auto live_slot = [](const ShaderRecompiler::IR::ResourceSpecialization::Buffer& b) {
+		return !b.zero_stride_oob && (b.packed_stride >> 31u) != 0u && static_cast<uint32_t>(b.descriptor_format) != 0u;
+	};
+	std::unordered_map<uint64_t, std::vector<std::array<uint32_t, 2>>> live;
+	for (const auto key: m_stage_order) {
+		const auto& record = m_stages.at(key).record;
+		auto&       values = live[ProgramKey(RecordIdentity(record))];
+		const auto& bufs   = record.specialization.buffers;
+		if (values.size() < bufs.size()) values.resize(bufs.size(), {0u, 0u});
+		for (size_t i = 0; i < bufs.size(); i++) {
+			if (live_slot(bufs[i])) values[i] = {static_cast<uint32_t>(bufs[i].descriptor_format), bufs[i].descriptor_swizzle};
+		}
+	}
+	std::unordered_map<uint64_t, uint64_t> remap;
+	std::vector<uint64_t>                  order;
+	size_t                                 slots_runtime = 0;
+	size_t                                 slots_shared  = 0;
+	size_t                                 merged        = 0;
+	for (const auto key: m_stage_order) {
+		auto  node   = m_stages.extract(key);
+		auto& record = node.mapped().record;
+		const auto& values = live[ProgramKey(RecordIdentity(record))];
+		bool        changed = false;
+		for (size_t i = 0; i < record.specialization.buffers.size(); i++) {
+			auto& b = record.specialization.buffers[i];
+			if (!null_slot(b)) continue;
+			const bool known = i < values.size() && values[i][0] != 0u;
+			b.packed_stride  = (b.packed_stride & ~0x3fffu) | (1u << 31u) | 1u;
+			b.zero_stride_oob = false;
+			if (known) {
+				b.descriptor_format  = static_cast<Prospero::BufferFormat>(values[i][0]);
+				b.descriptor_swizzle = values[i][1];
+				slots_shared++;
+			} else {
+				b.descriptor_format  = static_cast<Prospero::BufferFormat>(ShaderRecompiler::IR::NullSlot::RuntimeFormat);
+				b.descriptor_swizzle = 0u;
+				slots_runtime++;
+			}
+			changed = true;
+		}
+		const auto new_key = changed ? record.Key() : key;
+		remap[key]         = new_key;
+		if (changed) {
+			m_recorded_graphics.erase(key);
+			m_recorded_graphics.insert(new_key);
+		}
+		if (m_stages.contains(new_key) || std::ranges::find(order, new_key) != order.end()) {
+			merged++;
+			continue;
+		}
+		node.key() = new_key;
+		m_stages.insert(std::move(node));
+		order.push_back(new_key);
+	}
+	m_stage_order = std::move(order);
+	size_t pipelines_changed = 0;
+	for (auto& p: pipelines) {
+		bool changed = false;
+		for (auto& k: p.vertex) {
+			if (k == 0) continue;
+			if (const auto it = remap.find(k); it != remap.end() && it->second != k) {
+				k       = it->second;
+				changed = true;
+			}
+		}
+		if (p.pixel != 0) {
+			if (const auto it = remap.find(p.pixel); it != remap.end() && it->second != p.pixel) {
+				p.pixel = it->second;
+				changed = true;
+			}
+		}
+		if (changed) pipelines_changed++;
+	}
+	std::fprintf(stderr,
+	             "NULL_SLOT_CANON graphics stages=%zu slots_runtime=%zu slots_shared=%zu stages_merged=%zu pipelines_rekeyed=%zu\n",
+	             m_stage_order.size(), slots_runtime, slots_shared, merged, pipelines_changed);
+	return slots_runtime + slots_shared;
+}
+
 void ShaderPrecompiler::LoadGraphics(const std::unordered_set<uint64_t>& skipped, std::vector<Job>& jobs,
                                      std::vector<Job>& stage_jobs) {
 	const auto bytes        = ReadFileBytes(m_graphics_journal_path);
@@ -2302,6 +2387,7 @@ void ShaderPrecompiler::LoadGraphics(const std::unordered_set<uint64_t>& skipped
 		}
 	});
 	torn = torn || !complete;
+	if (CanonicalizeNullSlots(pipelines) != 0u && header_ok && !Config::PrecompileOnly()) torn = true;
 	// The pipelines whose stages were all recorded (a stage record can be missing when its code had changed); one
 	// with a suspect key or stage is skipped for this build.
 	size_t unresolved = 0;
@@ -2845,7 +2931,7 @@ bool ShaderPrecompiler::CompileModule(const PrecompileStageRecord& record, uint6
 	g_reuse.compile_us.fetch_add(static_cast<uint64_t>(compile_ms * 1000.0), std::memory_order_relaxed);
 	spirv_words           = result.spirv.size();
 	const auto spirv_hash = XXH3_64bits(result.spirv.data(), result.spirv.size() * sizeof(uint32_t));
-	if (!forced_lds && record.revision == Revision() && spirv_hash != record.spirv_hash) {
+	if (!forced_lds && record.revision == Revision() && record.spirv_hash != 0u && spirv_hash != record.spirv_hash) {
 		// The same build made other SPIR-V from the recorded inputs: an input is missing from the record (or a
 		// SPIR-V-changing KYTY_ switch differs from the recording run).
 		std::fprintf(stderr, "SHADER_PRECOMPILE_MISMATCH hash=0x%016llx stage=%s key=%s (the game's SPIR-V differs)\n",
@@ -3200,6 +3286,7 @@ struct RuntimeJobStats {
 	std::atomic<uint64_t> queued {0}, first_use {0}, duplicate {0}, full {0}, started {0}, compiled {0}, first_use_failed {0};
 	std::atomic<uint64_t> first_use_known {0}, skipped_taken {0}, dropped {0}, waited {0}, wait_us {0}, ready {0};
 	std::atomic<uint64_t> lead_us {0}, lead_n {0};
+	std::atomic<uint64_t> miss_queued {0}, miss_known {0}, miss_failed {0}, miss_created {0}, miss_stages {0}, miss_ms {0};
 } g_runtime_jobs;
 constexpr size_t RuntimeQueueMax = 1024;
 } // namespace
@@ -3285,7 +3372,104 @@ bool ShaderPrecompiler::MaterializeFirstUse(PrecompileStageRecord& record, uint6
 	return true;
 }
 
+void ShaderPrecompiler::EnqueueGraphicsMiss(std::unique_ptr<PrecompileGraphicsMiss> miss) {
+	if (!m_runtime || miss == nullptr) return;
+	auto job       = std::make_unique<RuntimeJob>();
+	job->miss      = std::move(miss);
+	job->queued_at = std::chrono::steady_clock::now();
+	{
+		std::lock_guard lock(m_mutex);
+		if (m_stop || m_quitting) return;
+		if (m_runtime_queue.size() >= RuntimeQueueMax) {
+			g_runtime_jobs.full.fetch_add(1, std::memory_order_relaxed);
+			return;
+		}
+		m_runtime_queue.push_back(job.get());
+		m_runtime_jobs.push_back(std::move(job));
+	}
+	g_runtime_jobs.miss_queued.fetch_add(1, std::memory_order_relaxed);
+	m_runtime_wake.notify_one();
+}
+
+void ShaderPrecompiler::RunGraphicsMiss(RuntimeJob& job) {
+	auto&      m     = *job.miss;
+	const auto begin = std::chrono::steady_clock::now();
+	std::array<ShaderRecompiler::IR::CompiledShaderInfo, 2> compiled;
+	std::array<const ShaderRecompiler::IR::CompiledShaderInfo*, 2> infos {};
+	std::array<vk::ShaderModule, 2> modules {};
+	std::array<uint64_t, 2>         keys {};
+	std::vector<vk::ShaderModule>   created;
+	const auto destroy = [&] {
+		for (auto module: created) m_graphics.device.destroyShaderModule(module, nullptr);
+	};
+	uint32_t       cursor = m.push_start;
+	const uint32_t count  = m.ps_active ? 2u : 1u;
+	for (uint32_t i = 0; i < count; i++) {
+		auto& s = m.stages[i];
+		if (s.missing) {
+			s.record.push_data_start = cursor;
+			keys[i]                  = s.record.Key();
+			size_t words             = 0;
+			if (!CompileModule(s.record, keys[i], true, modules[i], compiled[i], words)) {
+				g_runtime_jobs.miss_failed.fetch_add(1, std::memory_order_relaxed);
+				destroy();
+				return;
+			}
+			created.push_back(modules[i]);
+			infos[i] = &compiled[i];
+			g_runtime_jobs.miss_stages.fetch_add(1, std::memory_order_relaxed);
+		} else {
+			keys[i]    = PrecompileKey(s.record.stage, s.record.shader_hash, static_cast<uint32_t>(s.record.user_data.size()),
+			                           s.code_size, s.record.static_key, cursor, s.record.specialization);
+			infos[i]   = s.info;
+			modules[i] = s.module;
+		}
+		infos[i]->bindings.AdvancePushData(cursor);
+	}
+	PrecompileGraphicsRecord record;
+	record.vertex[0]     = keys[0];
+	record.pixel         = m.ps_active ? keys[1] : 0u;
+	record.rendering     = m.rendering;
+	record.vertex_input  = m.vertex_input;
+	record.static_params = m.static_params;
+	const auto key       = record.Key();
+	{
+		std::lock_guard lock(m_mutex);
+		if (m_job_index.contains(key) || m_runtime_index.contains(key)) {
+			g_runtime_jobs.miss_known.fetch_add(1, std::memory_order_relaxed);
+			destroy();
+			return;
+		}
+		job.key = key;
+		m_runtime_index.emplace(key, &job);
+	}
+	const ShaderRecompiler::IR::ResourceSnapshot no_resources {};
+	ShaderVertexInputInfo                        vertex = m.vertex;
+	vertex.stage                                        = {.program = infos[0], .resources = &no_resources};
+	ShaderPixelInputInfo pixel                          = m.pixel;
+	if (m.ps_active) pixel.stage = {.program = infos[1], .resources = &no_resources};
+	PipelineCache::GraphicsPrograms programs;
+	programs.vertex[0] = {.id = ~uint64_t {0} - 1u, .module = modules[0]};
+	if (m.ps_active) programs.pixel = {.id = ~uint64_t {0} - 2u, .module = modules[1]};
+	PipelineCache::Pipeline pipeline;
+	CreatePipelineInternal(m_graphics, pipeline, m.rendering, m.vertex_input, std::span<const ShaderVertexInputInfo>(&vertex, 1),
+	                       m.ps_active ? &pixel : nullptr, programs, m.static_params, m_driver_cache);
+	if (pipeline.pipeline != nullptr) {
+		g_runtime_jobs.miss_created.fetch_add(1, std::memory_order_relaxed);
+		m_created.fetch_add(1);
+	}
+	if (pipeline.pipeline != nullptr) m_graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
+	if (pipeline.pipeline_layout != nullptr) m_graphics.device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
+	if (pipeline.descriptor_set_layout != nullptr) m_graphics.device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout, nullptr);
+	destroy();
+	g_runtime_jobs.miss_ms.fetch_add(static_cast<uint64_t>(MillisecondsSince(begin)), std::memory_order_relaxed);
+}
+
 void ShaderPrecompiler::RunRuntimeJob(RuntimeJob& job) {
+	if (job.miss != nullptr) {
+		RunGraphicsMiss(job);
+		return;
+	}
 	g_runtime_jobs.started.fetch_add(1, std::memory_order_relaxed);
 	if (job.first_use) {
 		if (!MaterializeFirstUse(job.record, job.shader_base)) {
@@ -3320,11 +3504,12 @@ void ShaderPrecompiler::ReportRuntimePerf() const {
 	std::fprintf(stderr,
 	             "PERF compile_jobs queued=%llu first_use=%llu duplicate=%llu full=%llu started=%llu compiled=%llu "
 	             "first_use_failed=%llu first_use_known=%llu skipped_taken=%llu dropped=%llu waited=%llu wait_ms=%.0f "
-	             "ready=%llu lead_ms_avg=%.0f\n",
+	             "ready=%llu lead_ms_avg=%.0f miss[queued|known|failed|created|stages|ms]=%llu|%llu|%llu|%llu|%llu|%llu\n",
 	             n(s.queued), n(s.first_use), n(s.duplicate), n(s.full), n(s.started), n(s.compiled), n(s.first_use_failed),
 	             n(s.first_use_known), n(s.skipped_taken), n(s.dropped), n(s.waited),
 	             static_cast<double>(n(s.wait_us)) / 1000.0, n(s.ready),
-	             n(s.lead_n) != 0 ? static_cast<double>(n(s.lead_us)) / 1000.0 / static_cast<double>(n(s.lead_n)) : 0.0);
+	             n(s.lead_n) != 0 ? static_cast<double>(n(s.lead_us)) / 1000.0 / static_cast<double>(n(s.lead_n)) : 0.0,
+	             n(s.miss_queued), n(s.miss_known), n(s.miss_failed), n(s.miss_created), n(s.miss_stages), n(s.miss_ms));
 }
 
 bool ShaderPrecompiler::BeforeCompile(uint64_t key) {

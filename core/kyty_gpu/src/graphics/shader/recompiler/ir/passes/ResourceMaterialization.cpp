@@ -2337,11 +2337,38 @@ bool NullSlotSeedEnabled() {
 	return on;
 }
 
+uint32_t NullSlotRuntimeMode() {
+	static const uint32_t mode = [] {
+		const char*    value = Common::ShaderEnv::Read("KYTY_PERF_NULL_SLOT_RUNTIME_FORMAT");
+		const uint32_t m     = value != nullptr && (value[0] == '1' || value[0] == '2') ? static_cast<uint32_t>(value[0] - '0') : 0u;
+		if (m != 0u) std::fprintf(stderr, "PERF_NULL_SLOT_RUNTIME_FORMAT enabled (mode %u: %s)\n", m, m == 1u ? "all stages" : "graphics stages");
+		return m;
+	}();
+	return mode;
+}
+
 bool NullSlotRuntimeEnabled() {
-	static const bool on =
-	    NullSlotSwitch(Common::ShaderEnv::Read("KYTY_PERF_NULL_SLOT_RUNTIME_FORMAT"), "PERF_NULL_SLOT_RUNTIME_FORMAT");
+	return NullSlotRuntimeMode() != 0u;
+}
+
+bool NullSlotCheckEnabled() {
+	static const bool on = NullSlotSwitch(Common::ShaderEnv::Read("KYTY_CHECK_NULL_SLOT_RUNTIME"), "CHECK_NULL_SLOT_RUNTIME");
 	return on;
 }
+
+} // namespace
+
+bool NullSlotPrewarmEnabled() {
+	static const bool on = NullSlotSwitch(Common::ShaderEnv::Read("KYTY_PERF_NULL_SLOT_PREWARM"), "PERF_NULL_SLOT_PREWARM");
+	return on;
+}
+
+bool NullSlotRuntimeForStage(ShaderType stage) {
+	const auto mode = NullSlotRuntimeMode();
+	return mode == 1u || (mode == 2u && stage != ShaderType::Compute);
+}
+
+namespace {
 
 struct NullSlotCounters {
 	std::atomic<uint64_t> seeded {0};
@@ -2352,6 +2379,9 @@ struct NullSlotCounters {
 	std::atomic<uint64_t> seed_hits {0};
 	std::atomic<uint64_t> seed_misses {0};
 	std::atomic<uint64_t> logged {0};
+	std::atomic<uint64_t> check_live {0};
+	std::atomic<uint64_t> check_unknown {0};
+	std::atomic<uint64_t> check_logged {0};
 };
 NullSlotCounters  g_null_slot;
 std::atomic<bool> g_null_slot_runtime_active {false};
@@ -2421,7 +2451,7 @@ const std::array<uint64_t, 2>& NullSlotKeysOf(const ResourcePlan& program, Resou
 NullSlot::Decision NullSlotDecide(const ResourcePlan& program, ResourcePlan::NullFormattedLive& shared, size_t i) {
 	NullSlotGrow(shared, program.info.buffers.size());
 	const bool       seed    = NullSlotSeedEnabled();
-	const bool       runtime = NullSlotRuntimeEnabled() && !program.info.buffers[i].written;
+	const bool       runtime = NullSlotRuntimeForStage(program.stage) && !program.info.buffers[i].written;
 	NullSlot::Guesses guesses;
 	if (seed && shared.live[i][0] == 0u) {
 		const auto&      keys = NullSlotKeysOf(program, shared, i);
@@ -2485,9 +2515,19 @@ bool NullSlotOnLive(const ResourcePlan& program, ResourcePlan::NullFormattedLive
 	}
 	if (runtime) {
 		g_null_slot.runtime_live.fetch_add(1, std::memory_order_relaxed);
+		if (NullSlotCheckEnabled()) {
+			g_null_slot.check_live.fetch_add(1, std::memory_order_relaxed);
+			if (!NullSlotUsable(value)) {
+				g_null_slot.check_unknown.fetch_add(1, std::memory_order_relaxed);
+				if (g_null_slot.check_logged.fetch_add(1, std::memory_order_relaxed) < 32u) {
+					std::fprintf(stderr, "NULL_SLOT_CHECK unknown hash=0x%016llx buffer=%zu format=%u swizzle=0x%x\n",
+					             static_cast<unsigned long long>(program.shader_hash), i, value[0], value[1]);
+				}
+			}
+		}
 		return true;
 	}
-	if (NullSlotSeedEnabled() && NullSlotUsable(value)) {
+	if ((NullSlotSeedEnabled() || NullSlotPrewarmEnabled()) && NullSlotUsable(value)) {
 		const auto       keys = NullSlotKeysOf(program, shared, i);
 		std::scoped_lock lock(g_null_slot_table.mutex);
 		if (keys[0] != 0u) g_null_slot_table.precise[keys[0]] = value;
@@ -2509,6 +2549,30 @@ void NullSlotTakeRuntime(ResourceSpecialization::Buffer& buffer) {
 }
 
 } // namespace
+
+std::vector<std::array<uint32_t, 2>> NullSlotGuesses(const ResourcePlan& program, size_t i) {
+	std::vector<std::array<uint32_t, 2>> out;
+	if (program.null_formatted_live == nullptr || i >= program.info.buffers.size() || !program.info.buffers[i].formatted ||
+	    program.info.buffers[i].written) {
+		return out;
+	}
+	auto&                   shared = *program.null_formatted_live;
+	std::array<uint64_t, 2> keys {};
+	{
+		std::scoped_lock lock(shared.mutex);
+		keys = NullSlotKeysOf(program, shared, i);
+	}
+	std::scoped_lock lock(g_null_slot_table.mutex);
+	const auto take = [&](const std::unordered_map<uint64_t, NullSlot::Value>& table, uint64_t key) {
+		if (key == 0u) return;
+		const auto it = table.find(key);
+		if (it == table.end() || !NullSlotUsable(it->second)) return;
+		if (std::ranges::find(out, it->second) == out.end()) out.push_back(it->second);
+	};
+	take(g_null_slot_table.precise, keys[0]);
+	take(g_null_slot_table.coarse, keys[1]);
+	return out;
+}
 
 bool NullSlotRuntimeLive(const ResourcePlan& program, const std::vector<uint8_t>& kinds) {
 	if (!g_null_slot_runtime_active.load(std::memory_order_relaxed) || program.null_formatted_live == nullptr) return false;
@@ -2627,9 +2691,11 @@ void ReportNullShareJournalPerf() {
 	const auto& s = g_null_slot;
 	std::fprintf(stderr,
 	             "PERF null_slot seed=%d runtime_format=%d seeded=%llu runtime_bindings=%llu runtime_live=%llu "
-	             "transitions_caused=%llu transitions_avoided=%llu seed_hits=%llu seed_misses=%llu\n",
-	             NullSlotSeedEnabled() ? 1 : 0, NullSlotRuntimeEnabled() ? 1 : 0, n(s.seeded), n(s.runtime_bindings),
-	             n(s.runtime_live), n(s.caused), n(s.avoided), n(s.seed_hits), n(s.seed_misses));
+	             "transitions_caused=%llu transitions_avoided=%llu seed_hits=%llu seed_misses=%llu check_live=%llu "
+	             "check_unknown=%llu\n",
+	             NullSlotSeedEnabled() ? 1 : 0, static_cast<int>(NullSlotRuntimeMode()), n(s.seeded), n(s.runtime_bindings),
+	             n(s.runtime_live), n(s.caused), n(s.avoided), n(s.seed_hits), n(s.seed_misses), n(s.check_live),
+	             n(s.check_unknown));
 }
 
 // `tape` (when set) evaluates the plan's values instead of SrtWalker; `quiet` mutes its diagnostics.

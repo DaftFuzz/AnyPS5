@@ -63,6 +63,7 @@ inline constexpr const char* Names[] = {
     "KYTY_PERF_INLINE_BY_SIZE",
     "KYTY_PERF_INLINE_MAX_SITES",
     "KYTY_PERF_INLINE_SHARE",
+    "KYTY_PERF_NULL_SLOT_RUNTIME_INLINE",
     "KYTY_PERF_SHARE_ATTACHMENT_SETS",
     "KYTY_PERF_SPIRV_STORE_OUTLINE",
     "KYTY_PERF_SRT_GPU_WORDS",
@@ -80,6 +81,7 @@ inline constexpr const char* Names[] = {
 
 // Sorted (strcmp order; checked below).
 inline constexpr const char* OutputOnlyNames[] = {
+    "KYTY_CHECK_NULL_SLOT_RUNTIME",
     "KYTY_DIAG_LDS_STORAGE",
     "KYTY_DIAG_NULL_SLOT_REPLAY",
     // Precompiler report, no module made.
@@ -90,6 +92,9 @@ inline constexpr const char* OutputOnlyNames[] = {
     "KYTY_DIAG_SKIP_UNSUPPORTED_CS",
     "KYTY_PERF_COMPILE_JOBS",
     "KYTY_PERF_COMPILE_SCOUT",
+    "KYTY_PERF_INDIRECT_COVER",
+    "KYTY_PERF_NULL_SLOT_PREWARM",
+    "KYTY_PERF_NULL_SLOT_PREWARM_MIN_WORDS",
     "KYTY_PERF_NULL_SLOT_RUNTIME_FORMAT",
     "KYTY_PERF_NULL_SLOT_SEED",
     // The background compiles' reuse store (shaderPrecompile.cpp): the same SPIR-V, made earlier.
