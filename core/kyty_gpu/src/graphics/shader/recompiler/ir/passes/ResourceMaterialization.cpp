@@ -1472,6 +1472,79 @@ static bool BindlessIntegerSamplersFit(const ResourcePlan& program, const Resour
 	return count + children <= ShaderInfo::MaxSamplers;
 }
 
+uint32_t SamplerPadMode() {
+	static const uint32_t mode = [] {
+		const char*    value = Common::ShaderEnv::Read("KYTY_PERF_SAMPLER_PAD");
+		const uint32_t m     = value != nullptr && (value[0] == '1' || value[0] == '2') ? static_cast<uint32_t>(value[0] - '0') : 0u;
+		if (m != 0u) std::fprintf(stderr, "PERF_SAMPLER_PAD enabled (mode %u)\n", m);
+		return m;
+	}();
+	return mode;
+}
+
+namespace {
+struct SamplerPadCounters {
+	std::atomic<uint64_t> programs {0}, inserted {0}, checks {0}, bad {0}, logged {0};
+} g_sampler_pad;
+} // namespace
+
+size_t PadSamplerCandidates(ResourceSpecialization& specialization, std::vector<DescriptorValue>* descriptors) {
+	auto& s = specialization.samplers;
+	if (descriptors != nullptr && descriptors->size() != s.size()) return 0;
+	for (const auto& image: specialization.images) {
+		if (image.bindless && (image.numeric_class == Prospero::TextureNumericClass::Uint ||
+		                       image.numeric_class == Prospero::TextureNumericClass::Sint)) {
+			return 0;
+		}
+	}
+	const auto child = [&](size_t i) {
+		return s[i].indirect_root != SamplerResource::NoIndirectSampler && s[i].indirect_root != i;
+	};
+	size_t first_child = s.size();
+	size_t roots       = 0;
+	for (size_t i = 0; i < s.size(); i++) {
+		if (child(i)) {
+			if (first_child == s.size()) first_child = i;
+		} else {
+			if (first_child != s.size()) return 0;
+			roots++;
+		}
+	}
+	if (first_child == s.size()) return 0;
+	const int64_t limit  = static_cast<int64_t>(ShaderInfo::MaxSamplers) - static_cast<int64_t>(roots) * 4;
+	int64_t       budget = limit - static_cast<int64_t>(s.size() - first_child);
+	size_t        inserted = 0;
+	size_t        i        = first_child;
+	while (i < s.size() && budget > 0) {
+		const auto root = s[i].indirect_root;
+		size_t     j    = i;
+		while (j < s.size() && s[j].indirect_root == root) j++;
+		const size_t total  = j - i + 1u;
+		const size_t target = std::max<size_t>(8u, std::bit_ceil(total));
+		const size_t pad    = std::min<size_t>(target - total, static_cast<size_t>(budget));
+		if (pad != 0u) {
+			const auto spec_copy = s[j - 1u];
+			s.insert(s.begin() + static_cast<std::ptrdiff_t>(j), pad, spec_copy);
+			if (descriptors != nullptr) {
+				const auto value_copy = (*descriptors)[j - 1u];
+				descriptors->insert(descriptors->begin() + static_cast<std::ptrdiff_t>(j), pad, value_copy);
+			}
+			budget -= static_cast<int64_t>(pad);
+			inserted += pad;
+		}
+		i = j + pad;
+	}
+	return inserted;
+}
+
+void ReportSamplerPad() {
+	if (SamplerPadMode() == 0u) return;
+	const auto& c = g_sampler_pad;
+	std::fprintf(stderr, "PERF sampler_pad mode=%u programs=%llu inserted=%llu checks=%llu bad=%llu\n", SamplerPadMode(),
+	             static_cast<unsigned long long>(c.programs.load()), static_cast<unsigned long long>(c.inserted.load()),
+	             static_cast<unsigned long long>(c.checks.load()), static_cast<unsigned long long>(c.bad.load()));
+}
+
 static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSnapshot& snapshot,
                                         ResourceSpecialization& specialization) {
 	bool bindless_integer = false; // KYTY_PERF_BINDLESS_CLASSES
@@ -1669,6 +1742,29 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		if (counters.sampler_reverts.fetch_add(1, std::memory_order_relaxed) < 8u && t_ahead.log == nullptr)
 			std::fprintf(stderr, "BINDLESS_CLASS sampler_revert hash=0x%016llx (integer fields kept float)\n",
 			             static_cast<unsigned long long>(program.shader_hash));
+	}
+	if (SamplerPadMode() != 0u) {
+		const auto flattened_before = snapshot.flattened_srt;
+		const auto inserted         = PadSamplerCandidates(specialization, &snapshot.samplers);
+		if (inserted != 0u && SamplerPadMode() == 2u) {
+			auto& c = g_sampler_pad;
+			c.checks.fetch_add(1, std::memory_order_relaxed);
+			const bool same_srt   = snapshot.flattened_srt == flattened_before;
+			const bool aligned    = snapshot.samplers.size() == specialization.samplers.size();
+			const bool in_limit   = specialization.samplers.size() <= ShaderInfo::MaxSamplers;
+			const bool fit_kept   = !bindless_integer || BindlessIntegerSamplersFit(program, specialization);
+			if (!same_srt || !aligned || !in_limit || !fit_kept) {
+				c.bad.fetch_add(1, std::memory_order_relaxed);
+				if (c.logged.fetch_add(1, std::memory_order_relaxed) < 16u)
+					std::fprintf(stderr, "SAMPLER_PAD_CHECK bad hash=0x%016llx srt=%d aligned=%d limit=%d fit=%d\n",
+					             static_cast<unsigned long long>(program.shader_hash), same_srt ? 1 : 0, aligned ? 1 : 0,
+					             in_limit ? 1 : 0, fit_kept ? 1 : 0);
+			}
+		}
+		if (inserted != 0u) {
+			g_sampler_pad.programs.fetch_add(1, std::memory_order_relaxed);
+			g_sampler_pad.inserted.fetch_add(inserted, std::memory_order_relaxed);
+		}
 	}
 	CompactImages(snapshot.images, [&](size_t index) { return !specialization.images[index].fmask; });
 	return true;
@@ -2696,6 +2792,7 @@ void ReportNullShareJournalPerf() {
 	             NullSlotSeedEnabled() ? 1 : 0, static_cast<int>(NullSlotRuntimeMode()), n(s.seeded), n(s.runtime_bindings),
 	             n(s.runtime_live), n(s.caused), n(s.avoided), n(s.seed_hits), n(s.seed_misses), n(s.check_live),
 	             n(s.check_unknown));
+	ReportSamplerPad();
 }
 
 // `tape` (when set) evaluates the plan's values instead of SrtWalker; `quiet` mutes its diagnostics.

@@ -2077,6 +2077,28 @@ void ShaderPrecompiler::LoadCompute(const std::unordered_set<uint64_t>& skipped,
 		m_compute_records.push_back(std::move(record));
 	});
 	torn = torn || !complete;
+	if (ShaderRecompiler::IR::SamplerPadMode() != 0u) {
+		std::unordered_set<uint64_t> keys;
+		size_t                       padded = 0;
+		size_t                       merged = 0;
+		for (auto& job: jobs) {
+			auto& record = m_compute_records[job.record];
+			if (ShaderRecompiler::IR::PadSamplerCandidates(record.specialization, nullptr) != 0u) {
+				padded++;
+				const auto old_key = job.key;
+				const auto key     = record.Key();
+				job.key            = job.forced_lds ? ForcedLdsKey(key) : key;
+				m_recorded.erase(old_key);
+				m_recorded.insert(key);
+			}
+			if (!keys.insert(job.key).second && job.state == JobState::Queued) {
+				job.state = JobState::Dropped;
+				merged++;
+			}
+		}
+		std::fprintf(stderr, "SAMPLER_PAD_CANON compute records=%zu padded=%zu merged=%zu\n", jobs.size(), padded, merged);
+		if (padded != 0u && header_ok && !Config::PrecompileOnly()) torn = true;
+	}
 	if (const char* replay = Common::ShaderEnv::Read("KYTY_DIAG_NULL_SLOT_REPLAY"); replay != nullptr && replay[0] == '1') {
 		std::thread replay_thread([this, &jobs] { NullSlotReplay(jobs); });
 		replay_thread.join();
@@ -2254,7 +2276,10 @@ bool ShaderPrecompiler::CoveringRecord(const PrecompileGraphicsRecord& wanted, P
 }
 
 size_t ShaderPrecompiler::CanonicalizeNullSlots(std::vector<PrecompileGraphicsRecord>& pipelines) {
-	if (!ShaderRecompiler::IR::NullSlotRuntimeForStage(ShaderType::Vertex)) return 0;
+	const bool null_slots = ShaderRecompiler::IR::NullSlotRuntimeForStage(ShaderType::Vertex);
+	const bool pad        = ShaderRecompiler::IR::SamplerPadMode() != 0u;
+	if (!null_slots && !pad) return 0;
+	size_t samplers_padded = 0;
 	const auto null_slot = [](const ShaderRecompiler::IR::ResourceSpecialization::Buffer& b) {
 		return b.zero_stride_oob && static_cast<uint32_t>(b.descriptor_format) == 0u && b.descriptor_swizzle == 0u;
 	};
@@ -2281,7 +2306,11 @@ size_t ShaderPrecompiler::CanonicalizeNullSlots(std::vector<PrecompileGraphicsRe
 		auto& record = node.mapped().record;
 		const auto& values = live[ProgramKey(RecordIdentity(record))];
 		bool        changed = false;
-		for (size_t i = 0; i < record.specialization.buffers.size(); i++) {
+		if (pad && ShaderRecompiler::IR::PadSamplerCandidates(record.specialization, nullptr) != 0u) {
+			changed = true;
+			samplers_padded++;
+		}
+		for (size_t i = 0; null_slots && i < record.specialization.buffers.size(); i++) {
 			auto& b = record.specialization.buffers[i];
 			if (!null_slot(b)) continue;
 			const bool known = i < values.size() && values[i][0] != 0u;
@@ -2332,9 +2361,9 @@ size_t ShaderPrecompiler::CanonicalizeNullSlots(std::vector<PrecompileGraphicsRe
 		if (changed) pipelines_changed++;
 	}
 	std::fprintf(stderr,
-	             "NULL_SLOT_CANON graphics stages=%zu slots_runtime=%zu slots_shared=%zu stages_merged=%zu pipelines_rekeyed=%zu\n",
-	             m_stage_order.size(), slots_runtime, slots_shared, merged, pipelines_changed);
-	return slots_runtime + slots_shared;
+	             "NULL_SLOT_CANON graphics stages=%zu slots_runtime=%zu slots_shared=%zu samplers_padded=%zu stages_merged=%zu pipelines_rekeyed=%zu\n",
+	             m_stage_order.size(), slots_runtime, slots_shared, samplers_padded, merged, pipelines_changed);
+	return slots_runtime + slots_shared + samplers_padded;
 }
 
 void ShaderPrecompiler::LoadGraphics(const std::unordered_set<uint64_t>& skipped, std::vector<Job>& jobs,
