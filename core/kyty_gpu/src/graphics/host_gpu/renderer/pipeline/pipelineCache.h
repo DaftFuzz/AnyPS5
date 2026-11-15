@@ -356,8 +356,12 @@ public:
 	// objects were given back (today's lookup recreates them).
 	[[nodiscard]] Pipeline* TakePlannedPipeline(Pipeline* planned);
 	[[nodiscard]] size_t GraphicsPipelineCount() const { return m_graphics_pipelines.size() + m_table_pending.size(); }
+	void QueueAheadGraphicsPipeline(const GraphicsPipelineKey& key, std::span<const ShaderVertexInputInfo> vertex_info,
+	                                const ShaderPixelInputInfo* ps_input_info, const GraphicsPrograms& programs);
 
 private:
+	Pipeline* TakeAheadGraphicsPipeline(const GraphicsPipelineKey& key);
+	std::mutex m_ahead_workers_mutex;
 
 	GraphicContext&               m_graphics;
 	std::unique_ptr<ProgramCache> m_program_cache;

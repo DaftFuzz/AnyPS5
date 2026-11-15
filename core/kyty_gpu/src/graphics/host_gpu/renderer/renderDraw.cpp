@@ -4098,7 +4098,13 @@ void RenderExecutor::ScoutResolve(const ResolveTask& task) {
 		(void)ResolveDispatchInto(*scout, *task.shaders, task.groups_x, task.groups_y, task.groups_z, task.mode, task.indirect,
 		                          task.async_compute);
 	} else {
-		(void)ResolveDrawInto(*scout, *task.context, *task.user_config, *task.shaders, task.indirect_draw);
+		const auto mode = task.context->GetColorControl().mode;
+		if ((mode == 0u || mode == 1u) && DrawHasValidVertexShader(*task.shaders) &&
+		    ResolveDrawInto(*scout, *task.context, *task.user_config, *task.shaders, task.indirect_draw)) {
+			scout->empty = false;
+			PeekAhead(scout, *task.context, *task.user_config, *task.shaders, task.indexed, task.draw_count, 1u, task.index_type,
+			          task.slice_offset, task.draw_indirect, 127u, task.index_address, nullptr);
+		}
 	}
 	t_scouting = false;
 }
@@ -4483,6 +4489,10 @@ void RenderExecutor::PeekAhead(ResolvedDraw* slot, const HW::Context& ctx, const
 		slot->ahead.key_valid = true;
 		slot->ahead.find      = pc.FindGraphicsPipeline(slot->ahead.key, GuestGpu::IsGpuThread());
 		front                 = slot->ahead.find.second == PipelineCache::PipelineFind::Found;
+		if (slot->ahead.find.second == PipelineCache::PipelineFind::Missing && CompileJobsEnabled()) {
+			pc.QueueAheadGraphicsPipeline(slot->ahead.key, vertex_stages, state.ps_active ? &state.ps_input_info : nullptr,
+			                              state.programs);
+		}
 		// The stages' images and samplers, with the predicted programs.
 		for (uint32_t i = 0; i < PipelineCache::StageCount(*slot->stages); i++) {
 			const auto* program   = PipelineCache::AheadProgram(*slot->stages, i);

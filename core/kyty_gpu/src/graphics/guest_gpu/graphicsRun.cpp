@@ -1450,6 +1450,28 @@ void GuestGpu::ResolveThread() {
 			task.async_compute = next->processor->IsAsyncComputeQueue();
 			executor.ScoutResolve(task);
 			sc.dispatches.fetch_add(1, std::memory_order_relaxed);
+		} else if ((kind == GpuOperationKind::DrawIndex || kind == GpuOperationKind::DrawAuto) && next->processor == m_gfx_cp.get()) {
+			RenderExecutor::ResolveTask task;
+			task.context     = next->state.context;
+			task.user_config = next->state.user_config;
+			task.shaders     = next->state.shaders;
+			task.member      = true;
+			if (kind == GpuOperationKind::DrawIndex) {
+				const auto& args   = next->draw_index;
+				task.indexed       = true;
+				task.draw_count    = args.index_count;
+				task.index_type    = args.index_type_and_size;
+				task.slice_offset  = args.render_target_slice_offset;
+				task.draw_indirect = args.indirect.address;
+				task.index_address = reinterpret_cast<uint64_t>(args.index_addr);
+			} else {
+				const auto& args   = next->draw_auto;
+				task.draw_count    = args.vertex_count;
+				task.slice_offset  = args.render_target_slice_offset;
+				task.draw_indirect = args.indirect.address;
+			}
+			executor.ScoutResolve(task);
+			sc.draws.fetch_add(1, std::memory_order_relaxed);
 		}
 		return true;
 	};

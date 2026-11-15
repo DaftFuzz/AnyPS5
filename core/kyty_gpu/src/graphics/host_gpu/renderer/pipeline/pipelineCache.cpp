@@ -2907,6 +2907,21 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		if (found.pipeline == nullptr) RecreateGraphicsPipeline(found, key, vertex_info, ps_input_info, programs);
 		return found;
 	}
+	if (CompileJobsEnabled()) {
+		if (auto* ahead = TakeAheadGraphicsPipeline(key); ahead != nullptr) {
+			PrecompileGraphicsRecord record;
+			if (m_precompiler != nullptr && ShaderPrecompiler::GraphicsEnabled() &&
+			    m_program_cache->PrecompileStageKeys(programs, ps_active, record)) {
+				record.rendering     = rendering;
+				record.vertex_input  = key.vertex_input;
+				record.static_params = static_params;
+				record.revision      = ShaderPrecompiler::Revision();
+				m_precompiler->RecordPipeline(record);
+				if (m_warm != nullptr) m_warm->Mark(record.Key(), true);
+			}
+			return *ahead;
+		}
+	}
 
 	if (graphics_debug_dump_enabled()) {
 		ShaderDbgDumpInputInfo(vs_input_info);
@@ -3020,12 +3035,21 @@ bool CompileScoutEnabled() {
 	return enabled;
 }
 
+namespace {
+struct AheadGraphicsStats {
+	std::atomic<uint64_t> queued {0}, taken {0}, waited {0}, wait_us {0}, failed {0};
+} g_ahead_graphics;
+} // namespace
+
 void PipelineCache::ReportCompileJobs() const {
 	if (!PerfEnabled() || !CompileJobsEnabled()) return;
 	const auto& s = g_compile_scout;
 	const auto  n = [](const std::atomic<uint64_t>& v) { return static_cast<unsigned long long>(v.load(std::memory_order_relaxed)); };
 	std::fprintf(stderr, "PERF compile_scout stalls=%llu scouted=%llu dispatches=%llu draws=%llu polls=%llu max_ahead=%llu\n",
 	             n(s.stalls), n(s.scouted), n(s.dispatches), n(s.draws), n(s.polls), n(s.max_ahead));
+	const auto& g = g_ahead_graphics;
+	std::fprintf(stderr, "PERF compile_ahead_graphics queued=%llu taken=%llu waited=%llu wait_ms=%.0f failed=%llu\n", n(g.queued),
+	             n(g.taken), n(g.waited), static_cast<double>(n(g.wait_us)) / 1000.0, n(g.failed));
 	if (m_precompiler != nullptr) m_precompiler->ReportRuntimePerf();
 }
 
@@ -3153,6 +3177,91 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipelineAsync(
 		job->done.store(true, std::memory_order_release);
 	});
 	return nullptr;
+}
+
+void PipelineCache::QueueAheadGraphicsPipeline(const GraphicsPipelineKey& key, std::span<const ShaderVertexInputInfo> vertex_info,
+                                               const ShaderPixelInputInfo* ps_input_info, const GraphicsPrograms& programs) {
+	if (vertex_info.empty() || vertex_info.size() > 3) return;
+	{
+		const std::shared_lock lock(m_pipelines_mutex);
+		if (m_graphics_pipelines.contains(key) || m_table_pending.contains(key)) return;
+	}
+	auto job           = std::make_shared<TableCompileJob>();
+	job->rendering     = key.rendering;
+	job->vertex_input  = key.vertex_input;
+	job->static_params = key.static_params;
+	job->vertex_count  = static_cast<uint32_t>(vertex_info.size());
+	for (uint32_t i = 0; i < job->vertex_count; i++) {
+		job->vertex_info[i]                     = vertex_info[i];
+		job->vertex_info[i].stage.resources     = &job->no_resources;
+		job->vertex_info[i].stage.stagef_record = nullptr;
+	}
+	job->ps_active = ps_input_info != nullptr;
+	if (job->ps_active) {
+		job->ps_input_info                     = *ps_input_info;
+		job->ps_input_info.stage.resources     = &job->no_resources;
+		job->ps_input_info.stage.stagef_record = nullptr;
+	}
+	job->programs = programs;
+	{
+		const std::unique_lock lock(m_pipelines_mutex);
+		if (m_table_workers_stopped || m_graphics_pipelines.contains(key) || m_table_pending.contains(key)) return;
+		m_table_pending.emplace(key, job);
+	}
+	{
+		const std::lock_guard lock(m_ahead_workers_mutex);
+		if (m_table_workers == nullptr) m_table_workers = std::make_unique<TableCompileWorkers>(TableAsyncThreads());
+	}
+	g_ahead_graphics.queued.fetch_add(1, std::memory_order_relaxed);
+	m_table_workers->Push([this, job] {
+		const auto begin = std::chrono::steady_clock::now();
+		CreatePipelineInternal(m_graphics, *job->pipeline, job->rendering, job->vertex_input,
+		                       std::span<const ShaderVertexInputInfo>(job->vertex_info.data(), job->vertex_count),
+		                       job->ps_active ? &job->ps_input_info : nullptr, job->programs, job->static_params, m_driver_cache);
+		auto& made = *job->pipeline;
+		if (made.pipeline == nullptr || made.pipeline_layout == nullptr) {
+			if (made.pipeline != nullptr) m_graphics.device.destroyPipeline(made.pipeline, nullptr);
+			if (made.pipeline_layout != nullptr) m_graphics.device.destroyPipelineLayout(made.pipeline_layout, nullptr);
+			if (made.descriptor_set_layout != nullptr) m_graphics.device.destroyDescriptorSetLayout(made.descriptor_set_layout, nullptr);
+			made        = Pipeline {};
+			job->failed = true;
+		}
+		job->ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+		job->done.store(true, std::memory_order_release);
+		job->done.notify_all();
+	});
+}
+
+PipelineCache::Pipeline* PipelineCache::TakeAheadGraphicsPipeline(const GraphicsPipelineKey& key) {
+	std::shared_ptr<TableCompileJob> job;
+	{
+		const std::shared_lock lock(m_pipelines_mutex);
+		const auto             pending = m_table_pending.find(key);
+		if (pending == m_table_pending.end()) return nullptr;
+		job = pending->second;
+	}
+	if (!job->done.load(std::memory_order_acquire)) {
+		const CompileStallScope compile_stall;
+		const auto              begin = std::chrono::steady_clock::now();
+		job->done.wait(false, std::memory_order_acquire);
+		g_ahead_graphics.waited.fetch_add(1, std::memory_order_relaxed);
+		g_ahead_graphics.wait_us.fetch_add(
+		    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin).count()),
+		    std::memory_order_relaxed);
+	}
+	const std::unique_lock lock(m_pipelines_mutex);
+	m_table_pending.erase(key);
+	if (job->failed) {
+		g_ahead_graphics.failed.fetch_add(1, std::memory_order_relaxed);
+		return nullptr;
+	}
+	g_ahead_graphics.taken.fetch_add(1, std::memory_order_relaxed);
+	m_pipelines_since_save++;
+	auto finished       = std::move(job->pipeline);
+	finished->last_used = static_cast<uint32_t>(DebugPresentCount().load());
+	auto [iter, inserted] = m_graphics_pipelines.emplace(key, std::move(finished));
+	EXIT_IF(!inserted);
+	return iter->second.get();
 }
 
 PipelineCache::Pipeline&
