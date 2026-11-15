@@ -93,6 +93,8 @@ inline constexpr const char* OutputOnlyNames[] = {
     "KYTY_PERF_COMPILE_JOBS",
     "KYTY_PERF_COMPILE_SCOUT",
     "KYTY_PERF_INDIRECT_COVER",
+    "KYTY_PERF_NULL_SLOT_PREWARM",
+    "KYTY_PERF_NULL_SLOT_PREWARM_MIN_WORDS",
     "KYTY_PERF_NULL_SLOT_RUNTIME_FORMAT",
     "KYTY_PERF_NULL_SLOT_SEED",
     // The background compiles' reuse store (shaderPrecompile.cpp): the same SPIR-V, made earlier.

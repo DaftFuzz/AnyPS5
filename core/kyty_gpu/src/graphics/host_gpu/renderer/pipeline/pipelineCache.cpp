@@ -110,6 +110,19 @@ struct ResolveStats {
 	std::array<std::array<std::atomic<uint64_t>, static_cast<size_t>(ResolveMiss::Count)>, 2> walks {}, walk_ns {};
 	std::array<std::atomic<uint64_t>, 16> missing_by_stage {};
 } g_resolve_stats;
+struct StageCompileStats {
+	std::atomic<uint64_t> count {0}, us {0}, reused {0};
+};
+std::array<StageCompileStats, 2> g_stage_compile;
+std::atomic<uint64_t>            g_null_slot_prewarm {0};
+StageCompileStats                g_graphics_create;
+uint32_t NullSlotPrewarmMinWords() {
+	static const uint32_t words = [] {
+		const char* value = std::getenv("KYTY_PERF_NULL_SLOT_PREWARM_MIN_WORDS");
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 100000u;
+	}();
+	return words;
+}
 // Project 15 S2d (KYTY_CHECK_PEEK=2, diagnostic): PeekAdopt's prediction against what Adopt did (execution thread).
 struct PeekAdoptStats {
 	uint64_t calls = 0, keep = 0, refind = 0, compile = 0, not_adoptable = 0, reads_changed = 0, bad = 0, injected = 0, detected = 0;
@@ -1292,6 +1305,20 @@ struct PipelineCache::ProgramCache {
 		if (precompile_key != 0) {
 			RecordPrecompileStage(stage, params, input_info, compile_push_start, permutation, precompile_key);
 		}
+		{
+			const double total = MillisecondsSince(translate_begin);
+			auto&        acc   = g_stage_compile[stage == ShaderType::Compute ? 1 : 0];
+			acc.count.fetch_add(1, std::memory_order_relaxed);
+			acc.us.fetch_add(static_cast<uint64_t>(total * 1000.0), std::memory_order_relaxed);
+			if (use_reused) acc.reused.fetch_add(1, std::memory_order_relaxed);
+		}
+		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			if (precompiler != nullptr && CompileJobsEnabled() && ShaderRecompiler::IR::NullSlotPrewarmEnabled() &&
+			    last_spirv_words >= NullSlotPrewarmMinWords()) {
+				PrewarmLiveVariants(params, input_info, compile_push_start, lookup_key.static_state, entry->second.resource_plan,
+				                    permutation.specialization);
+			}
+		}
 		// KYTY_TRACE_PERF: a shader preparation over 50 ms, split by step (the GPU thread waits for all of it).
 		if (PerfEnabled()) {
 			const double total_ms = MillisecondsSince(translate_begin);
@@ -1369,6 +1396,25 @@ struct PipelineCache::ProgramCache {
 		precompiler->Record(record);
 		// Compute ones too: GetComputePipeline marks the key warm once the pipeline exists.
 		precompile_stages[permutation.handle.id] = {.key = key, .spirv_hash = last_spirv_hash};
+	}
+
+	void PrewarmLiveVariants(const ShaderParams& params, const ShaderComputeInputInfo& input_info, uint32_t push_cursor,
+	                         std::span<const uint32_t> static_state, const ShaderRecompiler::IR::ResourcePlan& plan,
+	                         const ShaderRecompiler::IR::ResourceSpecialization& specialization) {
+		for (size_t i = 0; i < specialization.buffers.size() && i < plan.info.buffers.size(); i++) {
+			const auto& b = specialization.buffers[i];
+			if (!b.zero_stride_oob || static_cast<uint32_t>(b.descriptor_format) != 0u || b.descriptor_swizzle != 0u) continue;
+			for (const auto& guess: ShaderRecompiler::IR::NullSlotGuesses(plan, i)) {
+				auto  variant = specialization;
+				auto& slot    = variant.buffers[i];
+				slot.packed_stride      = (slot.packed_stride & ~0x3fffu) | (1u << 31u) | 1u;
+				slot.zero_stride_oob    = false;
+				slot.descriptor_format  = static_cast<Prospero::BufferFormat>(guess[0]);
+				slot.descriptor_swizzle = guess[1];
+				g_null_slot_prewarm.fetch_add(1, std::memory_order_relaxed);
+				QueueRuntimeCompile(params, input_info, push_cursor, static_state, &variant);
+			}
+		}
 	}
 
 	void QueueRuntimeCompile(const ShaderParams& params, const ShaderComputeInputInfo& input_info, uint32_t push_cursor,
@@ -3414,8 +3460,11 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
+		const auto create_begin = std::chrono::steady_clock::now();
 		CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
 		                       ps_input_info, programs, static_params, m_driver_cache);
+		g_graphics_create.count.fetch_add(1, std::memory_order_relaxed);
+		g_graphics_create.us.fetch_add(static_cast<uint64_t>(MillisecondsSince(create_begin) * 1000.0), std::memory_order_relaxed);
 	}
 	m_pipelines_since_save++;
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
@@ -3512,7 +3561,14 @@ struct AheadGraphicsStats {
 } // namespace
 
 void PipelineCache::ReportCompileJobs() const {
-	if (PerfEnabled()) ReportIndirectCover();
+	if (PerfEnabled()) {
+		ReportIndirectCover();
+		const auto u = [](const std::atomic<uint64_t>& v) { return static_cast<unsigned long long>(v.load(std::memory_order_relaxed)); };
+		std::fprintf(stderr, "PERF stage_compile graphics=%llu/%.0fms(reused %llu) compute=%llu/%.0fms(reused %llu) null_slot_prewarm=%llu graphics_create=%llu/%.0fms\n",
+		             u(g_stage_compile[0].count), static_cast<double>(u(g_stage_compile[0].us)) / 1000.0, u(g_stage_compile[0].reused),
+		             u(g_stage_compile[1].count), static_cast<double>(u(g_stage_compile[1].us)) / 1000.0, u(g_stage_compile[1].reused),
+		             u(g_null_slot_prewarm), u(g_graphics_create.count), static_cast<double>(u(g_graphics_create.us)) / 1000.0);
+	}
 	if (!PerfEnabled() || !CompileJobsEnabled()) return;
 	const auto& s = g_compile_scout;
 	const auto  n = [](const std::atomic<uint64_t>& v) { return static_cast<unsigned long long>(v.load(std::memory_order_relaxed)); };

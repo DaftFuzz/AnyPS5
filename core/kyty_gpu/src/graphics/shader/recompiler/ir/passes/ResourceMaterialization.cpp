@@ -2358,6 +2358,11 @@ bool NullSlotCheckEnabled() {
 
 } // namespace
 
+bool NullSlotPrewarmEnabled() {
+	static const bool on = NullSlotSwitch(Common::ShaderEnv::Read("KYTY_PERF_NULL_SLOT_PREWARM"), "PERF_NULL_SLOT_PREWARM");
+	return on;
+}
+
 bool NullSlotRuntimeForStage(ShaderType stage) {
 	const auto mode = NullSlotRuntimeMode();
 	return mode == 1u || (mode == 2u && stage != ShaderType::Compute);
@@ -2522,7 +2527,7 @@ bool NullSlotOnLive(const ResourcePlan& program, ResourcePlan::NullFormattedLive
 		}
 		return true;
 	}
-	if (NullSlotSeedEnabled() && NullSlotUsable(value)) {
+	if ((NullSlotSeedEnabled() || NullSlotPrewarmEnabled()) && NullSlotUsable(value)) {
 		const auto       keys = NullSlotKeysOf(program, shared, i);
 		std::scoped_lock lock(g_null_slot_table.mutex);
 		if (keys[0] != 0u) g_null_slot_table.precise[keys[0]] = value;
@@ -2544,6 +2549,30 @@ void NullSlotTakeRuntime(ResourceSpecialization::Buffer& buffer) {
 }
 
 } // namespace
+
+std::vector<std::array<uint32_t, 2>> NullSlotGuesses(const ResourcePlan& program, size_t i) {
+	std::vector<std::array<uint32_t, 2>> out;
+	if (program.null_formatted_live == nullptr || i >= program.info.buffers.size() || !program.info.buffers[i].formatted ||
+	    program.info.buffers[i].written) {
+		return out;
+	}
+	auto&                   shared = *program.null_formatted_live;
+	std::array<uint64_t, 2> keys {};
+	{
+		std::scoped_lock lock(shared.mutex);
+		keys = NullSlotKeysOf(program, shared, i);
+	}
+	std::scoped_lock lock(g_null_slot_table.mutex);
+	const auto take = [&](const std::unordered_map<uint64_t, NullSlot::Value>& table, uint64_t key) {
+		if (key == 0u) return;
+		const auto it = table.find(key);
+		if (it == table.end() || !NullSlotUsable(it->second)) return;
+		if (std::ranges::find(out, it->second) == out.end()) out.push_back(it->second);
+	};
+	take(g_null_slot_table.precise, keys[0]);
+	take(g_null_slot_table.coarse, keys[1]);
+	return out;
+}
 
 bool NullSlotRuntimeLive(const ResourcePlan& program, const std::vector<uint8_t>& kinds) {
 	if (!g_null_slot_runtime_active.load(std::memory_order_relaxed) || program.null_formatted_live == nullptr) return false;

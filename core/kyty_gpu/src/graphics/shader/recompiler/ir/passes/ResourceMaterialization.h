@@ -179,6 +179,8 @@ bool ApplyNullFormattedShare(const ResourcePlan& program, const std::vector<uint
                              ResourceSpecialization& specialization);
 bool NullSlotRuntimeLive(const ResourcePlan& program, const std::vector<uint8_t>& kinds);
 bool NullSlotRuntimeForStage(ShaderType stage);
+bool NullSlotPrewarmEnabled();
+std::vector<std::array<uint32_t, 2>> NullSlotGuesses(const ResourcePlan& program, size_t i);
 // Project 15 S2d: what ApplyNullFormattedShare does to `specialization` (the null buffers take the shared format),
 // without its writes (the live formats and the journal stay as they are). Under the plan's share lock.
 void PeekNullFormattedShare(const ResourcePlan& program, const std::vector<uint8_t>& kinds,
