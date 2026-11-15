@@ -2310,6 +2310,7 @@ void PipelineCache::ResolveDispatchPrograms(RenderContext& renderer, const HW::C
 	results.adoptable          = !indirect;
 	uint32_t push_data_cursor  = 0;
 	m_program_cache->Resolve(renderer, params, input_info, push_data_cursor, results, program);
+	if (ShaderRecompiler::IR::AdoptRunsPossible()) results.log.PrepareRuns();
 	ReportResolveStats(results.count);
 }
 
@@ -2358,6 +2359,7 @@ void PipelineCache::ResolveGraphicsPrograms(RenderContext& renderer, const HW::V
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
 		m_program_cache->Resolve(renderer, vertex_params[i], vertex_info[i], push_data_cursor, results, programs.vertex[i]);
 	}
+	if (ShaderRecompiler::IR::AdoptRunsPossible()) results.log.PrepareRuns();
 	ReportResolveStats(results.count);
 }
 

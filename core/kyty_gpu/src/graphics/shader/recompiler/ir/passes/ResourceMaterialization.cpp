@@ -237,6 +237,8 @@ std::atomic<PlainReadHook>           g_plain_read_hook {nullptr};
 std::atomic<OrdinaryReadSessionHook> g_ordinary_read_session_hook {nullptr};
 std::atomic<AheadReadHook>           g_ahead_read_hook {nullptr};
 std::atomic<FastVerifyHook>          g_fast_verify_hook {nullptr};
+std::atomic<RunsVerifyHook>          g_runs_verify_hook {nullptr};
+std::atomic<RunsCensusHook>          g_runs_census_hook {nullptr};
 
 bool CaptureOrdinaryRead(void* userdata, uint64_t address, std::span<uint32_t> values) {
 	auto& capture = *static_cast<ReadCapture*>(userdata);
@@ -2186,6 +2188,11 @@ void SetFastVerifyHook(FastVerifyHook hook) {
 	g_fast_verify_hook.store(hook, std::memory_order_relaxed);
 }
 
+void SetRunsVerifyHooks(RunsVerifyHook verify, RunsCensusHook census) {
+	g_runs_verify_hook.store(verify, std::memory_order_relaxed);
+	g_runs_census_hook.store(census, std::memory_order_relaxed);
+}
+
 namespace {
 
 // The entries of the current log by address, size: its repeated reads (ReadLog::Clear starts a new epoch).
@@ -2904,7 +2911,75 @@ bool MaterializeResourcesAhead(const ResourcePlan& program, const SrtRuntime& ru
 void ReadLog::Clear() {
 	entries.clear();
 	bytes.clear();
+	runs.clear();
+	pages.clear();
+	run_bytes.clear();
+	runs_entries = SIZE_MAX;
+	runs_bytes   = 0;
 	t_ahead_epoch++;
+}
+
+void ReadLog::PrepareRuns() {
+	runs_entries = SIZE_MAX;
+	runs.clear();
+	pages.clear();
+	run_bytes.clear();
+	const size_t count = entries.size();
+	if (count > UINT32_MAX || bytes.size() > UINT32_MAX) return;
+	thread_local std::vector<uint32_t> order;
+	order.resize(count);
+	for (size_t i = 0; i < count; ++i) {
+		const auto& e = entries[i];
+		if (!e.ok || e.size == 0 || e.size > MaxCallBytes || (e.kind == Kind::Strict && e.size % sizeof(uint32_t) != 0u) ||
+		    e.first > bytes.size() || e.size > bytes.size() - e.first || e.address > UINT64_MAX - e.size) {
+			return;
+		}
+		order[i] = static_cast<uint32_t>(i);
+	}
+	std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+		const auto& x = entries[a];
+		const auto& y = entries[b];
+		if (x.kind != y.kind) return x.kind < y.kind;
+		if (x.address != y.address) return x.address < y.address;
+		return a < b;
+	});
+	for (const uint32_t i: order) {
+		const auto&    e   = entries[i];
+		const uint8_t* src = bytes.data() + e.first;
+		const uint64_t end = e.address + e.size;
+		if (!runs.empty()) {
+			auto&          run     = runs.back();
+			const uint64_t run_end = run.address + run.size;
+			if (run.kind == e.kind && e.address <= run_end) {
+				const uint64_t overlap = std::min(run_end, end) - e.address;
+				if (std::memcmp(run_bytes.data() + run.first + (e.address - run.address), src, static_cast<size_t>(overlap)) != 0) {
+					runs.clear();
+					run_bytes.clear();
+					return;
+				}
+				if (end > run_end) {
+					run_bytes.insert(run_bytes.end(), src + overlap, src + e.size);
+					run.size = end - run.address;
+				}
+				run.entries++;
+				continue;
+			}
+		}
+		runs.push_back({.address = e.address,
+		                .size    = e.size,
+		                .first   = static_cast<uint32_t>(run_bytes.size()),
+		                .kind    = e.kind,
+		                .entries = 1});
+		run_bytes.insert(run_bytes.end(), src, src + e.size);
+	}
+	for (const auto& run: runs) {
+		const uint64_t last = (run.address + run.size - 1u) >> 12u;
+		for (uint64_t page = run.address >> 12u; page <= last; ++page) pages.push_back(page);
+	}
+	std::sort(pages.begin(), pages.end());
+	pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+	runs_entries = count;
+	runs_bytes   = bytes.size();
 }
 
 bool ReadGuestAhead(ReadLog& log, uint64_t address, void* data, uint64_t size) {
@@ -2954,17 +3029,146 @@ static bool AssumeReadsUnchanged() {
 	return on;
 }
 
+static uint32_t AdoptRunsFixed() {
+	static const uint32_t value = [] {
+		const char* env = std::getenv("KYTY_PERF_ADOPT_RUNS");
+		return env != nullptr && env[0] == '1' && env[1] == '\0' ? 1u : 0u;
+	}();
+	return value;
+}
+
+static bool AdoptRunsCheck() {
+	static const bool on = [] {
+		const char* env = std::getenv("KYTY_CHECK_ADOPT_RUNS");
+		return env != nullptr && env[0] == '2' && env[1] == '\0';
+	}();
+	return on;
+}
+
+bool AdoptRunsPossible() {
+	static const bool possible = AdoptRunsCheck() || Common::LiveAb::Possible(Common::LiveAb::Switch::AdoptRuns, AdoptRunsFixed());
+	return possible;
+}
+
+namespace {
+struct AdoptRunsCounters {
+	uint64_t calls[3] {};
+	uint64_t ns[3] {};
+	uint64_t total          = 0;
+	uint64_t ready          = 0;
+	uint64_t proven         = 0;
+	uint64_t undecided      = 0;
+	uint64_t entries        = 0;
+	uint64_t runs           = 0;
+	uint64_t pages          = 0;
+	uint64_t check_compared = 0;
+	uint64_t check_differ   = 0;
+	uint64_t check_fallback = 0;
+	uint64_t census_checks  = 0;
+	uint64_t census_runs    = 0;
+	uint64_t census_prot    = 0;
+	uint64_t census_all     = 0;
+};
+AdoptRunsCounters g_adopt_runs;
+
+void ReportAdoptRuns() {
+	const auto& c   = g_adopt_runs;
+	const auto  per = [](uint64_t a, uint64_t b) { return b != 0 ? static_cast<double>(a) / static_cast<double>(b) : 0.0; };
+	std::fprintf(stderr,
+	             "PERF adopt_runs calls=%llu off_calls=%llu off_ns/call=%.0f on_calls=%llu on_ns/call=%.0f check_calls=%llu "
+	             "check_ns/call=%.0f ready=%.3f proven=%llu undecided=%llu entries/call=%.1f runs/call=%.2f pages/call=%.2f "
+	             "check_compared=%llu check_differ=%llu check_fallback_hold=%llu census_checks=%llu protected_runs=%.3f "
+	             "all_protected_checks=%.3f\n",
+	             static_cast<unsigned long long>(c.total), static_cast<unsigned long long>(c.calls[0]), per(c.ns[0], c.calls[0]),
+	             static_cast<unsigned long long>(c.calls[1]), per(c.ns[1], c.calls[1]),
+	             static_cast<unsigned long long>(c.calls[2]), per(c.ns[2], c.calls[2]), per(c.ready, c.total),
+	             static_cast<unsigned long long>(c.proven), static_cast<unsigned long long>(c.undecided), per(c.entries, c.ready),
+	             per(c.runs, c.ready), per(c.pages, c.ready), static_cast<unsigned long long>(c.check_compared),
+	             static_cast<unsigned long long>(c.check_differ), static_cast<unsigned long long>(c.check_fallback),
+	             static_cast<unsigned long long>(c.census_checks), per(c.census_prot, c.census_runs),
+	             per(c.census_all, c.census_checks));
+}
+} // namespace
+
+static bool ReadsUnchangedLogged(const ReadLog& log, const SrtRuntime& runtime, FastAdoptStats& counted, FastVerifyHook hook);
+
 bool ReadsUnchangedFast(const ReadLog& log, const SrtRuntime& runtime, FastAdoptStats* stats) {
 	if (t_ahead.log != nullptr) return false;
 	if (AssumeReadsUnchanged()) return true;
 	t_srt_changed_entry = SIZE_MAX; // KYTY_TRACE_SRT_CLASSES
 	FastAdoptStats  local;
 	FastAdoptStats& counted = stats != nullptr ? *stats : local;
-	++counted.calls;
 	// Strict entries are compared with the backing store by the verifier: only valid when the runtime has a strict
 	// reader at all (without one a strict entry cannot read as it did).
 	const FastVerifyHook hook =
 	    runtime.read_specialization_memory != nullptr ? g_fast_verify_hook.load(std::memory_order_relaxed) : nullptr;
+	if (!AdoptRunsPossible()) return ReadsUnchangedLogged(log, runtime, counted, hook);
+	const bool     check   = AdoptRunsCheck();
+	const uint32_t mode    = check ? 2u : (Common::LiveAb::Gate(Common::LiveAb::Switch::AdoptRuns, AdoptRunsFixed()) != 0u ? 1u : 0u);
+	const bool     perf    = Common::EnvRead::PerfLines();
+	const auto     t0      = perf ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+	const bool     ready   = log.RunsReady();
+	const auto     verify  = g_runs_verify_hook.load(std::memory_order_relaxed);
+	auto&          c       = g_adopt_runs;
+	bool           result  = false;
+	if (mode == 0u || hook == nullptr || verify == nullptr || !ready) {
+		result = ReadsUnchangedLogged(log, runtime, counted, hook);
+	} else {
+		bool           proven = false;
+		FastAdoptStats scratch;
+		{
+			const OrdinaryReadSession session(true);
+			proven = verify(log, mode == 2u ? scratch : counted);
+		}
+		(proven ? c.proven : c.undecided)++;
+		if (mode == 1u) {
+			if (proven) {
+				++counted.calls;
+				result = true;
+			} else {
+				result = ReadsUnchangedLogged(log, runtime, counted, hook);
+			}
+		} else {
+			result = ReadsUnchangedLogged(log, runtime, counted, hook);
+			c.check_compared++;
+			if (proven && !result) {
+				c.check_differ++;
+				static std::atomic_uint logged {0};
+				if (logged.fetch_add(1, std::memory_order_relaxed) < 16u) {
+					std::fprintf(stderr, "CHECK_ADOPT_RUNS differ entries=%zu runs=%zu pages=%zu changed_entry=%zu\n",
+					             log.entries.size(), log.runs.size(), log.pages.size(), t_srt_changed_entry);
+				}
+			}
+			if (!proven && result) c.check_fallback++;
+		}
+	}
+	c.total++;
+	if (perf) {
+		c.calls[mode]++;
+		c.ns[mode] += static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+	}
+	if (ready) {
+		c.ready++;
+		c.entries += log.entries.size();
+		c.runs += log.runs.size();
+		c.pages += log.pages.size();
+		const auto census = g_runs_census_hook.load(std::memory_order_relaxed);
+		if (perf && census != nullptr && (c.ready & 15u) == 0u) {
+			RunsCensus counts;
+			census(log, counts);
+			c.census_checks++;
+			c.census_runs += counts.runs;
+			c.census_prot += counts.protected_runs;
+			if (counts.protected_runs == counts.runs) c.census_all++;
+		}
+	}
+	if ((perf || check) && (c.total & 0x1ffffu) == 0u) ReportAdoptRuns();
+	return result;
+}
+
+static bool ReadsUnchangedLogged(const ReadLog& log, const SrtRuntime& runtime, FastAdoptStats& counted, FastVerifyHook hook) {
+	++counted.calls;
 	// A real call makes its ordinary reads inside this bracket; the verifier shares its page cache.
 	const OrdinaryReadSession session(true);
 	const size_t              count = log.entries.size();

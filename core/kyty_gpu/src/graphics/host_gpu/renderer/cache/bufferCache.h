@@ -235,6 +235,7 @@ public:
 	[[nodiscard]] bool HasPendingReadback(uint64_t vaddr, uint64_t size) const;
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool PeekCpuClean(uint64_t vaddr, uint64_t size) { return m_memory_tracker.PeekCpuClean(vaddr, size); }
 	// BAR reads: a draw or dispatch was recorded into the current command buffer; the
 	// writable buffers obtained for it get that command buffer's tick as their write tick.
 	void NoteCommandEmitted();

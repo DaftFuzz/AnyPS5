@@ -5,6 +5,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstdint>
 #include <functional>
 #include <optional>
 #include <span>
@@ -135,11 +136,25 @@ struct ReadLog {
 	static constexpr uint32_t MaxCallBytes  = 4096;
 	static constexpr uint32_t MaxTotalBytes = 1024u << 10u;
 
+	struct Run {
+		uint64_t address = 0;
+		uint64_t size    = 0;
+		uint32_t first   = 0;
+		Kind     kind    = Kind::Ordinary;
+		uint32_t entries = 0;
+	};
+
 	std::vector<Entry>   entries;
 	std::vector<uint8_t> bytes;
+	std::vector<Run>      runs;
+	std::vector<uint64_t> pages;
+	std::vector<uint8_t>  run_bytes;
+	size_t                runs_entries = SIZE_MAX;
+	size_t                runs_bytes   = 0;
 	// Starts a new log (the reads the stages of one operation repeat are logged once, while they read the same bytes).
 	void Clear();
-
+	void PrepareRuns();
+	[[nodiscard]] bool RunsReady() const { return runs_entries == entries.size() && runs_bytes == bytes.size(); }
 };
 
 // Reads guest memory for the ahead path: the bytes of [vaddr, vaddr + size) as the backing store holds them,
@@ -218,6 +233,15 @@ struct FastAdoptStats {
 
 using FastVerifyHook = FastVerifyResult (*)(const ReadLog& log, size_t begin, size_t& stop, FastAdoptStats& stats);
 void SetFastVerifyHook(FastVerifyHook hook);
+
+using RunsVerifyHook = bool (*)(const ReadLog& log, FastAdoptStats& stats);
+struct RunsCensus {
+	uint64_t runs           = 0;
+	uint64_t protected_runs = 0;
+};
+using RunsCensusHook = void (*)(const ReadLog& log, RunsCensus& census);
+void SetRunsVerifyHooks(RunsVerifyHook verify, RunsCensusHook census);
+[[nodiscard]] bool AdoptRunsPossible();
 
 // ReadsUnchangedFast through the fast verifier (without a hook installed it is ReadsUnchangedFast).
 bool ReadsUnchangedFast(const ReadLog& log, const SrtRuntime& runtime, FastAdoptStats* stats = nullptr);

@@ -92,6 +92,7 @@ constexpr SwitchInfo Switches[] = {
     // Measurement only (APPROXIMATION, 11.11 ceiling of the per-draw checks): whether the check of a helper's logged
     // reads at adoption (kernel/memory.cpp FastVerifyLoggedReads) is skipped - the helper's result is taken as unchanged.
     {Switch::DiagAdoptAssume, "KYTY_DIAG_ADOPT_ASSUME_UNCHANGED", 1},
+    {Switch::AdoptRuns, "KYTY_PERF_ADOPT_RUNS", 1},
     // Project 15 way B P1 (test switch): a read-only buffer binding with a ready plan entry whose proof holds takes the
     // binding the helper computed (handle, aligned offset, range, offset byte, record stride) instead of RebindBuffers'.
 };
@@ -326,6 +327,8 @@ void ResetMeasure(State& state) {
 	state.frame_ms.clear();
 	state.busy_ns = 0;
 	state.wait_ns = 0;
+	g_phase_draws.store(0, std::memory_order_relaxed);
+	g_phase_dispatches.store(0, std::memory_order_relaxed);
 }
 
 void StartPhase(State& state, const Config& config, int64_t now) {

@@ -1223,6 +1223,82 @@ static Graphics::ShaderRecompiler::IR::FastVerifyResult FastVerifyLoggedReads(
 	return Result::Unchanged;
 }
 
+static bool FastVerifyLoggedRuns(const Graphics::ShaderRecompiler::IR::ReadLog& log,
+                                 Graphics::ShaderRecompiler::IR::FastAdoptStats& stats) {
+	namespace Ir = Graphics::ShaderRecompiler::IR;
+	if (g_gpu_resources == nullptr || !Map().IsAvailable() || !Graphics::GuestGpu::IsGpuThread()) return false;
+	if (Ir::SrtClassTrace() || Graphics::BufferCache::PageMarkCheck()) return false;
+	static const uint32_t assume_fixed = [] {
+		const char* value = std::getenv("KYTY_DIAG_ADOPT_ASSUME_UNCHANGED");
+		return value != nullptr && value[0] == '1' ? 1u : 0u;
+	}();
+	if (Common::LiveAb::Gate(Common::LiveAb::Switch::DiagAdoptAssume, assume_fixed) != 0u) return false;
+	for (const auto& run: log.runs) {
+		if (!IsGpuAddressRange(run.address, run.size)) return false;
+	}
+	auto&     cache = t_ordinary_read_pages;
+	uint64_t  local_pages[OrdinaryReadPageCache::kSlots] = {~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull};
+	uint64_t* pages       = cache.active ? cache.pages : local_pages;
+	auto&     buffers     = GetGpuResources().GetBufferCache();
+	const bool ask_direct = Graphics::BufferCache::VerifyRangeOn() || Graphics::PerfEnabled();
+	for (const uint64_t page: log.pages) {
+		auto& slot = pages[page % OrdinaryReadPageCache::kSlots];
+		if (slot == page) continue;
+		const uint64_t base = page << 12u;
+		if (!IsGpuAddressRange(base, 4096u)) return false;
+		if (ask_direct && buffers.DirectPendingIn(base, 4096u) != 0u) return false;
+		if (buffers.WaitPendingReadbacks(base, 4096u) || buffers.IsRegionGpuModified(base, 4096u)) return false;
+		slot = page;
+	}
+	constexpr size_t      kMaxPending = 32;
+	GuestMap::CompareSpan spans[kMaxPending];
+	size_t                pending = 0;
+	const auto            flush   = [&]() {
+		if (pending == 0) return true;
+		size_t     bad     = 0;
+		const auto outcome = Map().CompareBackingBatch(spans, pending, &bad);
+		pending            = 0;
+		return outcome == GuestMap::CompareResult::Equal;
+	};
+	for (const auto& run: log.runs) {
+		const uint8_t* const expected = log.run_bytes.data() + run.first;
+		if (run.kind == Ir::ReadLog::Kind::Ordinary) {
+			bool same = true;
+			if (GuestImageReadArmed(run.address, run.size)) {
+				thread_local std::vector<uint8_t> watched;
+				watched.resize(run.size);
+				ReadGuestPlain(watched.data(), run.address, run.size);
+				same = std::memcmp(watched.data(), expected, static_cast<size_t>(run.size)) == 0;
+			} else {
+				same = std::memcmp(reinterpret_cast<const void*>(run.address), expected, static_cast<size_t>(run.size)) == 0;
+			}
+			if (!same) return false;
+		} else {
+			spans[pending++] = {run.address, expected, run.size};
+			if (pending == kMaxPending && !flush()) return false;
+		}
+	}
+	if (!flush()) return false;
+	stats.entries_fast += log.entries.size();
+	stats.runs += log.runs.size();
+	return true;
+}
+
+static void CensusLoggedRuns(const Graphics::ShaderRecompiler::IR::ReadLog& log,
+                             Graphics::ShaderRecompiler::IR::RunsCensus& census) {
+	census.runs += log.runs.size();
+	if (g_gpu_resources == nullptr || !Graphics::GuestGpu::IsGpuThread()) return;
+	auto& buffers = GetGpuResources().GetBufferCache();
+	for (const auto& run: log.runs) {
+		const uint64_t base = run.address & ~uint64_t {0xfff};
+		const uint64_t last = (run.address + run.size - 1u) | uint64_t {0xfff};
+		if (last == UINT64_MAX) continue;
+		const uint64_t size = last + 1u - base;
+		if (!IsGpuAddressRange(base, size)) continue;
+		if (buffers.PeekCpuClean(base, size) && !buffers.IsRegionGpuModified(base, size)) census.protected_runs++;
+	}
+}
+
 uint64_t TryClampReservedRangeSize(uint64_t vaddr, uint64_t size) {
 	return Map().ClampRangeSize(vaddr, size);
 }
@@ -1275,6 +1351,8 @@ void InstallGpuResources(Graphics::RenderContext* resources) noexcept {
 	Graphics::ShaderRecompiler::IR::SetAheadReadHook(resources != nullptr ? &AheadReadBacking : nullptr);
 	Graphics::ShaderRecompiler::IR::SetPlainReadHook(resources != nullptr ? &ReadGuestPlain : nullptr);
 	Graphics::ShaderRecompiler::IR::SetFastVerifyHook(resources != nullptr ? &FastVerifyLoggedReads : nullptr);
+	Graphics::ShaderRecompiler::IR::SetRunsVerifyHooks(resources != nullptr ? &FastVerifyLoggedRuns : nullptr,
+	                                                   resources != nullptr ? &CensusLoggedRuns : nullptr);
 	if (resources != nullptr) {
 		Graphics::ShaderRecompiler::IR::SetOrdinaryReadHook(&OrdinaryReadBufferBacking);
 		Graphics::ShaderRecompiler::IR::SetOrdinaryReadSessionHook(&SrtReadSession);
