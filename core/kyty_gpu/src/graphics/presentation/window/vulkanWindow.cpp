@@ -951,6 +951,42 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 			});
 		}
 	}
+	vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT gpl_features {};
+	graphics.graphics_pipeline_library_enabled = false;
+	if (Common::EnvRead::Gpl() != 0u && HasExtension(device_extensions, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME)) {
+		vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT   supported_gpl {};
+		vk::PhysicalDeviceGraphicsPipelineLibraryPropertiesEXT gpl_properties {};
+		vk::PhysicalDeviceFeatures2                            gpl_query {};
+		vk::PhysicalDeviceProperties2                          gpl_properties_query {};
+		gpl_query.pNext            = &supported_gpl;
+		gpl_properties_query.pNext = &gpl_properties;
+		physical_device.getFeatures2(&gpl_query);
+		physical_device.getProperties2(&gpl_properties_query);
+		const bool usable = supported_gpl.graphicsPipelineLibrary == VK_TRUE &&
+		                    gpl_properties.graphicsPipelineLibraryFastLinking == VK_TRUE &&
+		                    supported_features13.pipelineCreationCacheControl == VK_TRUE;
+		if (usable) {
+			gpl_features.graphicsPipelineLibrary      = VK_TRUE;
+			gpl_features.pNext                        = const_cast<void*>(create_info.pNext);
+			create_info.pNext                         = &gpl_features;
+			features13.pipelineCreationCacheControl   = VK_TRUE;
+			graphics.graphics_pipeline_library_enabled = true;
+		} else {
+			std::erase_if(enabled_extensions, [](const char* name) {
+				return std::strcmp(name, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME) == 0 ||
+				       std::strcmp(name, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME) == 0;
+			});
+		}
+		std::fprintf(stderr,
+		             "PERF_GPL device: library=%d fast_linking=%d independent_interpolation=%d cache_control=%d -> %s\n",
+		             supported_gpl.graphicsPipelineLibrary == VK_TRUE ? 1 : 0,
+		             gpl_properties.graphicsPipelineLibraryFastLinking == VK_TRUE ? 1 : 0,
+		             gpl_properties.graphicsPipelineLibraryIndependentInterpolationDecoration == VK_TRUE ? 1 : 0,
+		             supported_features13.pipelineCreationCacheControl == VK_TRUE ? 1 : 0,
+		             usable ? "enabled" : "unavailable (monolithic pipelines)");
+	} else if (Common::EnvRead::Gpl() != 0u) {
+		std::fprintf(stderr, "PERF_GPL device: VK_EXT_graphics_pipeline_library missing -> unavailable (monolithic pipelines)\n");
+	}
 	std::fprintf(stderr, "PERF_SHARE_ATTACHMENT_SETS switch=%d unused_attachments=%d\n",
 	             Common::EnvRead::ShareAttachmentSets() ? 1 : 0, graphics.unused_attachments_enabled ? 1 : 0);
 	create_info.pQueueCreateInfos       = &queue_create_info;
@@ -1434,6 +1470,11 @@ void WindowContext::CreateVulkan() {
 		if (Common::EnvRead::ShareAttachmentSets() &&
 		    HasExtension(available_extensions, VK_EXT_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_EXTENSION_NAME);
+		}
+		if (Common::EnvRead::Gpl() != 0u && HasExtension(available_extensions, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME) &&
+		    HasExtension(available_extensions, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+			device_extensions.push_back(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
 		}
 		Vr::OpenXrAppendExtensions(device_extensions, available_extensions, true);
 	}

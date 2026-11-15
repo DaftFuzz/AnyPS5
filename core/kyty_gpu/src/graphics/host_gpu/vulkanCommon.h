@@ -30,6 +30,15 @@ void        RequireVulkanSuccess(vk::Result result, const char* operation);
 vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device);
 // CompileSPV for the background compiles (shaderPrecompile.h): null instead of an exit when the driver refuses it.
 vk::ShaderModule TryCompileSPV(std::span<const uint32_t> code, vk::Device device);
+// KYTY_PERF_GPL: the 128-bit hash of the SPIR-V a live module was last created from by CompileSPV or TryCompileSPV
+// (a reused handle takes its new code's hash); zero when unknown or the switch is off.
+struct ShaderModuleContentHash {
+	uint64_t low  = 0;
+	uint64_t high = 0;
+	[[nodiscard]] bool Known() const { return low != 0 || high != 0; }
+	bool               operator==(const ShaderModuleContentHash&) const = default;
+};
+[[nodiscard]] ShaderModuleContentHash ModuleContentHash(vk::ShaderModule module);
 
 [[nodiscard]] constexpr bool IsHdrSwapchainFormat(vk::Format format) {
 	switch (format) {

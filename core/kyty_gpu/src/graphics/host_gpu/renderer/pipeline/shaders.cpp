@@ -32,11 +32,16 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <future>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <span>
+#include <type_traits>
+#include <unordered_map>
 #include <vector>
+#include <xxhash.h>
 
 namespace Libs::Graphics {
 
@@ -588,6 +593,227 @@ const char* GraphicsPipelineUnsupported(const GraphicContext& graphics, const Pi
 	return nullptr;
 }
 
+namespace {
+
+enum GplKind : uint32_t { GplVertexInput, GplPreRaster, GplFragment, GplOutput, GplLayout, GplKindCount };
+
+struct GplKey {
+	uint64_t low  = 0;
+	uint64_t high = 0;
+	uint32_t kind = 0;
+	bool     operator==(const GplKey&) const = default;
+};
+
+struct GplKeyHash {
+	std::size_t operator()(const GplKey& key) const { return static_cast<std::size_t>(key.low ^ (key.high * 31u) ^ key.kind); }
+};
+
+class GplKeyBuilder {
+public:
+	template <typename T>
+	void Add(const T& value) {
+		static_assert(std::is_trivially_copyable_v<T>);
+		const auto* bytes = reinterpret_cast<const uint8_t*>(&value);
+		m_bytes.insert(m_bytes.end(), bytes, bytes + sizeof(T));
+	}
+	void AddBytes(const void* data, size_t size) {
+		const auto* bytes = static_cast<const uint8_t*>(data);
+		m_bytes.insert(m_bytes.end(), bytes, bytes + size);
+	}
+	[[nodiscard]] GplKey Finish(GplKind kind) const {
+		const auto hash = XXH3_128bits(m_bytes.data(), m_bytes.size());
+		return {hash.low64, hash.high64, kind};
+	}
+
+private:
+	std::vector<uint8_t> m_bytes;
+};
+
+struct GplLayoutEntry {
+	vk::DescriptorSetLayout set_layout = nullptr;
+	vk::PipelineLayout      layout     = nullptr;
+};
+
+struct GplStats {
+	std::atomic<uint64_t> probe_hit {0}, probe_miss {0}, fast {0}, fast_us {0}, link_us {0}, mono {0};
+	std::array<std::atomic<uint64_t>, GplKindCount> made {}, hit {}, made_us {};
+	std::atomic<uint64_t> fb_rect_list {0}, fb_mesh {0}, fb_stats {0}, fb_module {0}, fb_library {0};
+	std::atomic<uint64_t> opt_queued {0}, opt_swapped {0}, opt_failed {0}, opt_discarded {0}, opt_us {0};
+	std::atomic<int64_t>  window_ms {0};
+};
+
+GplStats g_gpl;
+
+struct GplLibraryCache {
+	std::mutex                                                                     mutex;
+	std::unordered_map<GplKey, std::shared_future<vk::Pipeline>, GplKeyHash> libraries;
+	std::unordered_map<GplKey, GplLayoutEntry, GplKeyHash>                   layouts;
+};
+
+GplLibraryCache& GplLibraries() {
+	static GplLibraryCache cache;
+	return cache;
+}
+
+const ShaderRecompiler::IR::ResourceSnapshot g_gpl_no_resources {};
+
+uint64_t GplElapsedUs(std::chrono::steady_clock::time_point begin) {
+	return static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin).count());
+}
+
+template <typename Create>
+vk::Pipeline GplLibrary(const GplKey& key, Create&& create) {
+	auto&                            cache = GplLibraries();
+	std::shared_future<vk::Pipeline> future;
+	std::promise<vk::Pipeline>       promise;
+	bool                             owner = false;
+	{
+		const std::lock_guard lock(cache.mutex);
+		if (const auto found = cache.libraries.find(key); found != cache.libraries.end()) {
+			future = found->second;
+		} else {
+			future = promise.get_future().share();
+			cache.libraries.emplace(key, future);
+			owner = true;
+		}
+	}
+	if (!owner) {
+		g_gpl.hit[key.kind].fetch_add(1, std::memory_order_relaxed);
+		return future.get();
+	}
+	const auto begin   = std::chrono::steady_clock::now();
+	const auto library = create();
+	g_gpl.made[key.kind].fetch_add(1, std::memory_order_relaxed);
+	g_gpl.made_us[key.kind].fetch_add(GplElapsedUs(begin), std::memory_order_relaxed);
+	promise.set_value(library);
+	return library;
+}
+
+const char* GplDynamicSubset(vk::DynamicState state) {
+	switch (state) {
+		case vk::DynamicState::eViewportWithCount:
+		case vk::DynamicState::eScissorWithCount:
+		case vk::DynamicState::eLineWidth:
+		case vk::DynamicState::eDepthBiasEnable:
+		case vk::DynamicState::eDepthBias:
+		case vk::DynamicState::eCullMode:
+		case vk::DynamicState::eFrontFace: return "pre";
+		case vk::DynamicState::eDepthTestEnable:
+		case vk::DynamicState::eDepthWriteEnable:
+		case vk::DynamicState::eDepthCompareOp:
+		case vk::DynamicState::eStencilTestEnable:
+		case vk::DynamicState::eStencilOp:
+		case vk::DynamicState::eStencilCompareMask:
+		case vk::DynamicState::eStencilReference:
+		case vk::DynamicState::eStencilWriteMask:
+		case vk::DynamicState::eDepthBoundsTestEnable:
+		case vk::DynamicState::eDepthBounds: return "fs";
+		case vk::DynamicState::eBlendConstants:
+		case vk::DynamicState::eColorWriteEnableEXT:
+		case vk::DynamicState::eAttachmentFeedbackLoopEnableEXT: return "fo";
+		default: return nullptr;
+	}
+}
+
+void GplReport(bool force) {
+	if (!PerfEnabled()) return;
+	const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+	                        std::chrono::steady_clock::now().time_since_epoch())
+	                        .count();
+	auto last = g_gpl.window_ms.load(std::memory_order_relaxed);
+	if (!force && now_ms - last < 5000) return;
+	if (!g_gpl.window_ms.compare_exchange_strong(last, now_ms, std::memory_order_relaxed)) return;
+	const auto ms = [](const std::atomic<uint64_t>& us) { return static_cast<double>(us.load(std::memory_order_relaxed)) / 1000.0; };
+	const auto n  = [](const std::atomic<uint64_t>& v) { return static_cast<unsigned long long>(v.load(std::memory_order_relaxed)); };
+	std::fprintf(stderr,
+	             "PERF gpl mode=%u probe_hit=%llu probe_miss=%llu fast=%llu fast_ms=%.0f link_ms=%.0f mono=%llu "
+	             "vi=%llu/%llu pre=%llu/%llu (%.0fms) fs=%llu/%llu (%.0fms) fo=%llu/%llu layouts=%llu "
+	             "fallback rect_list=%llu mesh=%llu stats=%llu module=%llu library=%llu "
+	             "opt queued=%llu swapped=%llu failed=%llu discarded=%llu opt_ms=%.0f\n",
+	             Common::EnvRead::Gpl(), n(g_gpl.probe_hit), n(g_gpl.probe_miss), n(g_gpl.fast), ms(g_gpl.fast_us),
+	             ms(g_gpl.link_us), n(g_gpl.mono), n(g_gpl.made[GplVertexInput]), n(g_gpl.hit[GplVertexInput]),
+	             n(g_gpl.made[GplPreRaster]), n(g_gpl.hit[GplPreRaster]), ms(g_gpl.made_us[GplPreRaster]),
+	             n(g_gpl.made[GplFragment]), n(g_gpl.hit[GplFragment]), ms(g_gpl.made_us[GplFragment]),
+	             n(g_gpl.made[GplOutput]), n(g_gpl.hit[GplOutput]), n(g_gpl.made[GplLayout]), n(g_gpl.fb_rect_list),
+	             n(g_gpl.fb_mesh), n(g_gpl.fb_stats), n(g_gpl.fb_module), n(g_gpl.fb_library), n(g_gpl.opt_queued),
+	             n(g_gpl.opt_swapped), n(g_gpl.opt_failed), n(g_gpl.opt_discarded), ms(g_gpl.opt_us));
+	std::fflush(stderr);
+}
+
+GplLayoutEntry GplLibraryLayout(GraphicContext& graphics, const PipelineCache::Pipeline& pipeline,
+                                std::span<const vk::DescriptorSetLayoutBinding> bindings,
+                                const vk::PushConstantRange& push_constants) {
+	GplKeyBuilder builder;
+	for (const auto& b: bindings) {
+		builder.Add(b.binding);
+		builder.Add(b.descriptorType);
+		builder.Add(b.descriptorCount);
+		builder.Add(static_cast<uint32_t>(b.stageFlags));
+	}
+	builder.Add(pipeline.uses_push_descriptors);
+	builder.Add(pipeline.uses_bindless);
+	builder.Add(static_cast<uint32_t>(push_constants.stageFlags));
+	builder.Add(push_constants.offset);
+	builder.Add(push_constants.size);
+	const auto key   = builder.Finish(GplLayout);
+	auto&      cache = GplLibraries();
+	const std::lock_guard lock(cache.mutex);
+	if (const auto found = cache.layouts.find(key); found != cache.layouts.end()) return found->second;
+	GplLayoutEntry                    entry;
+	vk::DescriptorSetLayoutCreateInfo set_create {};
+	set_create.flags        = pipeline.uses_push_descriptors ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
+	                                                         : vk::DescriptorSetLayoutCreateFlags {};
+	set_create.bindingCount = static_cast<uint32_t>(bindings.size());
+	set_create.pBindings    = bindings.data();
+	if (graphics.device.createDescriptorSetLayout(&set_create, nullptr, &entry.set_layout) != vk::Result::eSuccess) {
+		return {};
+	}
+	std::array<vk::DescriptorSetLayout, 2> set_layouts {entry.set_layout, graphics.bindless_layout};
+	vk::PipelineLayoutCreateInfo           layout_create {};
+	layout_create.setLayoutCount         = pipeline.uses_bindless ? 2u : 1u;
+	layout_create.pSetLayouts            = set_layouts.data();
+	layout_create.pushConstantRangeCount = 1;
+	layout_create.pPushConstantRanges    = &push_constants;
+	if (graphics.device.createPipelineLayout(&layout_create, nullptr, &entry.layout) != vk::Result::eSuccess) {
+		graphics.device.destroyDescriptorSetLayout(entry.set_layout, nullptr);
+		return {};
+	}
+	g_gpl.made[GplLayout].fetch_add(1, std::memory_order_relaxed);
+	cache.layouts.emplace(key, entry);
+	return entry;
+}
+
+} // namespace
+
+void GplCountOptimize(GplOptimizeEvent event, uint64_t us) {
+	switch (event) {
+		case GplOptimizeEvent::Queued: g_gpl.opt_queued.fetch_add(1, std::memory_order_relaxed); break;
+		case GplOptimizeEvent::Swapped: g_gpl.opt_swapped.fetch_add(1, std::memory_order_relaxed); break;
+		case GplOptimizeEvent::Failed: g_gpl.opt_failed.fetch_add(1, std::memory_order_relaxed); break;
+		case GplOptimizeEvent::Discarded: g_gpl.opt_discarded.fetch_add(1, std::memory_order_relaxed); break;
+	}
+	g_gpl.opt_us.fetch_add(us, std::memory_order_relaxed);
+	GplReport(false);
+}
+
+void GplDestroyLibraries(GraphicContext& graphics) {
+	auto&                 cache = GplLibraries();
+	const std::lock_guard lock(cache.mutex);
+	GplReport(true);
+	for (auto& [key, future]: cache.libraries) {
+		(void)key;
+		if (future.valid() && future.get() != nullptr) graphics.device.destroyPipeline(future.get(), nullptr);
+	}
+	for (auto& [key, entry]: cache.layouts) {
+		(void)key;
+		graphics.device.destroyPipelineLayout(entry.layout, nullptr);
+		graphics.device.destroyDescriptorSetLayout(entry.set_layout, nullptr);
+	}
+	cache.libraries.clear();
+	cache.layouts.clear();
+}
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const PipelineRenderingState&          rendering,
@@ -978,8 +1204,226 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		pipeline_info.flags |= vk::PipelineCreateFlagBits::eCaptureStatisticsKHR;
 	}
 	const auto create_begin = std::chrono::steady_clock::now();
-	result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr,
-	                                                 &pipeline.pipeline);
+	const uint32_t gpl_mode =
+	    graphics.graphics_pipeline_library_enabled && !t_gpl_monolithic ? Common::EnvRead::Gpl() : 0u;
+	const char* gpl_form  = t_gpl_monolithic ? "opt" : "mono";
+	bool        gpl_made  = false;
+	if (gpl_mode != 0u) {
+		if (rect_list) {
+			g_gpl.fb_rect_list.fetch_add(1, std::memory_order_relaxed);
+		} else if (mesh) {
+			g_gpl.fb_mesh.fetch_add(1, std::memory_order_relaxed);
+		} else if (want_stats) {
+			g_gpl.fb_stats.fetch_add(1, std::memory_order_relaxed);
+		} else {
+			if (gpl_mode == 1u) {
+				pipeline_info.flags |= vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired;
+				result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr, &pipeline.pipeline);
+				pipeline_info.flags &= ~vk::PipelineCreateFlags(vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired);
+				if (result == vk::Result::ePipelineCompileRequired) {
+					pipeline.pipeline = nullptr;
+					g_gpl.probe_miss.fetch_add(1, std::memory_order_relaxed);
+				} else {
+					gpl_made = true;
+					gpl_form = "probe";
+					if (result == vk::Result::eSuccess) g_gpl.probe_hit.fetch_add(1, std::memory_order_relaxed);
+				}
+			}
+			if (!gpl_made) {
+				const uint32_t pre_stage_count = static_cast<uint32_t>(vertex_info.size());
+				std::array<ShaderModuleContentHash, 4> module_hashes {};
+				bool                                   modules_known = true;
+				for (uint32_t i = 0; i < shader_stage_count; i++) {
+					module_hashes[i] = ModuleContentHash(shader_stages[i].module);
+					modules_known    = modules_known && module_hashes[i].Known();
+				}
+				const auto library_layout =
+				    modules_known ? GplLibraryLayout(graphics, pipeline, descriptor_bindings, push_constants) : GplLayoutEntry {};
+				if (!modules_known) {
+					g_gpl.fb_module.fetch_add(1, std::memory_order_relaxed);
+				} else if (library_layout.layout == nullptr) {
+					g_gpl.fb_library.fetch_add(1, std::memory_order_relaxed);
+				} else {
+					std::vector<vk::DynamicState> pre_dynamic, fs_dynamic, fo_dynamic;
+					for (const auto state: dynamic_states) {
+						const char* subset = GplDynamicSubset(state);
+						EXIT_IF(subset == nullptr);
+						(subset[0] == 'p' ? pre_dynamic : subset[1] == 's' ? fs_dynamic : fo_dynamic).push_back(state);
+					}
+					const auto dynamic_info = [](const std::vector<vk::DynamicState>& states) {
+						vk::PipelineDynamicStateCreateInfo info {};
+						info.dynamicStateCount = static_cast<uint32_t>(states.size());
+						info.pDynamicStates    = states.data();
+						return info;
+					};
+					const auto pre_dynamic_info = dynamic_info(pre_dynamic);
+					const auto fs_dynamic_info  = dynamic_info(fs_dynamic);
+					const auto fo_dynamic_info  = dynamic_info(fo_dynamic);
+					vk::PipelineRenderingCreateInfo     shader_rendering {};
+					vk::PipelineDepthStencilStateCreateInfo library_depth_stencil {};
+					const auto create_library = [&](vk::GraphicsPipelineLibraryFlagsEXT subset, vk::GraphicsPipelineCreateInfo info,
+					                                const void* rendering_chain) {
+						vk::GraphicsPipelineLibraryCreateInfoEXT library_info {};
+						library_info.flags = subset;
+						library_info.pNext = rendering_chain;
+						info.pNext         = &library_info;
+						info.flags         = vk::PipelineCreateFlagBits::eLibraryKHR;
+						info.basePipelineIndex = -1;
+						vk::Pipeline library = nullptr;
+						if (graphics.device.createGraphicsPipelines(driver_cache, 1, &info, nullptr, &library) != vk::Result::eSuccess) {
+							return vk::Pipeline {};
+						}
+						return library;
+					};
+					const auto multisample_key = [&](GplKeyBuilder& b) {
+						b.Add(multisampling.rasterizationSamples);
+						b.Add(multisampling.sampleShadingEnable);
+						b.Add(multisampling.minSampleShading);
+						b.Add(multisampling.alphaToCoverageEnable);
+						b.Add(multisampling.alphaToOneEnable);
+					};
+					const auto dynamic_key = [](GplKeyBuilder& b, const std::vector<vk::DynamicState>& states) {
+						b.Add(static_cast<uint32_t>(states.size()));
+						b.AddBytes(states.data(), states.size() * sizeof(vk::DynamicState));
+					};
+					GplKeyBuilder vi_builder;
+					vi_builder.Add(vertex_input_info.vertexBindingDescriptionCount);
+					vi_builder.AddBytes(input_desc, sizeof(input_desc[0]) * vertex_input_info.vertexBindingDescriptionCount);
+					vi_builder.Add(vertex_input_info.vertexAttributeDescriptionCount);
+					vi_builder.AddBytes(input_attr, sizeof(input_attr[0]) * vertex_input_info.vertexAttributeDescriptionCount);
+					vi_builder.Add(input_assembly.topology);
+					vi_builder.Add(input_assembly.primitiveRestartEnable);
+					GplKeyBuilder pre_builder;
+					pre_builder.Add(library_layout.layout);
+					pre_builder.Add(pre_stage_count);
+					for (uint32_t i = 0; i < pre_stage_count; i++) {
+						pre_builder.Add(shader_stages[i].stage);
+						pre_builder.Add(module_hashes[i]);
+					}
+					pre_builder.Add(tessellation ? tessellation_state.patchControlPoints : 0u);
+					pre_builder.Add(depth_clip_control.negativeOneToOne);
+					pre_builder.Add(rasterizer.depthClampEnable);
+					pre_builder.Add(rasterizer.pNext != nullptr ? clip_ext.depthClipEnable : VK_TRUE);
+					pre_builder.Add(graphics.provoking_vertex_last_enabled ? provoking_vertex.provokingVertexMode
+					                                                       : vk::ProvokingVertexModeEXT::eFirstVertex);
+					pre_builder.Add(static_cast<uint32_t>(rasterizer.cullMode));
+					pre_builder.Add(rasterizer.frontFace);
+					pre_builder.Add(rasterizer.polygonMode);
+					pre_builder.Add(rasterizer.lineWidth);
+					dynamic_key(pre_builder, pre_dynamic);
+					GplKeyBuilder fs_builder;
+					fs_builder.Add(library_layout.layout);
+					fs_builder.Add(ps_active);
+					fs_builder.Add(ps_active ? module_hashes[shader_stage_count - 1u] : ShaderModuleContentHash {});
+					multisample_key(fs_builder);
+					dynamic_key(fs_builder, fs_dynamic);
+					GplKeyBuilder fo_builder;
+					fo_builder.Add(rendering.color_count);
+					fo_builder.AddBytes(rendering.color_formats.data(), sizeof(vk::Format) * rendering.color_count);
+					fo_builder.Add(rendering.depth_format);
+					fo_builder.Add(rendering.stencil_format);
+					fo_builder.AddBytes(color_blend_attachment, sizeof(color_blend_attachment[0]) * rendering.color_count);
+					fo_builder.Add(color_blending.pNext != nullptr ? color_write.attachmentCount : 0xffffffffu);
+					fo_builder.Add(color_blending.logicOp);
+					multisample_key(fo_builder);
+					dynamic_key(fo_builder, fo_dynamic);
+
+					const auto make_vi = [&] {
+						vk::GraphicsPipelineCreateInfo info {};
+						info.pVertexInputState   = &vertex_input_info;
+						info.pInputAssemblyState = &input_assembly;
+						return create_library(vk::GraphicsPipelineLibraryFlagBitsEXT::eVertexInputInterface, info, nullptr);
+					};
+					const auto make_pre = [&] {
+						vk::GraphicsPipelineCreateInfo info {};
+						info.stageCount          = pre_stage_count;
+						info.pStages             = shader_stages;
+						info.pTessellationState  = tessellation ? &tessellation_state : nullptr;
+						info.pViewportState      = &viewport_state;
+						info.pRasterizationState = &rasterizer;
+						info.pDynamicState       = &pre_dynamic_info;
+						info.layout              = library_layout.layout;
+						return create_library(vk::GraphicsPipelineLibraryFlagBitsEXT::ePreRasterizationShaders, info,
+						                      &shader_rendering);
+					};
+					const auto make_fs = [&] {
+						vk::GraphicsPipelineCreateInfo info {};
+						info.stageCount         = ps_active ? 1u : 0u;
+						info.pStages            = ps_active ? &shader_stages[shader_stage_count - 1u] : nullptr;
+						info.pMultisampleState  = &multisampling;
+						info.pDepthStencilState = &library_depth_stencil;
+						info.pDynamicState      = &fs_dynamic_info;
+						info.layout             = library_layout.layout;
+						return create_library(vk::GraphicsPipelineLibraryFlagBitsEXT::eFragmentShader, info, &shader_rendering);
+					};
+					const auto make_fo = [&] {
+						vk::GraphicsPipelineCreateInfo info {};
+						info.pMultisampleState = &multisampling;
+						info.pColorBlendState  = &color_blending;
+						info.pDynamicState     = &fo_dynamic_info;
+						return create_library(vk::GraphicsPipelineLibraryFlagBitsEXT::eFragmentOutputInterface, info,
+						                      &rendering_info);
+					};
+					const auto fast_begin = std::chrono::steady_clock::now();
+					std::future<vk::Pipeline> fs_async;
+					const auto fs_key = fs_builder.Finish(GplFragment);
+					if (!background) {
+						fs_async = std::async(std::launch::async, [&] { return GplLibrary(fs_key, make_fs); });
+					}
+					const vk::Pipeline libraries[4] = {
+					    GplLibrary(vi_builder.Finish(GplVertexInput), make_vi), GplLibrary(pre_builder.Finish(GplPreRaster), make_pre),
+					    fs_async.valid() ? fs_async.get() : GplLibrary(fs_key, make_fs), GplLibrary(fo_builder.Finish(GplOutput), make_fo)};
+					if (std::ranges::any_of(libraries, [](vk::Pipeline p) { return p == nullptr; })) {
+						g_gpl.fb_library.fetch_add(1, std::memory_order_relaxed);
+					} else {
+						vk::PipelineLibraryCreateInfoKHR link_libraries {};
+						link_libraries.libraryCount = 4;
+						link_libraries.pLibraries   = libraries;
+						link_libraries.pNext        = &rendering_info;
+						vk::GraphicsPipelineCreateInfo link {};
+						link.pNext             = &link_libraries;
+						link.layout            = pipeline.pipeline_layout;
+						link.basePipelineIndex = -1;
+						const auto link_begin  = std::chrono::steady_clock::now();
+						result = graphics.device.createGraphicsPipelines(driver_cache, 1, &link, nullptr, &pipeline.pipeline);
+						g_gpl.link_us.fetch_add(GplElapsedUs(link_begin), std::memory_order_relaxed);
+						if (result == vk::Result::eSuccess && pipeline.pipeline != nullptr) {
+							gpl_made = true;
+							gpl_form = "fast";
+							g_gpl.fast.fetch_add(1, std::memory_order_relaxed);
+							g_gpl.fast_us.fetch_add(GplElapsedUs(fast_begin), std::memory_order_relaxed);
+							auto pending           = std::make_shared<GplPending>();
+							pending->rendering     = rendering;
+							pending->vertex_input  = vertex_input;
+							pending->static_params = static_params;
+							pending->vertex_count  = static_cast<uint32_t>(vertex_info.size());
+							for (uint32_t i = 0; i < pending->vertex_count; i++) {
+								pending->vertex_info[i]                     = vertex_info[i];
+								pending->vertex_info[i].stage.resources     = &g_gpl_no_resources;
+								pending->vertex_info[i].stage.stagef_record = nullptr;
+							}
+							pending->ps_active = ps_active;
+							if (ps_active) {
+								pending->ps_input_info                     = *ps_input_info;
+								pending->ps_input_info.stage.resources     = &g_gpl_no_resources;
+								pending->ps_input_info.stage.stagef_record = nullptr;
+							}
+							pending->programs = programs;
+							pipeline.gpl      = std::move(pending);
+						} else {
+							pipeline.pipeline = nullptr;
+							g_gpl.fb_library.fetch_add(1, std::memory_order_relaxed);
+						}
+					}
+				}
+			}
+		}
+	}
+	if (!gpl_made) {
+		if (gpl_mode != 0u || t_gpl_monolithic) g_gpl.mono.fetch_add(1, std::memory_order_relaxed);
+		result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr, &pipeline.pipeline);
+	}
+	if (gpl_mode != 0u) GplReport(false);
 	// KYTY_TRACE_STARTUP: every graphics pipeline creation (GPU thread or background), 50 ms+ ones also as slow.
 	if (Common::StartupTrace::Enabled()) {
 		const auto ms =
@@ -998,15 +1442,15 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 			const auto* ps       = ps_active && ps_input_info->stage ? ps_input_info->stage.program : nullptr;
 			std::fprintf(stderr,
 			             "PIPELINE_TIME %s vs=0x%016llx ps=0x%016llx %.0fms created_ago=%.0f/%.0fms kind=graphics source=%s "
-			             "vs_spirv_words=%u ps_spirv_words=%u vs_form=%s vs_lds=%s vs_inlined=%u/%u ps_inlined=%u/%u\n",
+			             "vs_spirv_words=%u ps_spirv_words=%u vs_form=%s vs_lds=%s vs_inlined=%u/%u ps_inlined=%u/%u gpl=%s\n",
 			             background ? "graphics-background" : "graphics", static_cast<unsigned long long>(stats_vs),
 			             static_cast<unsigned long long>(stats_ps), create_ms, ShaderCreatedMsAgo(stats_vs),
-			             ShaderCreatedMsAgo(stats_ps), background ? "precompile" : "runtime", vs.spirv_words,
-			             ps != nullptr ? ps->spirv_words : 0u, ShaderRecompiler::IR::EmitFormName(vs.emit_form),
+			             ShaderCreatedMsAgo(stats_ps), t_gpl_monolithic ? "gpl-optimize" : background ? "precompile" : "runtime",
+			             vs.spirv_words, ps != nullptr ? ps->spirv_words : 0u, ShaderRecompiler::IR::EmitFormName(vs.emit_form),
 			             ShaderRecompiler::IR::EmitLdsName(vs.emit_lds), static_cast<unsigned>(vs.helper_inline.inlined),
 			             static_cast<unsigned>(vs.helper_inline.helpers),
 			             ps != nullptr ? static_cast<unsigned>(ps->helper_inline.inlined) : 0u,
-			             ps != nullptr ? static_cast<unsigned>(ps->helper_inline.helpers) : 0u);
+			             ps != nullptr ? static_cast<unsigned>(ps->helper_inline.helpers) : 0u, gpl_form);
 		} else {
 			std::fprintf(stderr, "PIPELINE_TIME %s vs=0x%016llx ps=0x%016llx %.0fms created_ago=%.0f/%.0fms\n",
 			             background ? "graphics-background" : "graphics", static_cast<unsigned long long>(stats_vs),

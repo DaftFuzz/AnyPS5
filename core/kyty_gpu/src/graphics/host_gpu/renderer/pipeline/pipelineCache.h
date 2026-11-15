@@ -188,6 +188,10 @@ struct ShaderProgram {
 	explicit operator bool() const { return id != 0 && module != nullptr; }
 };
 
+struct GplPending;
+// KYTY_PERF_GPL: set on a thread that creates the optimized (monolithic) pipeline of a fast-linked one.
+inline thread_local bool t_gpl_monolithic = false;
+
 // The owning renderer serializes access, including saves while the GPU is running.
 class PipelineCache {
 public:
@@ -225,6 +229,8 @@ public:
 		// EvictIdlePipelines: the presented frame of the last lookup that returned this pipeline. An idle pipeline's
 		// Vulkan objects are destroyed (pipeline == nullptr) and the next lookup creates them again from the same inputs.
 		uint32_t                last_used             = 0;
+		// KYTY_PERF_GPL: fast-linked from libraries; its optimized pipeline is made in the background and swapped in.
+		std::shared_ptr<GplPending> gpl;
 	};
 
 	struct GraphicsPrograms {
@@ -470,6 +476,11 @@ public:
 	void EvictIdlePipelines(CommandScheduler& scheduler);
 
 private:
+	// KYTY_PERF_GPL: fast-linked pipelines of the maps whose optimized pipeline is not swapped in yet, and its workers.
+	std::vector<Pipeline*>               m_gpl_live;
+	std::unique_ptr<TableCompileWorkers> m_gpl_workers;
+	void                                 NoteGplPipeline(Pipeline& pipeline);
+	void                                 SwapGplPipelines(CommandScheduler& scheduler);
 	uint32_t m_last_eviction = 0;
 	uint64_t m_evicted = 0, m_recreated = 0;
 	void     RecreateComputePipeline(Pipeline& pipeline, const ShaderComputeInputInfo& input_info,
@@ -478,6 +489,26 @@ private:
 	                                  std::span<const ShaderVertexInputInfo> vertex_info,
 	                                  const ShaderPixelInputInfo* ps_input_info, const GraphicsPrograms& programs);
 };
+
+// KYTY_PERF_GPL: the inputs of a fast-linked pipeline (copies; resource snapshots are not read), and the optimized
+// pipeline a worker made from them (state 0 waiting for the cache's thread, 1 queued, 2 done).
+struct GplPending {
+	PipelineRenderingState                 rendering;
+	PipelineVertexInputState               vertex_input;
+	PipelineStaticParameters               static_params;
+	std::array<ShaderVertexInputInfo, 3>   vertex_info {};
+	uint32_t                               vertex_count = 1;
+	ShaderPixelInputInfo                   ps_input_info {};
+	bool                                   ps_active = false;
+	PipelineCache::GraphicsPrograms        programs;
+	std::atomic<uint32_t>                  state {0};
+	PipelineCache::Pipeline                optimized;
+	uint64_t                               us = 0;
+};
+enum class GplOptimizeEvent : uint8_t { Queued, Swapped, Failed, Discarded };
+void GplCountOptimize(GplOptimizeEvent event, uint64_t us);
+// Destroys the stage libraries and their layouts (after every thread that creates pipelines stopped).
+void GplDestroyLibraries(GraphicContext& graphics);
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
 
