@@ -49,6 +49,10 @@ enum class Switch : uint32_t {
 	DiagAdoptAssume,           // KYTY_DIAG_ADOPT_ASSUME_UNCHANGED (measurement only, APPROXIMATION)
 	AdoptRuns,
 	CompareLockFree,       // KYTY_PERF_COMPARE_LOCKFREE (aps5/memoryShim.cpp, CompareBackingBatch)
+	CountExact,            // KYTY_PERF_COUNT_EXACT (cache/bufferCache.cpp, ReadGpuCopy)
+	ServeInWait,           // KYTY_PERF_SERVE_IN_WAIT (cache/bufferCache.h)
+	CopyChain,             // KYTY_PERF_COPY_CHAIN (cache/bufferCache.cpp, StartCopyReadback)
+	RingWordsGpu,          // KYTY_PERF_RING_WORDS_GPU (cache/bufferCache.h, RecordDirectWordCopy)
 	Count
 };
 

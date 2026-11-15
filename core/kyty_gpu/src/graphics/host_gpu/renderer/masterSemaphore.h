@@ -33,6 +33,8 @@ public:
 	void Refresh();
 	void RefreshNow();
 	void Wait(uint64_t tick);
+	// Blocks until `tick` is reached or `timeout_ns` passed; true when reached (KYTY_PERF_SERVE_IN_WAIT).
+	bool WaitFor(uint64_t tick, uint64_t timeout_ns);
 
 	// KYTY_TRACE_PERF (PERF semaphore): semaphore queries (calls/ns) by caller: 0 Refresh, 1 Wait before blocking, 2 Wait
 	// after blocking, 3 other; blocking waits (calls/ns). GPU thread only; reset by TakeStats. polls/poll_ns: the GPU

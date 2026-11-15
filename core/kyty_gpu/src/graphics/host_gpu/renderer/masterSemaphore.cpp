@@ -184,4 +184,21 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	RefreshNow();
 }
 
+bool MasterSemaphore::WaitFor(uint64_t tick, uint64_t timeout_ns) {
+	if (IsFree(tick)) return true;
+	vk::SemaphoreWaitInfo wait_info {};
+	wait_info.semaphoreCount = 1;
+	wait_info.pSemaphores    = &m_semaphore;
+	wait_info.pValues        = &tick;
+	const auto result        = m_graphics.device.waitSemaphores(&wait_info, timeout_ns);
+	if (result != vk::Result::eSuccess && result != vk::Result::eTimeout) {
+		std::fprintf(stderr, "waitSemaphores failed: %s\n", vk::to_string(result).c_str());
+		GpuCheckpoints::Dump(m_graphics.queue);
+	}
+	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess && result != vk::Result::eTimeout);
+	const QuerySite site(2);
+	RefreshNow();
+	return IsFree(tick);
+}
+
 } // namespace Libs::Graphics

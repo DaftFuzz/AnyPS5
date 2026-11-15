@@ -22,6 +22,7 @@
 #include "common/shaderEnv.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/debugSample.h"
@@ -275,9 +276,28 @@ bool ResolvedReadsHold(ResolvedStages& results) {
 			static const bool slow_adopt = std::getenv("KYTY_TRACE_SLOW_ADOPT") != nullptr;
 			ShaderRecompiler::IR::FastAdoptStats stats;
 			const auto t0 = slow_adopt ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
-			results.reads = ShaderRecompiler::IR::ReadsUnchangedFast(results.log, runtime, slow_adopt ? &stats : nullptr)
-			                    ? Reads::Hold
-			                    : Reads::Changed;
+			if (BufferCache::ServeInWaitAllowed()) {
+				uint32_t passes = 0;
+				bool     hold   = false;
+				for (;;) {
+					passes++;
+					const BufferCache::ServeInWaitPass pass(passes < 8u);
+					hold = ShaderRecompiler::IR::ReadsUnchangedFast(results.log, runtime, slow_adopt ? &stats : nullptr);
+					if (!pass.Served()) break;
+				}
+				bool checked = false, differ = false;
+				if (BufferCache::ServeInWaitMode() == 2u) {
+					const BufferCache::ServeInWaitPass pass(false);
+					checked = true;
+					differ  = ShaderRecompiler::IR::ReadsUnchangedFast(results.log, runtime, nullptr) != hold;
+				}
+				BufferCache::NoteServeInWaitCheck(passes, checked, differ);
+				results.reads = hold ? Reads::Hold : Reads::Changed;
+			} else {
+				results.reads = ShaderRecompiler::IR::ReadsUnchangedFast(results.log, runtime, slow_adopt ? &stats : nullptr)
+				                    ? Reads::Hold
+				                    : Reads::Changed;
+			}
 			if (slow_adopt) {
 				const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
 				const auto us = ns / 1000;
