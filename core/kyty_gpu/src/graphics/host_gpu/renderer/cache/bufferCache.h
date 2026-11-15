@@ -523,6 +523,9 @@ public:
 	// read as before too and compared with a second copy recorded right after the first (CheckRingWordGpu, on the
 	// priority thread); a difference is the guest touching the word between the CPU read and the copy.
 	[[nodiscard]] static uint32_t RingWordsGpuMode();
+	// KYTY_PERF_COPY_PREDICT (declared with its state below): between operations, predicted copies to start or apply.
+	[[nodiscard]] static bool PredictWork() noexcept { return s_predict_work; }
+	void                      IssuePredictedCopies();
 	bool                          RecordDirectWordCopy(uint64_t address, vk::Buffer destination, uint64_t destination_offset);
 	void                          CheckRingWordGpu(uint64_t address, uint32_t cpu_value);
 	static void                   NoteRingWordWait(uint64_t nanoseconds); // check: the CPU wait the copy replaces
@@ -925,6 +928,7 @@ private:
 		// KYTY_PERF_COPY_HANDBACK: not 0 for a hand-back copy. It wrote the backing itself on the second queue and is
 		// finished when the copy timeline reached this value (asked there, then remembered in `done`).
 		uint64_t copy_tick = 0;
+		bool     predicted = false; // KYTY_PERF_COPY_PREDICT: issued ahead of any fault
 		uint64_t source    = 0; // KYTY_PERF_BAR_GPU_COPY_VERIFY: the copied buffer's handle
 		uint32_t frame     = 0; // and the presented frame of the copy's start
 	};
@@ -936,7 +940,7 @@ private:
 	// state, run by run. DeadRingWouldFree: DropDeadRingBytes's answer for the page, without changing anything.
 	[[nodiscard]] static bool CopyHandbackOn();
 	[[nodiscard]] static bool CopyChainOn(); // KYTY_PERF_COPY_CHAIN (bufferCache.cpp, before StartCopyReadback)
-	[[nodiscard]] uint64_t    StartCopyReadback(CallerPlan& plan, uint64_t vaddr, bool is_write, bool chained = false);
+	[[nodiscard]] uint64_t    StartCopyReadback(CallerPlan& plan, uint64_t vaddr, bool is_write, bool chained = false, bool predicted = false);
 	[[nodiscard]] bool        EagerDone(const EagerReadback& entry) const;
 	void                      UnmarkPublishedWindow(uint64_t lo, uint64_t hi);
 	[[nodiscard]] bool        DeadRingWouldFree(uint64_t vaddr);
@@ -945,6 +949,28 @@ private:
 	// since are GPU-dirty again and are skipped (PERF bar_gpu_copy verified / mismatched).
 	void                      VerifyCopyReadback(const EagerReadback& entry);
 	void                      RedoHandbackWrittenDuringFlight(const EagerReadback& entry); // KYTY_FIX_HANDBACK_REDO
+	// KYTY_PERF_COPY_PREDICT (G4, design-gpuwait 2.2; default 0; 1 on, 2 check; with KYTY_PERF_COPY_HANDBACK), GPU thread.
+	// A 64 KiB granule that retried guest read faults took in at least 2 of the last 4 frames is predicted, with the
+	// 4 KiB pages they touched. When a GPU write raises a predicted granule's write tick (NoteGpuWriteTick), the granule
+	// is queued; between operations, once that tick's command buffer is submitted, IssuePredictedCopies starts a
+	// hand-back copy of the touched pages' GPU-dirty bytes waiting for the tick (StartCopyReadback, the hand-back
+	// state transitions), and applies predicted copies that finished (no fault needed). Applied predicted windows take
+	// the redo of KYTY_FIX_HANDBACK_REDO always. A predicted granule stays predicted while its copies are issued and
+	// decays after 8 frames without a write. Check: every applied predicted window is verified against the mapping.
+	[[nodiscard]] static uint32_t CopyPredictMode();
+	void                          NotePredictFault(uint64_t vaddr);
+	void                          PredictFrame();
+	void                          PredictNoteWrite(uint64_t first_key, uint64_t last_key);
+	struct PredictGranule {
+		uint8_t  frames    = 0; // bit 0: this frame, bit i: i frames ago (a fault, or a predicted copy issued)
+		uint16_t pages     = 0; // touched 4 KiB pages
+		uint8_t  idle      = 0; // frames without a write since predicted
+		bool     predicted = false;
+	};
+	std::unordered_map<uint64_t, PredictGranule> m_predict;
+	std::vector<uint64_t>                        m_predict_keys;  // predicted granules, sorted
+	std::vector<uint64_t>                        m_predict_dirty; // written since their last copy
+	static inline bool                           s_predict_work = false;
 	// KYTY_PERF_BAR_GPU_COPY_VERIFY=2: a hand-back mismatch (its first differing byte and the tick the copy waited for),
 	// classified 3 frames later by the page events (C0ByteChangedAfter: an event that changes the GPU copy, newer than
 	// the tick, covering the byte - a late-learned GPU write - or none).

@@ -108,6 +108,9 @@ constexpr SwitchInfo Switches[] = {
     // Per binding: a direct-range SRT word under a pending GPU write reaches its word-stream slot by a GPU copy recorded
     // there or by the CPU read after the wait; nothing outlives the binding.
     {Switch::RingWordsGpu, "KYTY_PERF_RING_WORDS_GPU", 1},
+    // Per operation boundary: whether predicted hand-back copies are started; copies already started finish as ordinary
+    // hand-back copies (their windows stay in the hand-back state until applied) whatever the phase.
+    {Switch::CopyPredict, "KYTY_PERF_COPY_PREDICT", 1},
     // Project 15 way B P1 (test switch): a read-only buffer binding with a ready plan entry whose proof holds takes the
     // binding the helper computed (handle, aligned offset, range, offset byte, record stride) instead of RebindBuffers'.
 };
