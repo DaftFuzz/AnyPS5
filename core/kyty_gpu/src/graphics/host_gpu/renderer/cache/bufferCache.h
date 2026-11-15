@@ -944,6 +944,17 @@ private:
 	// backing are compared with the buffer's mapping, interval by interval; intervals a GPU write was recorded over
 	// since are GPU-dirty again and are skipped (PERF bar_gpu_copy verified / mismatched).
 	void                      VerifyCopyReadback(const EagerReadback& entry);
+	void                      RedoHandbackWrittenDuringFlight(const EagerReadback& entry); // KYTY_FIX_HANDBACK_REDO
+	// KYTY_PERF_BAR_GPU_COPY_VERIFY=2: a hand-back mismatch (its first differing byte and the tick the copy waited for),
+	// classified 3 frames later by the page events (C0ByteChangedAfter: an event that changes the GPU copy, newer than
+	// the tick, covering the byte - a late-learned GPU write - or none).
+	struct HandbackLate {
+		uint64_t address = 0;
+		uint64_t tick    = 0;
+		uint32_t frame   = 0;
+	};
+	std::vector<HandbackLate> m_handback_late;
+	[[nodiscard]] bool        C0ByteChangedAfter(uint64_t address, uint64_t tick);
 	// True when an unfinished eager readback is copying one of the bytes of the range.
 	[[nodiscard]] bool PendingReadbackCovers(uint64_t vaddr, uint64_t size) const;
 	[[nodiscard]] uint32_t InFlightReadbackKinds(uint64_t vaddr, uint64_t size) const;

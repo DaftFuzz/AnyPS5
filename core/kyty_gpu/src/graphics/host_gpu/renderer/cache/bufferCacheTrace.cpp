@@ -244,6 +244,33 @@ BufferCache::C0Event BufferCache::C0PageHistory(uint64_t page, std::string& text
 	return changer;
 }
 
+bool BufferCache::C0ByteChangedAfter(uint64_t address, uint64_t tick) {
+	const uint64_t page   = address & ~(TRACKER_PAGE_SIZE - 1u);
+	const auto     offset = static_cast<uint16_t>(address - page);
+	std::scoped_lock lock(m_c0_log_mutex);
+	const auto       it = m_c0_log.find(page);
+	if (it == m_c0_log.end()) return false;
+	const auto&    log = it->second;
+	const uint32_t n   = std::min<uint32_t>(log.head, static_cast<uint32_t>(log.events.size()));
+	for (uint32_t i = 0; i < n; ++i) {
+		const auto& e = log.events[(log.head - n + i) % log.events.size()];
+		if (e.tick <= tick || offset < e.lo || offset > e.hi) continue;
+		switch (e.kind) {
+			case C0Event::ShaderWrite:
+			case C0Event::DirectWrite:
+			case C0Event::ImageCopy:
+			case C0Event::Fill:
+			case C0Event::Copy:
+			case C0Event::BdaStore:
+			case C0Event::CleanMark:
+			case C0Event::Join:
+			case C0Event::Create: return true;
+			default: break;
+		}
+	}
+	return false;
+}
+
 void BufferCache::NoteC0Staged(uint64_t address, const uint8_t* bytes, uint64_t size) {
 	auto& staged = m_c0_staged.emplace_back(address, std::vector<uint8_t>(size));
 	std::memcpy(staged.second.data(), bytes, size); // read once: staged and kept bytes are the same

@@ -314,6 +314,8 @@ uint64_t BarReadMaxBytes(uint64_t bar_max);
 bool BarCopyTickReached(uint64_t tick);
 void BarCopyTickWait(uint64_t tick);
 bool BarGpuCopyVerify();
+uint32_t BarGpuCopyVerifyMode();
+bool HandbackRedoOn();
 
 void BarCensusCopy(uint64_t bytes, uint64_t ns) {
 	auto&           s = BarCensus();
@@ -5055,6 +5057,7 @@ void BufferCache::ApplyEagerReadbacks(uint64_t vaddr, uint64_t size, bool wait) 
 			// so it keeps none of its own pages.
 			const uint64_t lo = entry.start;
 			const uint64_t hi = entry.end;
+			if (HandbackRedoOn()) RedoHandbackWrittenDuringFlight(entry); // KYTY_FIX_HANDBACK_REDO
 			if (BarGpuCopyVerify()) VerifyCopyReadback(entry); // KYTY_PERF_BAR_GPU_COPY_VERIFY (diagnostic)
 			entry = std::move(m_eager_readbacks.back());
 			m_eager_readbacks.pop_back();
@@ -5662,11 +5665,32 @@ struct BarDirectTarget {
 	std::vector<const uint8_t*>                                         data;             // per interval: its bytes in the backing view
 };
 
+uint32_t BarGpuCopyVerifyMode() {
+	static const uint32_t mode = [] {
+		const char*    value = std::getenv("KYTY_PERF_BAR_GPU_COPY_VERIFY");
+		const uint32_t m     = value != nullptr && (value[0] == '1' || value[0] == '2') ? static_cast<uint32_t>(value[0] - '0') : 0u;
+		if (m != 0) {
+			std::fprintf(stderr, "PERF_BAR_GPU_COPY_VERIFY: every GPU copy is compared with the mapping%s\n",
+			             m == 2 ? " (hand-back mismatches classified after 3 frames by the page events, KYTY_D6_C0=2)" : "");
+		}
+		return m;
+	}();
+	return mode;
+}
+
 bool BarGpuCopyVerify() {
+	return BarGpuCopyVerifyMode() != 0;
+}
+
+// KYTY_FIX_HANDBACK_REDO=1 (default 0; exactness fix candidate for the cutscene hand-back mismatches): when a hand-back
+// readback is applied, a copied interval whose 64 KiB granule write tick rose above the tick the copy waited for (a GPU
+// write noted during the flight, e.g. an image copy into the buffer that notes only the tick) is GPU-dirty again: its
+// pages stay GPU-modified and the next read downloads the newest bytes.
+bool HandbackRedoOn() {
 	static const bool on = [] {
-		const char* value = std::getenv("KYTY_PERF_BAR_GPU_COPY_VERIFY");
+		const char* value = std::getenv("KYTY_FIX_HANDBACK_REDO");
 		const bool  set   = value != nullptr && value[0] == '1';
-		if (set) std::fprintf(stderr, "PERF_BAR_GPU_COPY_VERIFY: every GPU copy is compared with the mapping\n");
+		if (set) std::fprintf(stderr, "KYTY_FIX_HANDBACK_REDO=1: hand-back intervals written during the flight are GPU-dirty again at apply\n");
 		return set;
 	}();
 	return on;
@@ -6168,10 +6192,59 @@ uint64_t BufferCache::StartCopyReadback(CallerPlan& plan, uint64_t vaddr, bool i
 	return copy_tick;
 }
 
+void BufferCache::RedoHandbackWrittenDuringFlight(const EagerReadback& entry) {
+	static std::atomic<uint64_t> redone {0}, redone_bytes {0}, applied {0};
+	applied.fetch_add(1, std::memory_order_relaxed);
+	for (const auto& [start, end]: entry.bytes) {
+		if (start >= end) continue;
+		for (uint64_t key = WriteTickKey(start); key <= WriteTickKey(end - 1); ++key) {
+			const auto tick = GranuleWriteTick(key);
+			if (!tick || *tick <= entry.tick) continue;
+			const uint64_t a = std::max(start, key << 16u);
+			const uint64_t b = std::min(end, (key + 1u) << 16u);
+			GpuDirtyAdd(a, b - a);
+			redone.fetch_add(1, std::memory_order_relaxed);
+			redone_bytes.fetch_add(b - a, std::memory_order_relaxed);
+		}
+	}
+	if ((applied.load(std::memory_order_relaxed) & 0xffu) == 0 && Common::EnvRead::PerfLines()) {
+		std::fprintf(stderr, "PERF handback_redo applied=%llu redone_intervals=%llu redone_kb=%llu\n",
+		             static_cast<unsigned long long>(applied.load()), static_cast<unsigned long long>(redone.load()),
+		             static_cast<unsigned long long>(redone_bytes.load() >> 10u));
+	}
+}
+
 void BufferCache::VerifyCopyReadback(const EagerReadback& entry) {
 	const auto&    bytes = entry.bytes;
 	const uint64_t view = LibKernel::Memory::GuestBackingBase();
 	if (view == 0) return;
+	if (!m_handback_late.empty()) { // KYTY_PERF_BAR_GPU_COPY_VERIFY=2: mismatches 3 frames old, classified by the page events
+		static uint64_t explained = 0, confirmed = 0;
+		static uint32_t confirmed_lines = 0;
+		const uint32_t  now = DebugPresentCount().load();
+		bool            any = false;
+		std::erase_if(m_handback_late, [&](const HandbackLate& late) {
+			if (now < late.frame + 3u) return false;
+			any = true;
+			if (C0ByteChangedAfter(late.address, late.tick)) {
+				explained++;
+			} else {
+				confirmed++;
+				if (confirmed_lines++ < 32u) {
+					std::string history;
+					(void)C0PageHistory(late.address & ~(TRACKER_PAGE_SIZE - 1), history);
+					std::fprintf(stderr, "HANDBACK_MISMATCH_CONFIRMED addr=0x%llx write_tick=%llu frame=%u events:%s\n",
+					             static_cast<unsigned long long>(late.address), static_cast<unsigned long long>(late.tick), late.frame,
+					             history.c_str());
+				}
+			}
+			return true;
+		});
+		if (any) {
+			std::fprintf(stderr, "PERF handback_verify_late explained=%llu confirmed=%llu pending=%zu\n",
+			             static_cast<unsigned long long>(explained), static_cast<unsigned long long>(confirmed), m_handback_late.size());
+		}
+	}
 	static thread_local std::vector<uint8_t> from_mapping;
 	uint64_t                                 verified = 0, mismatched = 0;
 	static std::atomic_uint                  detail_lines {0};
@@ -6196,6 +6269,12 @@ void BufferCache::VerifyCopyReadback(const EagerReadback& entry) {
 				std::fprintf(stderr, "PERF_COPY_HANDBACK_MISMATCH addr=0x%llx size=%llu frame=%u\n",
 				             static_cast<unsigned long long>(start), static_cast<unsigned long long>(size),
 				             DebugPresentCount().load());
+			}
+			if (BarGpuCopyVerifyMode() == 2u && UploadClobberCheck()) {
+				const auto* g = reinterpret_cast<const uint8_t*>(view + backing);
+				uint64_t    i = 0;
+				while (i < size && from_mapping[i] == g[i]) i++;
+				if (m_handback_late.size() < 4096u) m_handback_late.push_back({start + i, entry.tick, DebugPresentCount().load()});
 			}
 			if (detail_lines.fetch_add(1) < 64u) {
 				const auto* guest = reinterpret_cast<const uint8_t*>(view + backing);
