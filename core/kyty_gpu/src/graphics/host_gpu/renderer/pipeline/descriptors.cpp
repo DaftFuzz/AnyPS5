@@ -89,6 +89,7 @@ thread_local std::vector<uint32_t> RenderExecutor::m_uniform_words;
 thread_local std::vector<std::pair<uint32_t, uint32_t>> RenderExecutor::m_gpu_word_patches;
 thread_local std::vector<std::pair<uint64_t, uint32_t>> RenderExecutor::m_gpu_word_addresses;
 thread_local std::vector<std::tuple<uint32_t, uint32_t, uint64_t>> RenderExecutor::m_gpu_word_values;
+thread_local std::vector<std::pair<uint32_t, uint32_t>>               RenderExecutor::m_gpu_word_copies;
 
 namespace {
 
@@ -5122,7 +5123,9 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		auto&       cache = m_context.GetBufferCache();
 		m_gpu_word_addresses.clear();
 		m_gpu_word_values.clear();
-		const bool  quiet_words = !BufferCache::PlanBufferCheck(); // (batch 1: the fast path; the check run takes today's path)
+		m_gpu_word_copies.clear();
+		const bool     quiet_words = !BufferCache::PlanBufferCheck(); // (batch 1: the fast path; the check run takes today's path)
+		const uint32_t ring_gpu    = BufferCache::RingWordsGpuMode(); // KYTY_PERF_RING_WORDS_GPU
 		for (const auto& word: words) {
 			EXIT_IF(word.slot >= flat.size() || word.hi >= flat.size());
 			const uint64_t address = (uint64_t {flat[word.hi]} << 32u) | flat[word.slot];
@@ -5134,6 +5137,22 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 				// given to the shader from device-local memory (walk 9.11: read from host memory in every invocation, the
 				// menu's GPU time went 14.6 -> 33.4 ms per frame).
 				uint32_t value = 0;
+				if (ring_gpu != 0u && (cache.DirectPendingIn(address, sizeof(uint32_t)) & 2u) != 0u) {
+					// KYTY_PERF_RING_WORDS_GPU: a pending GPU write of unknown bytes over the word; its slot is filled by a GPU
+					// copy recorded below (check: the CPU value is read as before too).
+					if (ring_gpu == 2u) {
+						const auto wait_start = std::chrono::steady_clock::now();
+						(void)cache.WaitDirectGpuWrites(address, sizeof(uint32_t), true);
+						BufferCache::NoteRingWordWait(static_cast<uint64_t>(
+						    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - wait_start).count()));
+						LibKernel::Memory::ReadGuestPlain(&value, address, sizeof(uint32_t));
+						cache.ApplyDirectCpWrites(address, &value, sizeof(uint32_t));
+					}
+					m_gpu_word_copies.emplace_back(static_cast<uint32_t>(m_gpu_word_values.size()), value);
+					m_gpu_word_values.emplace_back(index, value, address);
+					if (gw_key) gw_mix((uint64_t {index} << 32u) | 0xffffffffu, address);
+					continue;
+				}
 				if (quiet_words && cache.DirectWordQuiet(address)) {
 					// Batch 1: no listed GPU write may cover the word - today's wait would return at once with an empty overlay
 					LibKernel::Memory::ReadGuestPlain(&value, address, sizeof(uint32_t));
@@ -5162,6 +5181,18 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 				if (word.verify != UINT32_MAX) BufferCache::NoteGpuWordBind(host, guest);
 				m_gpu_word_patches.emplace_back(word.slot, static_cast<uint32_t>(host));
 				m_gpu_word_patches.emplace_back(word.hi, static_cast<uint32_t>(host >> 32u));
+			}
+			for (const auto& [position, check_value]: m_gpu_word_copies) { // KYTY_PERF_RING_WORDS_GPU
+				const uint64_t guest = std::get<2>(m_gpu_word_values[position]);
+				if (cache.RecordDirectWordCopy(guest, stream.Handle(), offset + position * sizeof(uint32_t))) {
+					if (ring_gpu == 2u) cache.CheckRingWordGpu(guest, check_value);
+					continue;
+				}
+				uint32_t value = 0;
+				(void)cache.WaitDirectGpuWrites(guest, sizeof(uint32_t), true);
+				LibKernel::Memory::ReadGuestPlain(&value, guest, sizeof(uint32_t));
+				cache.ApplyDirectCpWrites(guest, &value, sizeof(uint32_t));
+				std::memcpy(mapped + position * sizeof(uint32_t), &value, sizeof(uint32_t));
 			}
 			stream.Commit();
 		}

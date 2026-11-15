@@ -488,6 +488,44 @@ public:
 	static void NoteVerifyRange(VerifyRangeEvent event);
 	// The number of blocking waits WaitDirectGpuWrites made so far (monotonic).
 	[[nodiscard]] static uint64_t DirectWaitTotal();
+	// KYTY_PERF_SERVE_IN_WAIT (G5, design-gpuwait 2.1; default 0; 1 on, live A/B switch; 2 check, start value only), GPU
+	// thread. A compute program lookup (ServeInWaitAllow, before anything of the dispatch is recorded) lets its adoption
+	// check (ResolvedReadsHold) run its passes in ServeInWaitPass scopes: a blocking wait of WaitDirectGpuWrites inside
+	// one runs the queued guest commands (RunCommandsWhileWaiting) while the GPU works, and a pass in which any command
+	// ran is discarded and the check runs again, so the verdict is that of a pass with no command inside it, as when
+	// the commands are served between the previous operation and this one. Check: after a pass without commands the
+	// check runs a second time without serving and differing verdicts are counted.
+	[[nodiscard]] static uint32_t ServeInWaitMode();
+	struct ServeInWaitAllow {
+		ServeInWaitAllow();
+		~ServeInWaitAllow();
+		ServeInWaitAllow(const ServeInWaitAllow&)            = delete;
+		ServeInWaitAllow& operator=(const ServeInWaitAllow&) = delete;
+		uint32_t previous;
+	};
+	[[nodiscard]] static bool ServeInWaitAllowed();
+	struct ServeInWaitPass {
+		explicit ServeInWaitPass(bool on);
+		~ServeInWaitPass();
+		ServeInWaitPass(const ServeInWaitPass&)            = delete;
+		ServeInWaitPass& operator=(const ServeInWaitPass&) = delete;
+		[[nodiscard]] bool Served() const;
+		bool               previous_active;
+		bool               previous_served;
+	};
+	static void NoteServeInWaitCheck(uint32_t passes, bool checked, bool differ);
+	// KYTY_PERF_RING_WORDS_GPU (G6, design-gpuwait 2.1; default 0; 1 on, live A/B switch; 2 check, start value only), GPU
+	// thread. A shader-read SRT word in a direct range with a pending GPU write of unknown bytes over it is not read by
+	// the CPU after waiting for that write: RecordDirectWordCopy records a 4-byte copy from the direct buffer into the
+	// word's word-stream slot at this point of the stream, after every GPU write recorded before it (false: no direct
+	// buffer at once; the caller reads as before). The shader sees guest memory as the GPU leaves it there, which differs
+	// from the CPU read only if the guest writes the word after submitting the work that reads it. Check: the CPU value is
+	// read as before too and compared with a second copy recorded right after the first (CheckRingWordGpu, on the
+	// priority thread); a difference is the guest touching the word between the CPU read and the copy.
+	[[nodiscard]] static uint32_t RingWordsGpuMode();
+	bool                          RecordDirectWordCopy(uint64_t address, vk::Buffer destination, uint64_t destination_offset);
+	void                          CheckRingWordGpu(uint64_t address, uint32_t cpu_value);
+	static void                   NoteRingWordWait(uint64_t nanoseconds); // check: the CPU wait the copy replaces
 	// KYTY_DIAG_PAGE_MARK_CHECK=1 (diagnostic, default off, read once), GPU thread. The resource walker remembers a
 	// 4 KiB page as clean for the rest of one walk (OrdinaryReadPageCache in aps5/memoryShim.cpp and kernel/memory.cpp);
 	// a read through that mark takes guest memory without a question. An ordinary read sets the mark after asking
@@ -602,7 +640,7 @@ private:
 		// KYTY_PERF_COPY_HANDBACK: copies started and handed back; requests handed back for a copy already under way;
 		// requests it could have served but did not (small, no plan, no slot, dead ring, overlap); waits of the GPU
 		// thread for such a copy (its own readers, a download over the window).
-		std::atomic<uint64_t> copy_issued {0}, copy_joined {0}, copy_declined {0}, copy_exec_waits {0};
+		std::atomic<uint64_t> copy_issued {0}, copy_joined {0}, copy_declined {0}, copy_exec_waits {0}, copy_chained {0};
 	};
 	CallerWaitStats m_caller_stats;
 	// KYTY_RECORD_KEYED_VERIFY: pages of the written record-keyed ranges listed per frame (a ring of frames, rotated by
@@ -887,6 +925,8 @@ private:
 		// KYTY_PERF_COPY_HANDBACK: not 0 for a hand-back copy. It wrote the backing itself on the second queue and is
 		// finished when the copy timeline reached this value (asked there, then remembered in `done`).
 		uint64_t copy_tick = 0;
+		uint64_t source    = 0; // KYTY_PERF_BAR_GPU_COPY_VERIFY: the copied buffer's handle
+		uint32_t frame     = 0; // and the presented frame of the copy's start
 	};
 	// KYTY_PERF_COPY_HANDBACK (barGpuCopy.h). CopyHandbackOn: the switch's value now. StartCopyReadback: GPU thread, in a
 	// guest fault's request before it changed anything; starts the copy of the plan's download and lists it, returns
@@ -895,14 +935,26 @@ private:
 	// the window without GPU-dirty bytes and without bytes of another unfinished readback leave the GPU-modified
 	// state, run by run. DeadRingWouldFree: DropDeadRingBytes's answer for the page, without changing anything.
 	[[nodiscard]] static bool CopyHandbackOn();
-	[[nodiscard]] uint64_t    StartCopyReadback(CallerPlan& plan, uint64_t vaddr, bool is_write);
+	[[nodiscard]] static bool CopyChainOn(); // KYTY_PERF_COPY_CHAIN (bufferCache.cpp, before StartCopyReadback)
+	[[nodiscard]] uint64_t    StartCopyReadback(CallerPlan& plan, uint64_t vaddr, bool is_write, bool chained = false);
 	[[nodiscard]] bool        EagerDone(const EagerReadback& entry) const;
 	void                      UnmarkPublishedWindow(uint64_t lo, uint64_t hi);
 	[[nodiscard]] bool        DeadRingWouldFree(uint64_t vaddr);
 	// KYTY_PERF_BAR_GPU_COPY_VERIFY=1 with a hand-back copy: when the finished readback is applied, its bytes in the
 	// backing are compared with the buffer's mapping, interval by interval; intervals a GPU write was recorded over
 	// since are GPU-dirty again and are skipped (PERF bar_gpu_copy verified / mismatched).
-	void                      VerifyCopyReadback(const std::vector<std::pair<uint64_t, uint64_t>>& bytes);
+	void                      VerifyCopyReadback(const EagerReadback& entry);
+	void                      RedoHandbackWrittenDuringFlight(const EagerReadback& entry); // KYTY_FIX_HANDBACK_REDO
+	// KYTY_PERF_BAR_GPU_COPY_VERIFY=2: a hand-back mismatch (its first differing byte and the tick the copy waited for),
+	// classified 3 frames later by the page events (C0ByteChangedAfter: an event that changes the GPU copy, newer than
+	// the tick, covering the byte - a late-learned GPU write - or none).
+	struct HandbackLate {
+		uint64_t address = 0;
+		uint64_t tick    = 0;
+		uint32_t frame   = 0;
+	};
+	std::vector<HandbackLate> m_handback_late;
+	[[nodiscard]] bool        C0ByteChangedAfter(uint64_t address, uint64_t tick);
 	// True when an unfinished eager readback is copying one of the bytes of the range.
 	[[nodiscard]] bool PendingReadbackCovers(uint64_t vaddr, uint64_t size) const;
 	[[nodiscard]] uint32_t InFlightReadbackKinds(uint64_t vaddr, uint64_t size) const;
@@ -1109,6 +1161,10 @@ private:
 	// write tick are copied from the mapping after waiting for that tick only. 1: copied and
 	// published, -1: not possible (use the GPU copy path).
 	int TryBarDownload(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	// KYTY_PERF_COUNT_EXACT: ReadGpuCopy's read by the bytes' own write ticks (false: not served), and its recorded copy.
+	bool ReadCountExact(Buffer& buffer, uint64_t vaddr, uint64_t size, void* out);
+	bool ReadGpuCopyRecorded(Buffer& buffer, uint64_t vaddr, uint64_t size, void* out);
+	void ServeWhileWaiting(uint64_t target); // KYTY_PERF_SERVE_IN_WAIT
 	// The range a CPU read of [vaddr, vaddr + size) downloads (ReadMemory, PlanCallerWait).
 	[[nodiscard]] std::pair<uint64_t, uint64_t> ReadRange(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// Its publish of the intervals from span reads of the mapping.

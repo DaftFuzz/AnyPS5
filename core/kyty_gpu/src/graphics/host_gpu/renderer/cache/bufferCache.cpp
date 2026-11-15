@@ -314,6 +314,8 @@ uint64_t BarReadMaxBytes(uint64_t bar_max);
 bool BarCopyTickReached(uint64_t tick);
 void BarCopyTickWait(uint64_t tick);
 bool BarGpuCopyVerify();
+uint32_t BarGpuCopyVerifyMode();
+bool HandbackRedoOn();
 
 void BarCensusCopy(uint64_t bytes, uint64_t ns) {
 	auto&           s = BarCensus();
@@ -1600,6 +1602,14 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 						*defer                = plan.tick;
 						*copy_defer           = plan.copy_tick;
 						caller_timer.deferred = true;
+						// KYTY_PERF_COPY_CHAIN: the hand-back copy starts now and the GPU runs it once the tick finished;
+						// the faulting thread waits for the tick, its priority completions and the copy, then applies.
+						if (plan.buffer != nullptr && CopyHandbackOn() && CopyChainOn()) {
+							if (const uint64_t copy_tick = StartCopyReadback(plan, vaddr, is_write, true); copy_tick != 0) {
+								*copy_defer = copy_tick;
+								m_caller_stats.copy_chained.fetch_add(1, std::memory_order_relaxed);
+							}
+						}
 						return;
 					}
 					m_caller_stats.exhausted.fetch_add(1, std::memory_order_relaxed);
@@ -1875,6 +1885,14 @@ BufferCache::CallerPlan BufferCache::PlanCallerWait(uint64_t vaddr, uint64_t siz
 		return plan;
 	}
 	plan.tick = newest;
+	if (CopyChainOn()) { // KYTY_PERF_COPY_CHAIN: the download it would make once `newest` finished
+		plan.buffer    = &buffer;
+		plan.lo        = lo;
+		plan.hi        = hi;
+		plan.newest    = newest;
+		plan.total     = total;
+		plan.intervals = std::move(intervals);
+	}
 	return plan;
 }
 
@@ -2552,6 +2570,213 @@ void BufferCache::ApplyDirectCpWrites(uint64_t vaddr, void* data, uint64_t size)
 	}
 }
 
+// ---- KYTY_PERF_SERVE_IN_WAIT (bufferCache.h) --------------------------------------------------------------------------
+namespace {
+thread_local uint32_t t_serve_allowed = 0;
+thread_local bool     t_serve_active  = false;
+thread_local bool     t_serve_served  = false;
+
+uint32_t ServeInWaitFixed() {
+	static const uint32_t value = [] {
+		const char*    text = std::getenv("KYTY_PERF_SERVE_IN_WAIT");
+		const uint32_t v    = text != nullptr ? static_cast<uint32_t>(std::strtoul(text, nullptr, 10)) : 0u;
+		if (v != 0) std::fprintf(stderr, "KYTY_PERF_SERVE_IN_WAIT=%u: guest commands run during the adoption check's GPU waits%s\n", v, v == 2 ? " (check: verdicts compared)" : "");
+		return v;
+	}();
+	return value;
+}
+
+struct ServeInWaitStats {
+	std::atomic<uint64_t> checks {0}, restarts {0}, waits {0}, wait_ns {0}, served {0}, compared {0}, differ {0}, differ_lines {0};
+	std::atomic<int64_t>  window_start {0};
+};
+ServeInWaitStats g_serve;
+
+void ReportServeInWait() {
+	if (!PerfEnabled()) return;
+	auto&         s     = g_serve;
+	const int64_t now   = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+	int64_t       start = s.window_start.load(std::memory_order_relaxed);
+	if (start == 0) {
+		s.window_start.compare_exchange_strong(start, now, std::memory_order_relaxed);
+		return;
+	}
+	if (now - start < 5000 || !s.window_start.compare_exchange_strong(start, now, std::memory_order_relaxed)) return;
+	const auto take = [](std::atomic<uint64_t>& c) { return static_cast<unsigned long long>(c.exchange(0, std::memory_order_relaxed)); };
+	const auto checks = take(s.checks), restarts = take(s.restarts), waits = take(s.waits);
+	const auto wait_ns = take(s.wait_ns), served = take(s.served), compared = take(s.compared), differ = take(s.differ);
+	std::fprintf(stderr, "PERF serve_in_wait checks=%llu restarts=%llu waits=%llu wait_ms=%.1f served=%llu compared=%llu differ=%llu (per ~5 s)\n",
+	             checks, restarts, waits, static_cast<double>(wait_ns) / 1e6, served, compared, differ);
+}
+} // namespace
+
+uint32_t BufferCache::ServeInWaitMode() {
+	return Common::LiveAb::Gate(Common::LiveAb::Switch::ServeInWait, ServeInWaitFixed());
+}
+
+BufferCache::ServeInWaitAllow::ServeInWaitAllow(): previous(t_serve_allowed) {
+	t_serve_allowed = GuestGpu::IsGpuThread() && GuestGpu::WaitsServeCommands() ? ServeInWaitMode() : 0u;
+}
+
+BufferCache::ServeInWaitAllow::~ServeInWaitAllow() {
+	t_serve_allowed = previous;
+}
+
+bool BufferCache::ServeInWaitAllowed() {
+	return t_serve_allowed != 0u && !t_serve_active;
+}
+
+BufferCache::ServeInWaitPass::ServeInWaitPass(bool on): previous_active(t_serve_active), previous_served(t_serve_served) {
+	t_serve_active = on;
+	t_serve_served = false;
+}
+
+BufferCache::ServeInWaitPass::~ServeInWaitPass() {
+	t_serve_active = previous_active;
+	t_serve_served = previous_served;
+}
+
+bool BufferCache::ServeInWaitPass::Served() const {
+	return t_serve_served;
+}
+
+void BufferCache::NoteServeInWaitCheck(uint32_t passes, bool checked, bool differ) {
+	auto& s = g_serve;
+	s.checks.fetch_add(1, std::memory_order_relaxed);
+	if (passes > 1u) s.restarts.fetch_add(passes - 1u, std::memory_order_relaxed);
+	if (checked) s.compared.fetch_add(1, std::memory_order_relaxed);
+	if (differ) {
+		s.differ.fetch_add(1, std::memory_order_relaxed);
+		if (s.differ_lines.fetch_add(1, std::memory_order_relaxed) < 32u) {
+			std::fprintf(stderr, "PERF_SERVE_IN_WAIT_DIFFER frame=%u passes=%u\n", DebugPresentCount().load(), passes);
+		}
+	}
+	ReportServeInWait();
+}
+
+// Inside an adoption-check pass: the guest commands queued while the GPU has not reached `target`, run on this thread
+// with no pass active (a command's own waits block as usual). The pass is marked served and is discarded by its check.
+void BufferCache::ServeWhileWaiting(uint64_t target) {
+	auto&      master = m_scheduler.GetMasterSemaphore();
+	const auto t0     = std::chrono::steady_clock::now();
+	g_serve.waits.fetch_add(1, std::memory_order_relaxed);
+	constexpr uint64_t SliceNs = 100'000;
+	while (!master.IsFree(target)) {
+		if (GuestGpu::CommandsWaiting()) {
+			t_serve_active = false;
+			GuestGpu::RunCommandsWhileWaiting();
+			t_serve_active = true;
+			t_serve_served = true;
+			m_direct_cp_overlay.clear();
+			g_serve.served.fetch_add(1, std::memory_order_relaxed);
+			continue;
+		}
+		if (master.WaitFor(target, SliceNs)) break;
+	}
+	g_serve.wait_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()),
+	                          std::memory_order_relaxed);
+}
+
+// ---- KYTY_PERF_RING_WORDS_GPU (bufferCache.h) -------------------------------------------------------------------------
+namespace {
+uint32_t RingWordsGpuFixed() {
+	static const uint32_t value = [] {
+		const char*    text = std::getenv("KYTY_PERF_RING_WORDS_GPU");
+		const uint32_t v    = text != nullptr ? static_cast<uint32_t>(std::strtoul(text, nullptr, 10)) : 0u;
+		if (v != 0) std::fprintf(stderr, "KYTY_PERF_RING_WORDS_GPU=%u: direct-range SRT words under a pending GPU write are copied on the GPU%s\n", v, v == 2 ? " (check: the CPU read is compared)" : "");
+		return v;
+	}();
+	return value;
+}
+
+struct RingWordsGpuStats {
+	std::atomic<uint64_t> copies {0}, declined {0}, checked {0}, unchecked {0}, touched {0}, touched_lines {0}, waits {0}, wait_ns {0};
+	std::atomic<int64_t>  window_start {0};
+};
+RingWordsGpuStats g_ring_words;
+
+void ReportRingWordsGpu() {
+	if (!PerfEnabled()) return;
+	auto&         s     = g_ring_words;
+	const int64_t now   = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+	int64_t       start = s.window_start.load(std::memory_order_relaxed);
+	if (start == 0) {
+		s.window_start.compare_exchange_strong(start, now, std::memory_order_relaxed);
+		return;
+	}
+	if (now - start < 5000 || !s.window_start.compare_exchange_strong(start, now, std::memory_order_relaxed)) return;
+	const auto take = [](std::atomic<uint64_t>& c) { return static_cast<unsigned long long>(c.exchange(0, std::memory_order_relaxed)); };
+	const auto copies = take(s.copies), declined = take(s.declined), checked = take(s.checked), unchecked = take(s.unchecked);
+	const auto touched = take(s.touched), waits = take(s.waits), wait_ns = take(s.wait_ns);
+	std::fprintf(stderr, "PERF ring_words_gpu copies=%llu declined=%llu checked=%llu unchecked=%llu touched=%llu check_waits=%llu check_wait_ms=%.1f (per ~5 s)\n",
+	             copies, declined, checked, unchecked, touched, waits, static_cast<double>(wait_ns) / 1e6);
+}
+} // namespace
+
+uint32_t BufferCache::RingWordsGpuMode() {
+	return Common::LiveAb::Gate(Common::LiveAb::Switch::RingWordsGpu, RingWordsGpuFixed());
+}
+
+bool BufferCache::RecordDirectWordCopy(uint64_t address, vk::Buffer destination, uint64_t destination_offset) {
+	ReportRingWordsGpu();
+	bool           deferred = false;
+	const BufferId id       = GuestGpu::IsGpuThread() && m_scheduler.Active() && !m_scheduler.Current().IsInvalid()
+	                              ? DirectBufferFor(address, sizeof(uint32_t), &deferred)
+	                              : BufferId {};
+	if (!id || deferred) {
+		g_ring_words.declined.fetch_add(1, std::memory_order_relaxed);
+		return false;
+	}
+	auto& buffer  = m_slot_buffers[id];
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	const auto              native = command.Handle();
+	vk::BufferMemoryBarrier before[2] {};
+	before[0].srcAccessMask       = vk::AccessFlagBits::eMemoryWrite;
+	before[0].dstAccessMask       = vk::AccessFlagBits::eTransferRead;
+	before[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before[0].buffer              = buffer.Handle();
+	before[0].offset              = buffer.Offset(address);
+	before[0].size                = sizeof(uint32_t);
+	before[1]                     = before[0];
+	before[1].srcAccessMask       = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	before[1].dstAccessMask       = vk::AccessFlagBits::eTransferWrite;
+	before[1].buffer              = destination;
+	before[1].offset              = destination_offset;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 2,
+	                       before, 0, nullptr);
+	const vk::BufferCopy copy {buffer.Offset(address), destination_offset, sizeof(uint32_t)};
+	native.copyBuffer(buffer.Handle(), destination, 1, &copy);
+	auto after          = before[1];
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eMemoryRead;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eAllCommands, {}, 0, nullptr, 1,
+	                       &after, 0, nullptr);
+	g_ring_words.copies.fetch_add(1, std::memory_order_relaxed);
+	return true;
+}
+
+void BufferCache::NoteRingWordWait(uint64_t nanoseconds) {
+	g_ring_words.waits.fetch_add(1, std::memory_order_relaxed);
+	g_ring_words.wait_ns.fetch_add(nanoseconds, std::memory_order_relaxed);
+}
+
+void BufferCache::CheckRingWordGpu(uint64_t address, uint32_t cpu_value) {
+	const bool recorded = PeekGpuCopyAsync(address, sizeof(uint32_t), [address, cpu_value](const uint8_t* bytes) {
+		uint32_t gpu_value = 0;
+		std::memcpy(&gpu_value, bytes, sizeof(gpu_value));
+		g_ring_words.checked.fetch_add(1, std::memory_order_relaxed);
+		if (gpu_value == cpu_value) return;
+		g_ring_words.touched.fetch_add(1, std::memory_order_relaxed);
+		if (g_ring_words.touched_lines.fetch_add(1, std::memory_order_relaxed) < 32u) {
+			std::fprintf(stderr, "PERF_RING_WORDS_GPU_TOUCHED addr=0x%llx cpu=0x%08x gpu=0x%08x frame=%u\n",
+			             static_cast<unsigned long long>(address), cpu_value, gpu_value, DebugPresentCount().load());
+		}
+	});
+	if (!recorded) g_ring_words.unchecked.fetch_add(1, std::memory_order_relaxed);
+}
+
 bool BufferCache::WaitDirectGpuWrites(uint64_t vaddr, uint64_t size, bool cp_overlay) {
 	m_direct_cp_overlay.clear();
 	if (m_direct_ranges.empty()) return false;
@@ -2611,6 +2836,7 @@ bool BufferCache::WaitDirectGpuWrites(uint64_t vaddr, uint64_t size, bool cp_ove
 			m_scheduler.Flush();
 			g_direct_stats.flushes.fetch_add(1, std::memory_order_relaxed);
 		}
+		if (t_serve_active) ServeWhileWaiting(target);
 		m_scheduler.Wait(target);
 		RenderExecutor::GpuBurnAt(RenderExecutor::GpuBurnSite::DirectWait); // KYTY_DIAG_GPU_BURN_AT=direct_wait (measurement only)
 		g_direct_stats.waits.fetch_add(1, std::memory_order_relaxed);
@@ -4831,7 +5057,8 @@ void BufferCache::ApplyEagerReadbacks(uint64_t vaddr, uint64_t size, bool wait) 
 			// so it keeps none of its own pages.
 			const uint64_t lo = entry.start;
 			const uint64_t hi = entry.end;
-			if (BarGpuCopyVerify()) VerifyCopyReadback(entry.bytes); // KYTY_PERF_BAR_GPU_COPY_VERIFY (diagnostic)
+			if (HandbackRedoOn()) RedoHandbackWrittenDuringFlight(entry); // KYTY_FIX_HANDBACK_REDO
+			if (BarGpuCopyVerify()) VerifyCopyReadback(entry); // KYTY_PERF_BAR_GPU_COPY_VERIFY (diagnostic)
 			entry = std::move(m_eager_readbacks.back());
 			m_eager_readbacks.pop_back();
 			InFlightRebuild();
@@ -5438,11 +5665,32 @@ struct BarDirectTarget {
 	std::vector<const uint8_t*>                                         data;             // per interval: its bytes in the backing view
 };
 
+uint32_t BarGpuCopyVerifyMode() {
+	static const uint32_t mode = [] {
+		const char*    value = std::getenv("KYTY_PERF_BAR_GPU_COPY_VERIFY");
+		const uint32_t m     = value != nullptr && (value[0] == '1' || value[0] == '2') ? static_cast<uint32_t>(value[0] - '0') : 0u;
+		if (m != 0) {
+			std::fprintf(stderr, "PERF_BAR_GPU_COPY_VERIFY: every GPU copy is compared with the mapping%s\n",
+			             m == 2 ? " (hand-back mismatches classified after 3 frames by the page events, KYTY_D6_C0=2)" : "");
+		}
+		return m;
+	}();
+	return mode;
+}
+
 bool BarGpuCopyVerify() {
+	return BarGpuCopyVerifyMode() != 0;
+}
+
+// KYTY_FIX_HANDBACK_REDO=1 (default 0; exactness fix candidate for the cutscene hand-back mismatches): when a hand-back
+// readback is applied, a copied interval whose 64 KiB granule write tick rose above the tick the copy waited for (a GPU
+// write noted during the flight, e.g. an image copy into the buffer that notes only the tick) is GPU-dirty again: its
+// pages stay GPU-modified and the next read downloads the newest bytes.
+bool HandbackRedoOn() {
 	static const bool on = [] {
-		const char* value = std::getenv("KYTY_PERF_BAR_GPU_COPY_VERIFY");
+		const char* value = std::getenv("KYTY_FIX_HANDBACK_REDO");
 		const bool  set   = value != nullptr && value[0] == '1';
-		if (set) std::fprintf(stderr, "PERF_BAR_GPU_COPY_VERIFY: every GPU copy is compared with the mapping\n");
+		if (set) std::fprintf(stderr, "KYTY_FIX_HANDBACK_REDO=1: hand-back intervals written during the flight are GPU-dirty again at apply\n");
 		return set;
 	}();
 	return on;
@@ -5869,13 +6117,39 @@ bool BufferCache::DeadRingWouldFree(uint64_t vaddr) {
 	return !live;
 }
 
-uint64_t BufferCache::StartCopyReadback(CallerPlan& plan, uint64_t vaddr, bool is_write) {
+// KYTY_PERF_COPY_CHAIN=1 (G3, design-gpuwait 2.2; default 0, off; live A/B switch; with KYTY_PERF_COPY_HANDBACK): a
+// guest fault whose bytes still wait for their write tick T starts its hand-back copy in the first trip, submitted to wait
+// for T, instead of handing back with T and starting the copy when the request comes again. The window enters the
+// hand-back state at issue, as for a copy of finished bytes (barGpuCopy.h), and the faulting thread waits for T, the
+// priority completions up to it and the copy, then applies. Declined (the plain hand-back with T) as StartCopyReadback
+// declines, and also while an asynchronous publish of guest bytes (NotePendingGuestWrite) over the window is pending:
+// such a publish runs after its tick on the CPU and must not land after the copy.
+static uint32_t CopyChainFixed() {
+	static const uint32_t value = [] {
+		const char* text = std::getenv("KYTY_PERF_COPY_CHAIN");
+		const bool  on   = text != nullptr && text[0] == '1';
+		if (on) std::fprintf(stderr, "PERF_COPY_CHAIN=1: hand-back copies of unfinished bytes start at the first request, chained to the write tick\n");
+		return on ? 1u : 0u;
+	}();
+	return value;
+}
+
+bool BufferCache::CopyChainOn() {
+	return Common::LiveAb::Gate(Common::LiveAb::Switch::CopyChain, CopyChainFixed()) != 0;
+}
+
+uint64_t BufferCache::StartCopyReadback(CallerPlan& plan, uint64_t vaddr, bool is_write, bool chained) {
 	auto&      s       = m_caller_stats;
 	const auto decline = [&] {
 		s.copy_declined.fetch_add(1, std::memory_order_relaxed);
 		return uint64_t {0};
 	};
 	if (plan.buffer == nullptr || plan.intervals.empty() || !g_bar_copy_queue || !m_append_pools.empty()) return decline();
+	if (chained) {
+		for (const auto& write: m_pending_guest_writes) {
+			if (write.start < plan.hi && plan.lo < write.end && !write.done->load(std::memory_order_acquire)) return decline();
+		}
+	}
 	// Only what TryBarDownload would copy with the GPU; a smaller download is read from the mapping at once.
 	const uint32_t gpu_copy_kb = Common::LiveAb::Gate(Common::LiveAb::Switch::BarGpuCopy, BarGpuCopyFixed());
 	if (!((gpu_copy_kb != 0 && plan.total >= (uint64_t {gpu_copy_kb} << 10u)) || plan.total > BarMaxBytes)) return decline();
@@ -5912,16 +6186,68 @@ uint64_t BufferCache::StartCopyReadback(CallerPlan& plan, uint64_t vaddr, bool i
 	}
 	m_eager_readbacks.push_back({.start = plan.lo, .end = plan.hi, .generation = 0, .tick = plan.newest,
 	                             .done = std::make_shared<std::atomic_bool>(false), .bytes = std::move(plan.intervals),
-	                             .copy_tick = copy_tick});
+	                             .copy_tick = copy_tick, .source = reinterpret_cast<uint64_t>(static_cast<VkBuffer>(buffer.Handle())),
+	                             .frame = DebugPresentCount().load()});
 	s.copy_issued.fetch_add(1, std::memory_order_relaxed);
 	return copy_tick;
 }
 
-void BufferCache::VerifyCopyReadback(const std::vector<std::pair<uint64_t, uint64_t>>& bytes) {
+void BufferCache::RedoHandbackWrittenDuringFlight(const EagerReadback& entry) {
+	static std::atomic<uint64_t> redone {0}, redone_bytes {0}, applied {0};
+	applied.fetch_add(1, std::memory_order_relaxed);
+	for (const auto& [start, end]: entry.bytes) {
+		if (start >= end) continue;
+		for (uint64_t key = WriteTickKey(start); key <= WriteTickKey(end - 1); ++key) {
+			const auto tick = GranuleWriteTick(key);
+			if (!tick || *tick <= entry.tick) continue;
+			const uint64_t a = std::max(start, key << 16u);
+			const uint64_t b = std::min(end, (key + 1u) << 16u);
+			GpuDirtyAdd(a, b - a);
+			redone.fetch_add(1, std::memory_order_relaxed);
+			redone_bytes.fetch_add(b - a, std::memory_order_relaxed);
+		}
+	}
+	if ((applied.load(std::memory_order_relaxed) & 0xffu) == 0 && Common::EnvRead::PerfLines()) {
+		std::fprintf(stderr, "PERF handback_redo applied=%llu redone_intervals=%llu redone_kb=%llu\n",
+		             static_cast<unsigned long long>(applied.load()), static_cast<unsigned long long>(redone.load()),
+		             static_cast<unsigned long long>(redone_bytes.load() >> 10u));
+	}
+}
+
+void BufferCache::VerifyCopyReadback(const EagerReadback& entry) {
+	const auto&    bytes = entry.bytes;
 	const uint64_t view = LibKernel::Memory::GuestBackingBase();
 	if (view == 0) return;
+	if (!m_handback_late.empty()) { // KYTY_PERF_BAR_GPU_COPY_VERIFY=2: mismatches 3 frames old, classified by the page events
+		static uint64_t explained = 0, confirmed = 0;
+		static uint32_t confirmed_lines = 0;
+		const uint32_t  now = DebugPresentCount().load();
+		bool            any = false;
+		std::erase_if(m_handback_late, [&](const HandbackLate& late) {
+			if (now < late.frame + 3u) return false;
+			any = true;
+			if (C0ByteChangedAfter(late.address, late.tick)) {
+				explained++;
+			} else {
+				confirmed++;
+				if (confirmed_lines++ < 32u) {
+					std::string history;
+					(void)C0PageHistory(late.address & ~(TRACKER_PAGE_SIZE - 1), history);
+					std::fprintf(stderr, "HANDBACK_MISMATCH_CONFIRMED addr=0x%llx write_tick=%llu frame=%u events:%s\n",
+					             static_cast<unsigned long long>(late.address), static_cast<unsigned long long>(late.tick), late.frame,
+					             history.c_str());
+				}
+			}
+			return true;
+		});
+		if (any) {
+			std::fprintf(stderr, "PERF handback_verify_late explained=%llu confirmed=%llu pending=%zu\n",
+			             static_cast<unsigned long long>(explained), static_cast<unsigned long long>(confirmed), m_handback_late.size());
+		}
+	}
 	static thread_local std::vector<uint8_t> from_mapping;
 	uint64_t                                 verified = 0, mismatched = 0;
+	static std::atomic_uint                  detail_lines {0};
 	for (const auto& [start, end]: bytes) {
 		const uint64_t size = end - start;
 		if (size == 0 || m_gpu_modified_ranges.Intersects(start, size)) continue;
@@ -5943,6 +6269,46 @@ void BufferCache::VerifyCopyReadback(const std::vector<std::pair<uint64_t, uint6
 				std::fprintf(stderr, "PERF_COPY_HANDBACK_MISMATCH addr=0x%llx size=%llu frame=%u\n",
 				             static_cast<unsigned long long>(start), static_cast<unsigned long long>(size),
 				             DebugPresentCount().load());
+			}
+			if (BarGpuCopyVerifyMode() == 2u && UploadClobberCheck()) {
+				const auto* g = reinterpret_cast<const uint8_t*>(view + backing);
+				uint64_t    i = 0;
+				while (i < size && from_mapping[i] == g[i]) i++;
+				if (m_handback_late.size() < 4096u) m_handback_late.push_back({start + i, entry.tick, DebugPresentCount().load()});
+			}
+			if (detail_lines.fetch_add(1) < 64u) {
+				const auto* guest = reinterpret_cast<const uint8_t*>(view + backing);
+				uint64_t    first = 0, last = 0, count = 0;
+				for (uint64_t i = 0; i < size; i++) {
+					if (from_mapping[i] == guest[i]) continue;
+					if (count++ == 0) first = i;
+					last = i;
+				}
+				uint64_t map8 = 0, guest8 = 0;
+				const uint64_t at = first & ~uint64_t {7};
+				std::memcpy(&map8, from_mapping.data() + at, std::min<uint64_t>(8, size - at));
+				std::memcpy(&guest8, guest + at, std::min<uint64_t>(8, size - at));
+				const uint64_t bad  = start + first;
+				const uint64_t page = bad & ~(TRACKER_PAGE_SIZE - 1);
+				std::string    history;
+				if (UploadClobberCheck()) (void)C0PageHistory(page, history);
+				std::fprintf(stderr,
+				             "HANDBACK_MISMATCH_DETAIL frame=%u copy_frame=%u interval=0x%llx+0x%llx bad=0x%llx..0x%llx n=%llu map=%016llx guest=%016llx "
+				             "write_tick=%llu copy_tick=%llu cur=%llu gpu=%llu same_buffer=%d ready=%llu page_gpu=%d page_cpu=%d dirty_page=%d "
+				             "write_frame=%llu ring_exec=%llu ring_game=%llu events:%s\n",
+				             DebugPresentCount().load(), entry.frame, static_cast<unsigned long long>(start), static_cast<unsigned long long>(size),
+				             static_cast<unsigned long long>(bad), static_cast<unsigned long long>(start + last), static_cast<unsigned long long>(count),
+				             static_cast<unsigned long long>(map8), static_cast<unsigned long long>(guest8),
+				             static_cast<unsigned long long>(entry.tick), static_cast<unsigned long long>(entry.copy_tick),
+				             static_cast<unsigned long long>(m_scheduler.CurrentTick()),
+				             static_cast<unsigned long long>(m_scheduler.GetMasterSemaphore().KnownGpuTick()),
+				             entry.source == reinterpret_cast<uint64_t>(static_cast<VkBuffer>(buffer.Handle())) ? 1 : 0,
+				             static_cast<unsigned long long>(ready->second), m_memory_tracker.IsRegionGpuModified(page, TRACKER_PAGE_SIZE) ? 1 : 0,
+				             m_memory_tracker.IsRegionCpuModified(page, TRACKER_PAGE_SIZE) ? 1 : 0,
+				             m_gpu_modified_ranges.Intersects(page, TRACKER_PAGE_SIZE) ? 1 : 0,
+				             static_cast<unsigned long long>(QueryTicks(m_write_frames, bad, bad + 1)),
+				             static_cast<unsigned long long>(g_ring_exec_data_frame),
+				             static_cast<unsigned long long>(g_ring_game_write_frame.load(std::memory_order_relaxed)), history.c_str());
 			}
 		}
 	}
@@ -6561,6 +6927,127 @@ bool BufferCache::PendingReadbackCovers(uint64_t vaddr, uint64_t size) const {
 	return false;
 }
 
+// ---- KYTY_PERF_COUNT_EXACT (G2, design-gpuwait 2.3) ------------------------------------------------------------------
+// ReadGpuCopy (instance counts of GPU-executed indirect packets) waits for the bytes' own writes instead of recording a
+// copy and waiting for everything recorded so far:
+//  - bytes inside an active direct range: the newest listed GPU write overlapping them (WaitDirectGpuWrites, the rule
+//    the walker's reads of the same ranges use), then guest memory, which the GPU writes in place;
+//  - bytes all GPU-dirty in a host-mapped buffer: TryBarDownload's conditions (known granule ticks, the buffer's ready
+//    tick, written by a finished command buffer, no write obtained but not recorded), then the mapping.
+// Every other read takes the copy. 1 = on (live A/B switch), 2 = check (start value only): both reads, counted
+// mismatches; the copy's bytes are returned.
+namespace {
+uint32_t CountExactFixed() {
+	static const uint32_t value = [] {
+		const char* text = std::getenv("KYTY_PERF_COUNT_EXACT");
+		const uint32_t v = text != nullptr ? static_cast<uint32_t>(std::strtoul(text, nullptr, 10)) : 0u;
+		if (v != 0) std::fprintf(stderr, "KYTY_PERF_COUNT_EXACT=%u: instance-count reads wait for their bytes' writes%s\n", v, v == 2 ? " (check: both reads compared)" : "");
+		return v;
+	}();
+	return value;
+}
+
+enum CountExactWay : uint32_t { CeDirect, CeMapped, CeNotDirty, CeNoTick, CeOpen, CePending, CeNoMap, CeWays };
+
+struct CountExactStats {
+	std::atomic<uint64_t> calls {0}, copies {0}, copy_ns {0}, fast_ns {0}, fast_waits {0};
+	std::atomic<uint64_t> ways[CeWays] {};
+	std::atomic<uint64_t> checked {0}, mismatched {0}, mismatch_lines {0};
+	std::atomic<int64_t>  window_start {0};
+};
+CountExactStats g_count_exact;
+
+void ReportCountExact() {
+	if (!PerfEnabled()) return;
+	auto&         s   = g_count_exact;
+	const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+	int64_t       start = s.window_start.load(std::memory_order_relaxed);
+	if (start == 0) {
+		s.window_start.compare_exchange_strong(start, now, std::memory_order_relaxed);
+		return;
+	}
+	if (now - start < 5000 || !s.window_start.compare_exchange_strong(start, now, std::memory_order_relaxed)) return;
+	const auto take = [](std::atomic<uint64_t>& c) { return static_cast<unsigned long long>(c.exchange(0, std::memory_order_relaxed)); };
+	const auto cn   = take(s.copy_ns);
+	const auto fn   = take(s.fast_ns);
+	std::fprintf(stderr,
+	             "PERF count_exact calls=%llu copies=%llu copy_ms=%.2f direct=%llu mapped=%llu fast_waits=%llu fast_ms=%.2f "
+	             "declined(notdirty,notick,open,pending,nomap)=%llu,%llu,%llu,%llu,%llu checked=%llu mismatched=%llu (per ~5 s)\n",
+	             take(s.calls), take(s.copies), static_cast<double>(cn) / 1e6, take(s.ways[CeDirect]), take(s.ways[CeMapped]),
+	             take(s.fast_waits), static_cast<double>(fn) / 1e6, take(s.ways[CeNotDirty]), take(s.ways[CeNoTick]),
+	             take(s.ways[CeOpen]), take(s.ways[CePending]), take(s.ways[CeNoMap]), take(s.checked), take(s.mismatched));
+}
+} // namespace
+
+bool BufferCache::ReadCountExact(Buffer& buffer, uint64_t vaddr, uint64_t size, void* out) {
+	auto&      s    = g_count_exact;
+	const auto way  = [&](CountExactWay w) {
+		s.ways[w].fetch_add(1, std::memory_order_relaxed);
+		return false;
+	};
+	const auto timed_wait = [&](auto&& wait) {
+		const auto t0 = std::chrono::steady_clock::now();
+		if (wait()) s.fast_waits.fetch_add(1, std::memory_order_relaxed);
+		s.fast_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()),
+		                    std::memory_order_relaxed);
+	};
+	if (!GuestGpu::IsGpuThread()) return way(CeNoMap);
+	bool inside_direct = false;
+	for (const auto& range: m_direct_ranges) {
+		if (range.active && range.start <= vaddr && vaddr + size <= range.end) inside_direct = true;
+	}
+	if (inside_direct) {
+		bool overlay = false;
+		timed_wait([&] {
+			const uint64_t before = g_direct_wait_total.load(std::memory_order_relaxed);
+			overlay               = WaitDirectGpuWrites(vaddr, size, false);
+			return g_direct_wait_total.load(std::memory_order_relaxed) != before;
+		});
+		if (overlay || !LibKernel::Memory::TryReadBacking(vaddr, out, size)) return way(CeNoMap);
+		s.ways[CeDirect].fetch_add(1, std::memory_order_relaxed);
+		return true;
+	}
+	if (buffer.Mapped().empty()) return way(CeNoMap);
+	const auto base   = buffer.CpuAddress();
+	uint64_t   newest = 0, covered = 0;
+	bool       unknown = false;
+	m_memory_tracker.ForEachDownloadRange<false>(vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
+		m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
+			const uint64_t lo = std::max(start, vaddr);
+			const uint64_t hi = std::min(end, vaddr + size);
+			if (lo >= hi) return;
+			covered += hi - lo;
+			for (uint64_t page = lo & ~uint64_t {TRACKER_PAGE_SIZE - 1}; page < hi; page += TRACKER_PAGE_SIZE) {
+				const auto tick = GranuleWriteTick(WriteTickKey(page));
+				if (!tick) {
+					unknown = true;
+					return;
+				}
+				newest = std::max(newest, *tick);
+			}
+		});
+	});
+	if (covered != size) return way(CeNotDirty);
+	if (unknown) return way(CeNoTick);
+	const auto ready = m_buffer_ready_tick.find(reinterpret_cast<uint64_t>(static_cast<VkBuffer>(buffer.Handle())));
+	if (ready == m_buffer_ready_tick.end()) return way(CeNoTick);
+	newest = std::max(newest, ready->second);
+	if (newest >= m_scheduler.CurrentTick()) return way(CeOpen);
+	if (std::ranges::any_of(m_bar_pending_writes, [&](const auto& w) { return w.first < vaddr + size && vaddr < w.first + w.second; })) {
+		return way(CePending);
+	}
+	timed_wait([&] {
+		const bool blocked = !m_scheduler.IsFree(newest) || !m_scheduler.PriorityOperationsDone(newest);
+		m_scheduler.Wait(newest);
+		m_scheduler.WaitPriorityOperations(newest);
+		return blocked;
+	});
+	if (!buffer.IsCoherent()) buffer.Invalidate(0, buffer.Size());
+	CopyFromWriteCombined(static_cast<uint8_t*>(out), buffer.Mapped().data() + (vaddr - base), size);
+	s.ways[CeMapped].fetch_add(1, std::memory_order_relaxed);
+	return true;
+}
+
 bool BufferCache::ReadGpuCopy(uint64_t vaddr, uint64_t size, void* out) {
 	if (vaddr == 0 || size == 0 || size > 1024u * 1024u) return false;
 	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
@@ -6569,6 +7056,43 @@ bool BufferCache::ReadGpuCopy(uint64_t vaddr, uint64_t size, void* out) {
 	if (!buffer.IsInBounds(vaddr, size) || m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
 		return false;
 	}
+	const uint32_t exact = size <= 64u ? Common::LiveAb::Gate(Common::LiveAb::Switch::CountExact, CountExactFixed()) : 0u;
+	std::array<uint8_t, 64> fast {};
+	bool                    fast_ok = false;
+	if (exact != 0u) {
+		g_count_exact.calls.fetch_add(1, std::memory_order_relaxed);
+		fast_ok = ReadCountExact(buffer, vaddr, size, fast.data());
+		ReportCountExact();
+		if (fast_ok && exact == 1u) {
+			std::memcpy(out, fast.data(), size);
+			return true;
+		}
+	}
+	const auto copy_start = exact != 0u ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+	if (!ReadGpuCopyRecorded(buffer, vaddr, size, out)) return false;
+	if (exact != 0u) {
+		g_count_exact.copies.fetch_add(1, std::memory_order_relaxed);
+		g_count_exact.copy_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - copy_start).count()),
+		                                std::memory_order_relaxed);
+	}
+	if (fast_ok) {
+		g_count_exact.checked.fetch_add(1, std::memory_order_relaxed);
+		if (std::memcmp(out, fast.data(), size) != 0) {
+			g_count_exact.mismatched.fetch_add(1, std::memory_order_relaxed);
+			if (g_count_exact.mismatch_lines.fetch_add(1, std::memory_order_relaxed) < 32u) {
+				uint32_t a = 0, b = 0;
+				std::memcpy(&a, out, std::min<uint64_t>(size, 4));
+				std::memcpy(&b, fast.data(), std::min<uint64_t>(size, 4));
+				std::fprintf(stderr, "PERF_COUNT_EXACT_MISMATCH addr=0x%llx size=%llu copy=0x%08x fast=0x%08x direct=%d frame=%u\n",
+				             static_cast<unsigned long long>(vaddr), static_cast<unsigned long long>(size), a, b,
+				             InDirectRange(vaddr, size) ? 1 : 0, DebugPresentCount().load());
+			}
+		}
+	}
+	return true;
+}
+
+bool BufferCache::ReadGpuCopyRecorded(Buffer& buffer, uint64_t vaddr, uint64_t size, void* out) {
 	auto [mapped, offset] = m_download_buffer.Map(size, 64);
 	if (mapped == nullptr) return false;
 	m_download_buffer.Commit();
