@@ -105,6 +105,9 @@ constexpr SwitchInfo Switches[] = {
     // Per request: whether a hand-back copy of unfinished bytes starts at the first request (chained to the write tick)
     // or at the second; either way the window is in the hand-back state while the copy is under way.
     {Switch::CopyChain, "KYTY_PERF_COPY_CHAIN", 1},
+    // Per binding: a direct-range SRT word under a pending GPU write reaches its word-stream slot by a GPU copy recorded
+    // there or by the CPU read after the wait; nothing outlives the binding.
+    {Switch::RingWordsGpu, "KYTY_PERF_RING_WORDS_GPU", 1},
     // Project 15 way B P1 (test switch): a read-only buffer binding with a ready plan entry whose proof holds takes the
     // binding the helper computed (handle, aligned offset, range, offset byte, record stride) instead of RebindBuffers'.
 };

@@ -514,6 +514,17 @@ public:
 		bool               previous_served;
 	};
 	static void NoteServeInWaitCheck(uint32_t passes, bool checked, bool differ);
+	// KYTY_PERF_RING_WORDS_GPU (G6, design-gpuwait 2.1; default 0; 1 on, live A/B switch; 2 check, start value only), GPU
+	// thread. A shader-read SRT word in a direct range with a pending GPU write of unknown bytes over it is not read by
+	// the CPU after waiting for that write: RecordDirectWordCopy records a 4-byte copy from the direct buffer into the
+	// word's word-stream slot at this point of the stream, after every GPU write recorded before it (false: no direct
+	// buffer at once; the caller reads as before). The shader sees guest memory as the GPU leaves it there, which differs
+	// from the CPU read only if the guest writes the word after submitting the work that reads it. Check: the CPU value is
+	// read as before too and compared with a second copy recorded right after the first (CheckRingWordGpu, on the
+	// priority thread); a difference is the guest touching the word between the CPU read and the copy.
+	[[nodiscard]] static uint32_t RingWordsGpuMode();
+	bool                          RecordDirectWordCopy(uint64_t address, vk::Buffer destination, uint64_t destination_offset);
+	void                          CheckRingWordGpu(uint64_t address, uint32_t cpu_value);
 	// KYTY_DIAG_PAGE_MARK_CHECK=1 (diagnostic, default off, read once), GPU thread. The resource walker remembers a
 	// 4 KiB page as clean for the rest of one walk (OrdinaryReadPageCache in aps5/memoryShim.cpp and kernel/memory.cpp);
 	// a read through that mark takes guest memory without a question. An ordinary read sets the mark after asking

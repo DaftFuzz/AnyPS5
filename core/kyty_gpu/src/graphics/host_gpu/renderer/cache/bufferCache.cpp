@@ -2675,6 +2675,101 @@ void BufferCache::ServeWhileWaiting(uint64_t target) {
 	                          std::memory_order_relaxed);
 }
 
+// ---- KYTY_PERF_RING_WORDS_GPU (bufferCache.h) -------------------------------------------------------------------------
+namespace {
+uint32_t RingWordsGpuFixed() {
+	static const uint32_t value = [] {
+		const char*    text = std::getenv("KYTY_PERF_RING_WORDS_GPU");
+		const uint32_t v    = text != nullptr ? static_cast<uint32_t>(std::strtoul(text, nullptr, 10)) : 0u;
+		if (v != 0) std::fprintf(stderr, "KYTY_PERF_RING_WORDS_GPU=%u: direct-range SRT words under a pending GPU write are copied on the GPU%s\n", v, v == 2 ? " (check: the CPU read is compared)" : "");
+		return v;
+	}();
+	return value;
+}
+
+struct RingWordsGpuStats {
+	std::atomic<uint64_t> copies {0}, declined {0}, checked {0}, unchecked {0}, touched {0}, touched_lines {0};
+	std::atomic<int64_t>  window_start {0};
+};
+RingWordsGpuStats g_ring_words;
+
+void ReportRingWordsGpu() {
+	if (!PerfEnabled()) return;
+	auto&         s     = g_ring_words;
+	const int64_t now   = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+	int64_t       start = s.window_start.load(std::memory_order_relaxed);
+	if (start == 0) {
+		s.window_start.compare_exchange_strong(start, now, std::memory_order_relaxed);
+		return;
+	}
+	if (now - start < 5000 || !s.window_start.compare_exchange_strong(start, now, std::memory_order_relaxed)) return;
+	const auto take = [](std::atomic<uint64_t>& c) { return static_cast<unsigned long long>(c.exchange(0, std::memory_order_relaxed)); };
+	const auto copies = take(s.copies), declined = take(s.declined), checked = take(s.checked), unchecked = take(s.unchecked);
+	const auto touched = take(s.touched);
+	std::fprintf(stderr, "PERF ring_words_gpu copies=%llu declined=%llu checked=%llu unchecked=%llu touched=%llu (per ~5 s)\n", copies,
+	             declined, checked, unchecked, touched);
+}
+} // namespace
+
+uint32_t BufferCache::RingWordsGpuMode() {
+	return Common::LiveAb::Gate(Common::LiveAb::Switch::RingWordsGpu, RingWordsGpuFixed());
+}
+
+bool BufferCache::RecordDirectWordCopy(uint64_t address, vk::Buffer destination, uint64_t destination_offset) {
+	ReportRingWordsGpu();
+	bool           deferred = false;
+	const BufferId id       = GuestGpu::IsGpuThread() && m_scheduler.Active() && !m_scheduler.Current().IsInvalid()
+	                              ? DirectBufferFor(address, sizeof(uint32_t), &deferred)
+	                              : BufferId {};
+	if (!id || deferred) {
+		g_ring_words.declined.fetch_add(1, std::memory_order_relaxed);
+		return false;
+	}
+	auto& buffer  = m_slot_buffers[id];
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	const auto              native = command.Handle();
+	vk::BufferMemoryBarrier before[2] {};
+	before[0].srcAccessMask       = vk::AccessFlagBits::eMemoryWrite;
+	before[0].dstAccessMask       = vk::AccessFlagBits::eTransferRead;
+	before[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before[0].buffer              = buffer.Handle();
+	before[0].offset              = buffer.Offset(address);
+	before[0].size                = sizeof(uint32_t);
+	before[1]                     = before[0];
+	before[1].srcAccessMask       = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	before[1].dstAccessMask       = vk::AccessFlagBits::eTransferWrite;
+	before[1].buffer              = destination;
+	before[1].offset              = destination_offset;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 2,
+	                       before, 0, nullptr);
+	const vk::BufferCopy copy {buffer.Offset(address), destination_offset, sizeof(uint32_t)};
+	native.copyBuffer(buffer.Handle(), destination, 1, &copy);
+	auto after          = before[1];
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eMemoryRead;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eAllCommands, {}, 0, nullptr, 1,
+	                       &after, 0, nullptr);
+	g_ring_words.copies.fetch_add(1, std::memory_order_relaxed);
+	return true;
+}
+
+void BufferCache::CheckRingWordGpu(uint64_t address, uint32_t cpu_value) {
+	const bool recorded = PeekGpuCopyAsync(address, sizeof(uint32_t), [address, cpu_value](const uint8_t* bytes) {
+		uint32_t gpu_value = 0;
+		std::memcpy(&gpu_value, bytes, sizeof(gpu_value));
+		g_ring_words.checked.fetch_add(1, std::memory_order_relaxed);
+		if (gpu_value == cpu_value) return;
+		g_ring_words.touched.fetch_add(1, std::memory_order_relaxed);
+		if (g_ring_words.touched_lines.fetch_add(1, std::memory_order_relaxed) < 32u) {
+			std::fprintf(stderr, "PERF_RING_WORDS_GPU_TOUCHED addr=0x%llx cpu=0x%08x gpu=0x%08x frame=%u\n",
+			             static_cast<unsigned long long>(address), cpu_value, gpu_value, DebugPresentCount().load());
+		}
+	});
+	if (!recorded) g_ring_words.unchecked.fetch_add(1, std::memory_order_relaxed);
+}
+
 bool BufferCache::WaitDirectGpuWrites(uint64_t vaddr, uint64_t size, bool cp_overlay) {
 	m_direct_cp_overlay.clear();
 	if (m_direct_ranges.empty()) return false;

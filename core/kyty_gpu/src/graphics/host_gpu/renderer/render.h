@@ -598,6 +598,7 @@ private:
 	static thread_local std::vector<std::pair<uint32_t, uint32_t>> m_gpu_word_patches;
 	static thread_local std::vector<std::pair<uint64_t, uint32_t>> m_gpu_word_addresses;
 	static thread_local std::vector<std::tuple<uint32_t, uint32_t, uint64_t>> m_gpu_word_values; // index, value, guest
+	static thread_local std::vector<std::pair<uint32_t, uint32_t>> m_gpu_word_copies; // KYTY_PERF_RING_WORDS_GPU: position, check value
 	// The last bindless image lists CommitBindings walked, with the epochs of that walk.
 	struct BindlessLayoutMemo {
 		std::vector<ImageId> ids;
