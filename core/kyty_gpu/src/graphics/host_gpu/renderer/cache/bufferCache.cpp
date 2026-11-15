@@ -2688,7 +2688,7 @@ uint32_t RingWordsGpuFixed() {
 }
 
 struct RingWordsGpuStats {
-	std::atomic<uint64_t> copies {0}, declined {0}, checked {0}, unchecked {0}, touched {0}, touched_lines {0};
+	std::atomic<uint64_t> copies {0}, declined {0}, checked {0}, unchecked {0}, touched {0}, touched_lines {0}, waits {0}, wait_ns {0};
 	std::atomic<int64_t>  window_start {0};
 };
 RingWordsGpuStats g_ring_words;
@@ -2705,9 +2705,9 @@ void ReportRingWordsGpu() {
 	if (now - start < 5000 || !s.window_start.compare_exchange_strong(start, now, std::memory_order_relaxed)) return;
 	const auto take = [](std::atomic<uint64_t>& c) { return static_cast<unsigned long long>(c.exchange(0, std::memory_order_relaxed)); };
 	const auto copies = take(s.copies), declined = take(s.declined), checked = take(s.checked), unchecked = take(s.unchecked);
-	const auto touched = take(s.touched);
-	std::fprintf(stderr, "PERF ring_words_gpu copies=%llu declined=%llu checked=%llu unchecked=%llu touched=%llu (per ~5 s)\n", copies,
-	             declined, checked, unchecked, touched);
+	const auto touched = take(s.touched), waits = take(s.waits), wait_ns = take(s.wait_ns);
+	std::fprintf(stderr, "PERF ring_words_gpu copies=%llu declined=%llu checked=%llu unchecked=%llu touched=%llu check_waits=%llu check_wait_ms=%.1f (per ~5 s)\n",
+	             copies, declined, checked, unchecked, touched, waits, static_cast<double>(wait_ns) / 1e6);
 }
 } // namespace
 
@@ -2753,6 +2753,11 @@ bool BufferCache::RecordDirectWordCopy(uint64_t address, vk::Buffer destination,
 	                       &after, 0, nullptr);
 	g_ring_words.copies.fetch_add(1, std::memory_order_relaxed);
 	return true;
+}
+
+void BufferCache::NoteRingWordWait(uint64_t nanoseconds) {
+	g_ring_words.waits.fetch_add(1, std::memory_order_relaxed);
+	g_ring_words.wait_ns.fetch_add(nanoseconds, std::memory_order_relaxed);
 }
 
 void BufferCache::CheckRingWordGpu(uint64_t address, uint32_t cpu_value) {

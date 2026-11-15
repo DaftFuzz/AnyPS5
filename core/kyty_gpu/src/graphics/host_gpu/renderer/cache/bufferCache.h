@@ -525,6 +525,7 @@ public:
 	[[nodiscard]] static uint32_t RingWordsGpuMode();
 	bool                          RecordDirectWordCopy(uint64_t address, vk::Buffer destination, uint64_t destination_offset);
 	void                          CheckRingWordGpu(uint64_t address, uint32_t cpu_value);
+	static void                   NoteRingWordWait(uint64_t nanoseconds); // check: the CPU wait the copy replaces
 	// KYTY_DIAG_PAGE_MARK_CHECK=1 (diagnostic, default off, read once), GPU thread. The resource walker remembers a
 	// 4 KiB page as clean for the rest of one walk (OrdinaryReadPageCache in aps5/memoryShim.cpp and kernel/memory.cpp);
 	// a read through that mark takes guest memory without a question. An ordinary read sets the mark after asking

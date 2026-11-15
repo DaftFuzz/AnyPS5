@@ -5141,7 +5141,10 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 					// KYTY_PERF_RING_WORDS_GPU: a pending GPU write of unknown bytes over the word; its slot is filled by a GPU
 					// copy recorded below (check: the CPU value is read as before too).
 					if (ring_gpu == 2u) {
+						const auto wait_start = std::chrono::steady_clock::now();
 						(void)cache.WaitDirectGpuWrites(address, sizeof(uint32_t), true);
+						BufferCache::NoteRingWordWait(static_cast<uint64_t>(
+						    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - wait_start).count()));
 						LibKernel::Memory::ReadGuestPlain(&value, address, sizeof(uint32_t));
 						cache.ApplyDirectCpWrites(address, &value, sizeof(uint32_t));
 					}
