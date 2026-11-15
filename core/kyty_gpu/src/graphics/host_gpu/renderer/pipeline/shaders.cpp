@@ -417,7 +417,17 @@ static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>& descr
 
 // False only on a background compile (shaderPrecompile.h) the driver refused; the GPU thread exits then.
 static bool CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                                   std::span<const vk::DescriptorSetLayoutBinding> bindings,
+                                   std::span<const vk::DescriptorSetLayoutBinding> set_bindings);
+
+static bool CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                                    std::span<const vk::DescriptorSetLayoutBinding> bindings) {
+	return CreateDescriptorLayout(graphics, pipeline, bindings, bindings);
+}
+
+static bool CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                                   std::span<const vk::DescriptorSetLayoutBinding> bindings,
+                                   std::span<const vk::DescriptorSetLayoutBinding> set_bindings) {
 	const auto& limits = graphics.GetPhysicalDeviceProperties().limits;
 	uint64_t descriptor_count = 0;
 	uint64_t storage_buffers = 0;
@@ -453,14 +463,17 @@ static bool CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipe
 		EXIT("native sampler descriptors exceed device limit: %" PRIu64 "/%u\n",
 		     samplers, limits.maxDescriptorSetSamplers);
 	}
-	pipeline.uses_push_descriptors = descriptor_count <= graphics.max_push_descriptors;
+	uint64_t set_descriptor_count = 0;
+	for (const auto& binding: set_bindings) set_descriptor_count += binding.descriptorCount;
+	(void)descriptor_count;
+	pipeline.uses_push_descriptors = set_descriptor_count <= graphics.max_push_descriptors;
 
 	vk::DescriptorSetLayoutCreateInfo create {};
 	create.flags        = pipeline.uses_push_descriptors
 	                          ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
 	                          : vk::DescriptorSetLayoutCreateFlags {};
-	create.bindingCount = static_cast<uint32_t>(bindings.size());
-	create.pBindings    = bindings.data();
+	create.bindingCount = static_cast<uint32_t>(set_bindings.size());
+	create.pBindings    = set_bindings.data();
 	const auto result =
 	    graphics.device.createDescriptorSetLayout(&create, nullptr, &pipeline.descriptor_set_layout);
 	if (result != vk::Result::eSuccess && IsBackgroundCompileThread()) {
@@ -644,15 +657,84 @@ struct GplStats {
 
 GplStats g_gpl;
 
+struct GplTemplateEntry {
+	vk::DescriptorUpdateTemplate update_template = nullptr;
+	uint32_t                     bytes           = 0;
+};
+
 struct GplLibraryCache {
 	std::mutex                                                                     mutex;
 	std::unordered_map<GplKey, std::shared_future<vk::Pipeline>, GplKeyHash> libraries;
 	std::unordered_map<GplKey, GplLayoutEntry, GplKeyHash>                   layouts;
+	std::unordered_map<GplKey, vk::DescriptorSetLayout, GplKeyHash>          set_layouts;
+	std::unordered_map<GplKey, vk::PipelineLayout, GplKeyHash>               pipeline_layouts;
+	std::unordered_map<VkDescriptorSetLayout, GplTemplateEntry>             templates;
 };
 
 GplLibraryCache& GplLibraries() {
 	static GplLibraryCache cache;
 	return cache;
+}
+
+void GplKeyBindings(GplKeyBuilder& builder, std::span<const vk::DescriptorSetLayoutBinding> bindings) {
+	builder.Add(static_cast<uint32_t>(bindings.size()));
+	for (const auto& b: bindings) {
+		builder.Add(b.binding);
+		builder.Add(b.descriptorType);
+		builder.Add(b.descriptorCount);
+		builder.Add(static_cast<uint32_t>(b.stageFlags));
+	}
+}
+
+vk::DescriptorSetLayout GplSharedSetLayout(GraphicContext& graphics, std::span<const vk::DescriptorSetLayoutBinding> bindings,
+                                           bool push) {
+	GplKeyBuilder builder;
+	GplKeyBindings(builder, bindings);
+	builder.Add(push);
+	const auto            key   = builder.Finish(GplLayout);
+	auto&                 cache = GplLibraries();
+	const std::lock_guard lock(cache.mutex);
+	if (const auto found = cache.set_layouts.find(key); found != cache.set_layouts.end()) return found->second;
+	vk::DescriptorSetLayoutCreateInfo create {};
+	create.flags        = push ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR : vk::DescriptorSetLayoutCreateFlags {};
+	create.bindingCount = static_cast<uint32_t>(bindings.size());
+	create.pBindings    = bindings.data();
+	vk::DescriptorSetLayout layout = nullptr;
+	if (graphics.device.createDescriptorSetLayout(&create, nullptr, &layout) != vk::Result::eSuccess) return nullptr;
+	cache.set_layouts.emplace(key, layout);
+	return layout;
+}
+
+vk::PipelineLayout GplSharedPipelineLayout(GraphicContext& graphics, std::span<const vk::DescriptorSetLayout> sets,
+                                           const vk::PushConstantRange& push_constants, vk::PipelineLayoutCreateFlags flags) {
+	GplKeyBuilder builder;
+	builder.Add(static_cast<uint32_t>(sets.size()));
+	for (const auto set: sets) builder.Add(static_cast<VkDescriptorSetLayout>(set));
+	builder.Add(static_cast<uint32_t>(push_constants.stageFlags));
+	builder.Add(push_constants.offset);
+	builder.Add(push_constants.size);
+	builder.Add(static_cast<uint32_t>(flags));
+	const auto            key   = builder.Finish(GplLayout);
+	auto&                 cache = GplLibraries();
+	const std::lock_guard lock(cache.mutex);
+	if (const auto found = cache.pipeline_layouts.find(key); found != cache.pipeline_layouts.end()) return found->second;
+	vk::PipelineLayoutCreateInfo create {};
+	create.flags                  = flags;
+	create.setLayoutCount         = static_cast<uint32_t>(sets.size());
+	create.pSetLayouts            = sets.data();
+	create.pushConstantRangeCount = 1;
+	create.pPushConstantRanges    = &push_constants;
+	vk::PipelineLayout layout     = nullptr;
+	if (graphics.device.createPipelineLayout(&create, nullptr, &layout) != vk::Result::eSuccess) return nullptr;
+	g_gpl.made[GplLayout].fetch_add(1, std::memory_order_relaxed);
+	cache.pipeline_layouts.emplace(key, layout);
+	return layout;
+}
+
+vk::ShaderStageFlags SplitPushStages(bool mesh) {
+	return mesh ? vk::ShaderStageFlags(vk::ShaderStageFlagBits::eAllGraphics | vk::ShaderStageFlagBits::eMeshEXT |
+	                                   vk::ShaderStageFlagBits::eTaskEXT)
+	            : vk::ShaderStageFlags(vk::ShaderStageFlagBits::eAllGraphics);
 }
 
 const ShaderRecompiler::IR::ResourceSnapshot g_gpl_no_resources {};
@@ -727,11 +809,11 @@ void GplReport(bool force) {
 	const auto ms = [](const std::atomic<uint64_t>& us) { return static_cast<double>(us.load(std::memory_order_relaxed)) / 1000.0; };
 	const auto n  = [](const std::atomic<uint64_t>& v) { return static_cast<unsigned long long>(v.load(std::memory_order_relaxed)); };
 	std::fprintf(stderr,
-	             "PERF gpl mode=%u probe_hit=%llu probe_miss=%llu fast=%llu fast_ms=%.0f link_ms=%.0f mono=%llu "
+	             "PERF gpl mode=%u%s probe_hit=%llu probe_miss=%llu fast=%llu fast_ms=%.0f link_ms=%.0f mono=%llu "
 	             "vi=%llu/%llu pre=%llu/%llu (%.0fms) fs=%llu/%llu (%.0fms) fo=%llu/%llu layouts=%llu "
 	             "fallback rect_list=%llu mesh=%llu stats=%llu module=%llu library=%llu "
 	             "opt queued=%llu swapped=%llu failed=%llu discarded=%llu opt_ms=%.0f\n",
-	             Common::EnvRead::Gpl(), n(g_gpl.probe_hit), n(g_gpl.probe_miss), n(g_gpl.fast), ms(g_gpl.fast_us),
+	             Common::EnvRead::Gpl(), Common::EnvRead::GplSplit() ? " split=1" : "", n(g_gpl.probe_hit), n(g_gpl.probe_miss), n(g_gpl.fast), ms(g_gpl.fast_us),
 	             ms(g_gpl.link_us), n(g_gpl.mono), n(g_gpl.made[GplVertexInput]), n(g_gpl.hit[GplVertexInput]),
 	             n(g_gpl.made[GplPreRaster]), n(g_gpl.hit[GplPreRaster]), ms(g_gpl.made_us[GplPreRaster]),
 	             n(g_gpl.made[GplFragment]), n(g_gpl.hit[GplFragment]), ms(g_gpl.made_us[GplFragment]),
@@ -810,8 +892,45 @@ void GplDestroyLibraries(GraphicContext& graphics) {
 		graphics.device.destroyPipelineLayout(entry.layout, nullptr);
 		graphics.device.destroyDescriptorSetLayout(entry.set_layout, nullptr);
 	}
+	for (auto& [layout, entry]: cache.templates) {
+		(void)layout;
+		graphics.device.destroyDescriptorUpdateTemplate(entry.update_template, nullptr);
+	}
+	for (auto& [key, layout]: cache.pipeline_layouts) {
+		(void)key;
+		graphics.device.destroyPipelineLayout(layout, nullptr);
+	}
+	for (auto& [key, layout]: cache.set_layouts) {
+		(void)key;
+		graphics.device.destroyDescriptorSetLayout(layout, nullptr);
+	}
 	cache.libraries.clear();
 	cache.layouts.clear();
+	cache.templates.clear();
+	cache.pipeline_layouts.clear();
+	cache.set_layouts.clear();
+}
+
+vk::DescriptorUpdateTemplate GplSetTemplate(GraphicContext& graphics, vk::DescriptorSetLayout layout,
+                                            std::span<const vk::DescriptorUpdateTemplateEntry> entries, uint32_t& bytes) {
+	auto&                 cache = GplLibraries();
+	const std::lock_guard lock(cache.mutex);
+	if (const auto found = cache.templates.find(static_cast<VkDescriptorSetLayout>(layout)); found != cache.templates.end()) {
+		bytes = found->second.bytes;
+		return found->second.update_template;
+	}
+	EXIT_IF(entries.empty());
+	vk::DescriptorUpdateTemplateCreateInfo info {};
+	info.descriptorUpdateEntryCount = static_cast<uint32_t>(entries.size());
+	info.pDescriptorUpdateEntries   = entries.data();
+	info.templateType               = vk::DescriptorUpdateTemplateType::eDescriptorSet;
+	info.descriptorSetLayout        = layout;
+	GplTemplateEntry entry;
+	EXIT_IF(graphics.device.createDescriptorUpdateTemplate(&info, nullptr, &entry.update_template) != vk::Result::eSuccess);
+	entry.bytes = entries.back().offset + entries.back().descriptorCount * entries.back().stride;
+	cache.templates.emplace(static_cast<VkDescriptorSetLayout>(layout), entry);
+	bytes = entry.bytes;
+	return entry.update_template;
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
@@ -1086,18 +1205,53 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		pipeline.uses_bindless |= UsesBindless(*ps_input_info->stage.program);
 		pipeline.uses_image_heap |= ps_input_info->stage.program->info.uses_image_heap;
 	}
-	if (!CreateDescriptorLayout(graphics, pipeline, descriptor_bindings) ||
+	const bool split = Common::EnvRead::GplSplit();
+	pipeline.split   = split;
+	std::vector<vk::DescriptorSetLayoutBinding> vertex_bindings, pixel_bindings;
+	bool                                        vertex_bindless = false, pixel_bindless = false;
+	if (split) {
+		for (const auto& stage: vertex_info) {
+			AddLayoutBindings(vertex_bindings, *stage.stage.program, NativeShaderStage(stage.logical_stage));
+			vertex_bindless |= UsesBindless(*stage.stage.program);
+		}
+		if (ps_active) {
+			AddLayoutBindings(pixel_bindings, *ps_input_info->stage.program, vk::ShaderStageFlagBits::eFragment);
+			pixel_bindless = UsesBindless(*ps_input_info->stage.program);
+		}
+	}
+	if (!CreateDescriptorLayout(graphics, pipeline, descriptor_bindings, split ? vertex_bindings : descriptor_bindings) ||
 	    (background && pipeline.uses_bindless && graphics.bindless_layout == nullptr)) {
 		destroy_rect_list_modules();
 		return;
 	}
-	const vk::PushConstantRange push_constants {graphics_stages, 0,
+	const vk::PushConstantRange push_constants {split ? SplitPushStages(mesh) : graphics_stages, 0,
 	                                            ShaderRecompiler::IR::NativePushConstantSize};
+	pipeline.push_stages = push_constants.stageFlags;
 
-	std::array<vk::DescriptorSetLayout, 2> set_layouts {};
+	std::array<vk::DescriptorSetLayout, 3> set_layouts {};
 	uint32_t                               set_layout_count = 0;
-	FillSetLayouts(graphics, pipeline, set_layouts, set_layout_count);
+	vk::PipelineLayoutCreateFlags          layout_flags {};
+	if (split) {
+		pipeline.pixel_set_layout = GplSharedSetLayout(graphics, pixel_bindings, false);
+		EXIT_IF(pipeline.pixel_set_layout == nullptr);
+		EXIT_IF(pipeline.uses_image_heap);
+		set_layouts[ShaderRecompiler::IR::SplitVertexSet] = pipeline.descriptor_set_layout;
+		set_layouts[ShaderRecompiler::IR::SplitPixelSet]  = pipeline.pixel_set_layout;
+		set_layout_count                                  = 2;
+		if (pipeline.uses_bindless) {
+			EXIT_IF(graphics.bindless_layout == nullptr);
+			set_layouts[ShaderRecompiler::IR::SplitBindlessSet] = graphics.bindless_layout;
+			set_layout_count                                    = 3;
+		}
+		if (graphics.graphics_pipeline_library_enabled) layout_flags = vk::PipelineLayoutCreateFlagBits::eIndependentSetsEXT;
+	} else {
+		std::array<vk::DescriptorSetLayout, 2> merged {};
+		FillSetLayouts(graphics, pipeline, merged, set_layout_count);
+		set_layouts[0] = merged[0];
+		set_layouts[1] = merged[1];
+	}
 	vk::PipelineLayoutCreateInfo pipeline_layout_info {};
+	pipeline_layout_info.flags                  = layout_flags;
 	pipeline_layout_info.setLayoutCount         = set_layout_count;
 	pipeline_layout_info.pSetLayouts            = set_layouts.data();
 	pipeline_layout_info.pushConstantRangeCount = 1;
@@ -1237,8 +1391,29 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 					module_hashes[i] = ModuleContentHash(shader_stages[i].module);
 					modules_known    = modules_known && module_hashes[i].Known();
 				}
-				const auto library_layout =
-				    modules_known ? GplLibraryLayout(graphics, pipeline, descriptor_bindings, push_constants) : GplLayoutEntry {};
+				vk::PipelineLayout pre_layout = nullptr;
+				vk::PipelineLayout fs_layout  = nullptr;
+				if (modules_known && split) {
+					const auto independent = vk::PipelineLayoutCreateFlags(vk::PipelineLayoutCreateFlagBits::eIndependentSetsEXT);
+					const auto vertex_set  = GplSharedSetLayout(graphics, vertex_bindings, pipeline.uses_push_descriptors);
+					const std::array<vk::DescriptorSetLayout, 3> pre_sets {vertex_set, nullptr,
+					                                                       vertex_bindless ? graphics.bindless_layout : nullptr};
+					const std::array<vk::DescriptorSetLayout, 3> fs_sets {nullptr, pipeline.pixel_set_layout,
+					                                                      pixel_bindless ? graphics.bindless_layout : nullptr};
+					if (vertex_set != nullptr) {
+						pre_layout = GplSharedPipelineLayout(
+						    graphics, std::span<const vk::DescriptorSetLayout>(pre_sets.data(), vertex_bindless ? 3u : 1u),
+						    push_constants, independent);
+					}
+					fs_layout = GplSharedPipelineLayout(
+					    graphics, std::span<const vk::DescriptorSetLayout>(fs_sets.data(), pixel_bindless ? 3u : 2u),
+					    push_constants, independent);
+				} else if (modules_known) {
+					pre_layout = fs_layout = GplLibraryLayout(graphics, pipeline, descriptor_bindings, push_constants).layout;
+				}
+				struct {
+					vk::PipelineLayout layout;
+				} library_layout {pre_layout != nullptr && fs_layout != nullptr ? pre_layout : nullptr};
 				if (!modules_known) {
 					g_gpl.fb_module.fetch_add(1, std::memory_order_relaxed);
 				} else if (library_layout.layout == nullptr) {
@@ -1294,7 +1469,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 					vi_builder.Add(input_assembly.topology);
 					vi_builder.Add(input_assembly.primitiveRestartEnable);
 					GplKeyBuilder pre_builder;
-					pre_builder.Add(library_layout.layout);
+					pre_builder.Add(static_cast<VkPipelineLayout>(pre_layout));
 					pre_builder.Add(pre_stage_count);
 					for (uint32_t i = 0; i < pre_stage_count; i++) {
 						pre_builder.Add(shader_stages[i].stage);
@@ -1312,7 +1487,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 					pre_builder.Add(rasterizer.lineWidth);
 					dynamic_key(pre_builder, pre_dynamic);
 					GplKeyBuilder fs_builder;
-					fs_builder.Add(library_layout.layout);
+					fs_builder.Add(static_cast<VkPipelineLayout>(fs_layout));
 					fs_builder.Add(ps_active);
 					fs_builder.Add(ps_active ? module_hashes[shader_stage_count - 1u] : ShaderModuleContentHash {});
 					multisample_key(fs_builder);
@@ -1342,7 +1517,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 						info.pViewportState      = &viewport_state;
 						info.pRasterizationState = &rasterizer;
 						info.pDynamicState       = &pre_dynamic_info;
-						info.layout              = library_layout.layout;
+						info.layout              = pre_layout;
 						return create_library(vk::GraphicsPipelineLibraryFlagBitsEXT::ePreRasterizationShaders, info,
 						                      &shader_rendering);
 					};
@@ -1353,7 +1528,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 						info.pMultisampleState  = &multisampling;
 						info.pDepthStencilState = &library_depth_stencil;
 						info.pDynamicState      = &fs_dynamic_info;
-						info.layout             = library_layout.layout;
+						info.layout             = fs_layout;
 						return create_library(vk::GraphicsPipelineLibraryFlagBitsEXT::eFragmentShader, info, &shader_rendering);
 					};
 					const auto make_fo = [&] {

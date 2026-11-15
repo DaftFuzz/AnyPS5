@@ -62,6 +62,8 @@ inline constexpr const char* Names[] = {
     "KYTY_PERF_F16_CVT_PLAIN",
     // shaders.cpp: graphics pipelines linked from libraries; the emitter marks the vertex position invariant.
     "KYTY_PERF_GPL",
+    // shaders.cpp, descriptors.cpp and the emitter: one descriptor set per graphics stage group.
+    "KYTY_PERF_GPL_SPLIT",
     "KYTY_PERF_INLINE_BY_SIZE",
     "KYTY_PERF_INLINE_MAX_SITES",
     "KYTY_PERF_INLINE_SHARE",

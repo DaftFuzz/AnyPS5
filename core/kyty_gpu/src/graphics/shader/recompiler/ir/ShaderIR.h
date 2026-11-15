@@ -575,6 +575,26 @@ constexpr uint32_t NativePushConstantSize = sizeof(PushData);
 	return static_cast<uint32_t>(kind) + group * BindingGroupStride;
 }
 
+// KYTY_PERF_GPL_SPLIT: the descriptor set of a graphics stage's own bindings (the binding numbers stay NativeBinding's),
+// and of the bindless table. Compute keeps set 0 and BindlessDescriptorSet.
+inline constexpr uint32_t SplitVertexSet   = 0u;
+inline constexpr uint32_t SplitPixelSet    = 1u;
+inline constexpr uint32_t SplitBindlessSet = 2u;
+
+// The binding of an image kind's second view of a covered image slot (a slot whose shader picks the view at run time):
+// its stage group's set, above every NativeBinding (the largest is 4 * BindingGroupStride + 3).
+inline constexpr uint32_t CoverBindingBase   = 256u;
+inline constexpr uint32_t CoverBindingStride = 64u;
+static_assert(4u * BindingGroupStride + 3u < CoverBindingBase && ImageBindingCount <= CoverBindingStride);
+
+[[nodiscard]] constexpr uint32_t NativeCoverBinding(ShaderType stage, DescriptorBindingKind kind) {
+	const uint32_t group = stage == ShaderType::Pixel                    ? 1u
+	                       : stage == ShaderType::TessellationControl    ? 2u
+	                       : stage == ShaderType::TessellationEvaluation ? 3u
+	                                                                     : 0u;
+	return CoverBindingBase + group * CoverBindingStride + (static_cast<uint32_t>(kind) - FirstImageBinding);
+}
+
 [[nodiscard]] constexpr ImageResourceClass ImageBindingResourceClass(DescriptorBindingKind kind) {
 	const auto value = static_cast<uint32_t>(kind);
 	if (value >= FirstImageBinding && value < FirstStorageImageBinding) {

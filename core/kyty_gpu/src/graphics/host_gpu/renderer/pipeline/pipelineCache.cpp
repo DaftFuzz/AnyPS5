@@ -3542,7 +3542,9 @@ void PipelineCache::SwapGplPipelines(CommandScheduler& scheduler) {
 		const bool same = made.pipeline != nullptr && made.pipeline_layout != nullptr && made.descriptor_set_layout != nullptr &&
 		                  made.gpl == nullptr && made.uses_bindless == p->uses_bindless &&
 		                  made.uses_push_descriptors == p->uses_push_descriptors && made.uses_image_heap == p->uses_image_heap &&
-		                  made.color_count == p->color_count && made.cull_dynamic == p->cull_dynamic;
+		                  made.color_count == p->color_count && made.cull_dynamic == p->cull_dynamic &&
+		                  made.split == p->split && made.pixel_set_layout == p->pixel_set_layout &&
+		                  made.push_stages == p->push_stages;
 		if (same) {
 			retired.push_back({p->pipeline, p->pipeline_layout, p->descriptor_set_layout, p->push_template});
 			{
