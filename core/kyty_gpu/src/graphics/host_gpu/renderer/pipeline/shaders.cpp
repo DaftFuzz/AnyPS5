@@ -606,6 +606,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	const bool with_depth = rendering.depth_format != vk::Format::eUndefined ||
 	                        rendering.stencil_format != vk::Format::eUndefined;
 	EXIT_IF(!vs_input_info.stage);
+	pipeline.color_count  = rendering.color_count;
+	pipeline.cull_dynamic = SharedPipelineState(graphics);
 	// A background compile (shaderPrecompile.h) gives up where the GPU thread exits: what it created is destroyed
 	// (the caller destroys the layouts and pipeline left in `pipeline`). It checks the state first
 	// (GraphicsPipelineUnsupported); the driver calls can still fail.
@@ -924,6 +926,10 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 #endif
 	if (graphics.attachment_feedback_loop_enabled) {
 		dynamic_states.push_back(vk::DynamicState::eAttachmentFeedbackLoopEnableEXT);
+	}
+	if (pipeline.cull_dynamic) {
+		dynamic_states.push_back(vk::DynamicState::eCullMode);
+		dynamic_states.push_back(vk::DynamicState::eFrontFace);
 	}
 
 	vk::PipelineDynamicStateCreateInfo dynamic_state {};

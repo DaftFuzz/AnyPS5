@@ -22,6 +22,7 @@
 #include <type_traits>
 #include <unordered_map>
 #include <thread>
+#include <vector>
 
 namespace Common {
 class Mutex;
@@ -200,6 +201,8 @@ public:
 		mutable vk::DescriptorUpdateTemplate push_template       = nullptr;
 		mutable uint32_t                     push_template_bytes = 0;
 		bool                    uses_image_heap       = false;
+		uint32_t                color_count           = 0;
+		bool                    cull_dynamic          = false;
 		// EvictIdlePipelines: the presented frame of the last lookup that returned this pipeline. An idle pipeline's
 		// Vulkan objects are destroyed (pipeline == nullptr) and the next lookup creates them again from the same inputs.
 		uint32_t                last_used             = 0;
@@ -387,6 +390,18 @@ private:
 	std::shared_ptr<PrecompileWarmList> m_warm;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
+	bool m_share_attachments = false;
+	std::unordered_map<GraphicsPipelineKey, GraphicsPipelineKey, GraphicsPipelineKeyHash>              m_shared_keys;
+	std::unordered_map<GraphicsPipelineKey, std::vector<GraphicsPipelineKey>, GraphicsPipelineKeyHash> m_share_groups;
+	struct ShareStats {
+		uint64_t alias_hits = 0, session_shared = 0, journal_chosen = 0, created = 0;
+		std::chrono::steady_clock::time_point window {};
+	} m_share_stats;
+	[[nodiscard]] static GraphicsPipelineKey ShareRest(const GraphicsPipelineKey& key);
+	Pipeline* FindSharedPipeline(const GraphicsPipelineKey& key, std::span<const ShaderVertexInputInfo> vertex_info,
+	                             const ShaderPixelInputInfo* ps_input_info, const GraphicsPrograms& programs);
+	void      NoteSharedPipeline(const GraphicsPipelineKey& key);
+	void      ReportShare();
 	// N5.1: every change of m_graphics_pipelines and m_table_pending (the execution thread) holds it exclusively; a resolve
 	// helper's FindGraphicsPipeline holds it shared. The execution thread's own reads need no lock (it is the only writer).
 	mutable std::shared_mutex m_pipelines_mutex;
@@ -434,6 +449,15 @@ private:
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
+
+[[nodiscard]] bool SharedPipelineState(const GraphicContext& graphics);
+void               ClearAttachmentSet(PipelineRenderingState& rendering, PipelineStaticParameters& static_params);
+void               ClearDynamicCull(PipelineStaticParameters& static_params);
+[[nodiscard]] uint32_t AttachmentSetSlots(const PipelineRenderingState& rendering);
+[[nodiscard]] bool AttachmentSetCovers(const PipelineRenderingState& cover_rendering, const PipelineStaticParameters& cover_static,
+                                       const PipelineRenderingState& rendering, const PipelineStaticParameters& static_params);
+void CopyAttachmentSet(const PipelineRenderingState& from_rendering, const PipelineStaticParameters& from_static,
+                       PipelineRenderingState& to_rendering, PipelineStaticParameters& to_static);
 
 // The SPIR-V profile of this device's shader compiles (upstream 460a196fc, 286481889). Every compile of a program uses
 // it: ProgramCache::Get, and the background compiles of KYTY_SHADER_PRECOMPILE, whose modules the GPU thread reuses.

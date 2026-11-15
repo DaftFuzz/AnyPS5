@@ -312,6 +312,7 @@ public:
 	void Record(const PrecompileStageRecord& record);
 	// GPU thread, after it created a graphics pipeline from recorded stages: appended unless already recorded.
 	void RecordPipeline(const PrecompileGraphicsRecord& record);
+	[[nodiscard]] bool CoveringRecord(const PrecompileGraphicsRecord& wanted, PrecompileGraphicsRecord& out) const;
 
 	void EnqueueRuntime(PrecompileStageRecord record);
 	void EnqueueFirstUse(PrecompileStageRecord record, uint64_t shader_base, uint64_t program);
@@ -419,6 +420,9 @@ private:
 	std::condition_variable                m_done; // a job or a stage compile finished
 	std::vector<PrecompileStageRecord>     m_compute_records;  // the compute journal's records (fixed once loaded)
 	std::vector<PrecompileGraphicsRecord>  m_graphics_records; // the graphics journal's pipelines (fixed once loaded)
+	bool                                                    m_share = false;
+	std::unordered_map<uint64_t, std::vector<uint32_t>>     m_share_index;
+	std::vector<uint8_t>                                    m_share_ok;
 	std::unordered_map<uint64_t, Stage>    m_stages;           // the graphics journal's stages (fixed once loaded)
 	std::vector<uint64_t>                  m_stage_order;      // their keys in file order
 	std::vector<Job>                       m_jobs; // fixed once workers start

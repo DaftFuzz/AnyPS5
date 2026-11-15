@@ -63,6 +63,7 @@ inline constexpr const char* Names[] = {
     "KYTY_PERF_INLINE_BY_SIZE",
     "KYTY_PERF_INLINE_MAX_SITES",
     "KYTY_PERF_INLINE_SHARE",
+    "KYTY_PERF_SHARE_ATTACHMENT_SETS",
     "KYTY_PERF_SPIRV_STORE_OUTLINE",
     "KYTY_PERF_SRT_GPU_WORDS",
     // pipelineCache.cpp: the driver cache's signature (the warm list file is dropped with it).
@@ -117,6 +118,7 @@ inline constexpr const char* OutputOnlyNames[] = {
     "KYTY_TRACE_INDIRECT_IMAGE",
     "KYTY_TRACE_PERF",
     "KYTY_TRACE_PERMUTATIONS",
+    "KYTY_TRACE_REUSE_MISS_LINES",
     "KYTY_TRACE_SHADER_CODE_DIR",
     "KYTY_TRACE_SHADER_STAGES",
     "KYTY_TRACE_SPIRV_ALL_DIR",

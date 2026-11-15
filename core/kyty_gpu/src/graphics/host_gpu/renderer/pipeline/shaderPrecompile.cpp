@@ -2215,6 +2215,43 @@ void ShaderPrecompiler::NullSlotReplay(std::vector<Job>& jobs) {
 	std::fflush(stderr);
 }
 
+static PrecompileGraphicsRecord ShareRestRecord(const PrecompileGraphicsRecord& record) {
+	PrecompileGraphicsRecord rest = record;
+	ClearAttachmentSet(rest.rendering, rest.static_params);
+	rest.revision = 0;
+	return rest;
+}
+
+static bool SameShareRest(const PrecompileGraphicsRecord& a, const PrecompileGraphicsRecord& b) {
+	const auto x = ShareRestRecord(a);
+	const auto y = ShareRestRecord(b);
+	return x.vertex == y.vertex && x.pixel == y.pixel && x.rendering == y.rendering && x.vertex_input == y.vertex_input &&
+	       x.static_params == y.static_params;
+}
+
+bool ShaderPrecompiler::CoveringRecord(const PrecompileGraphicsRecord& wanted, PrecompileGraphicsRecord& out) const {
+	if (!m_share) return false;
+	const auto found = m_share_index.find(ShareRestRecord(wanted).Key());
+	if (found == m_share_index.end()) return false;
+	const PrecompileGraphicsRecord* best       = nullptr;
+	uint32_t                        best_slots = 0;
+	for (const auto index: found->second) {
+		const auto& candidate = m_graphics_records[index];
+		if (m_share_ok[index] == 0u || !SameShareRest(candidate, wanted) ||
+		    !AttachmentSetCovers(candidate.rendering, candidate.static_params, wanted.rendering, wanted.static_params)) {
+			continue;
+		}
+		const uint32_t slots = AttachmentSetSlots(candidate.rendering);
+		if (best == nullptr || slots > best_slots) {
+			best       = &candidate;
+			best_slots = slots;
+		}
+	}
+	if (best == nullptr) return false;
+	out = *best;
+	return true;
+}
+
 void ShaderPrecompiler::LoadGraphics(const std::unordered_set<uint64_t>& skipped, std::vector<Job>& jobs,
                                      std::vector<Job>& stage_jobs) {
 	const auto bytes        = ReadFileBytes(m_graphics_journal_path);
@@ -2271,7 +2308,9 @@ void ShaderPrecompiler::LoadGraphics(const std::unordered_set<uint64_t>& skipped
 	size_t suspects   = 0;
 	size_t warm       = 0;
 	size_t filtered   = 0;
+	m_share           = SharedPipelineState(m_graphics);
 	for (auto& record: pipelines) {
+		if (m_share) ClearDynamicCull(record.static_params);
 		const auto key      = record.Key();
 		bool       resolved = true;
 		bool       suspect  = skipped.contains(key);
@@ -2310,6 +2349,43 @@ void ShaderPrecompiler::LoadGraphics(const std::unordered_set<uint64_t>& skipped
 		}
 		jobs.push_back(job);
 		m_graphics_records.push_back(record);
+		m_share_ok.push_back(suspect ? 0u : 1u);
+	}
+	size_t covered = 0;
+	if (m_share) {
+		for (uint32_t i = 0; i < m_graphics_records.size(); i++) {
+			m_share_index[ShareRestRecord(m_graphics_records[i]).Key()].push_back(i);
+		}
+		for (const auto& [rest, members]: m_share_index) {
+			(void)rest;
+			for (const auto i: members) {
+				auto& job = jobs[i];
+				if (job.state != JobState::Queued || job.warm) continue;
+				const auto& record = m_graphics_records[i];
+				for (const auto j: members) {
+					const auto& cover = m_graphics_records[j];
+					if (j == i || m_share_ok[j] == 0u || !SameShareRest(cover, record) ||
+					    !AttachmentSetCovers(cover.rendering, cover.static_params, record.rendering, record.static_params)) {
+						continue;
+					}
+					job.state = JobState::Dropped;
+					ForEachStage(record, [&](uint64_t stage) { m_stages[stage].users--; });
+					if (covered < 32u && Common::EnvRead::PerfLines()) {
+						std::fprintf(stderr,
+						             "SHADER_PRECOMPILE share_covered vs=0x%016llx ps=0x%016llx slots=%u cover_slots=%u\n",
+						             static_cast<unsigned long long>(m_stages.at(record.vertex[0]).record.shader_hash),
+						             static_cast<unsigned long long>(record.pixel != 0 ? m_stages.at(record.pixel).record.shader_hash : 0u),
+						             AttachmentSetSlots(record.rendering), AttachmentSetSlots(cover.rendering));
+					}
+					covered++;
+					break;
+				}
+			}
+		}
+		std::fprintf(stderr,
+		             "SHADER_PRECOMPILE share_attachment_sets: %zu graphics pipelines left out (another record's attachment set "
+		             "covers theirs), %zu share groups\n",
+		             covered, m_share_index.size());
 	}
 	// The stages no queued job uses (no recorded pipeline names them: a table-mode pipeline no draw took, or one recorded
 	// under an older stage key); the shader reuse compiles them for the store, in the journal's order
@@ -3484,8 +3560,14 @@ bool ShaderPrecompiler::TakeReusedCompile(uint64_t key, const PrecompileReuseIde
 	const auto reason = taken.has_value() ? ReuseMiss::Differs : ReuseMissReason(key, queued_dropped);
 	g_reuse.misses[static_cast<uint32_t>(reason)].fetch_add(1, std::memory_order_relaxed);
 	// Which permutations the GPU thread translates itself every session, and why (the first 256; a few dozen a session).
-	static std::atomic_uint logged {0};
-	if (logged.fetch_add(1, std::memory_order_relaxed) < 256u) {
+	static const uint64_t miss_lines = [] {
+		if (const char* value = Common::ShaderEnv::Read("KYTY_TRACE_REUSE_MISS_LINES"); value != nullptr && value[0] != '\0') {
+			return static_cast<uint64_t>(std::strtoull(value, nullptr, 10));
+		}
+		return Common::EnvRead::PerfLines() ? std::numeric_limits<uint64_t>::max() : uint64_t {256};
+	}();
+	static std::atomic<uint64_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < miss_lines) {
 		static constexpr const char* Names[] = {"unrecorded", "pending", "dropped", "differs"};
 		std::fprintf(stderr, "SHADER_REUSE_MISS hash=0x%016" PRIx64 " stage=%u key=0x%016" PRIx64 " push=%u reason=%s\n",
 		             identity.shader_hash, static_cast<unsigned>(identity.stage), key, push_data_start,

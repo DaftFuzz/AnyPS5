@@ -30,8 +30,6 @@
 	X(vkCmdWaitEvents2) \
 	X(vkCmdBlitImage2) \
 	X(vkCmdResolveImage2) \
-	X(vkCmdSetCullMode) \
-	X(vkCmdSetFrontFace) \
 	X(vkCmdSetPrimitiveTopology) \
 	X(vkCmdSetRasterizerDiscardEnable) \
 	X(vkCmdSetPrimitiveRestartEnable) \

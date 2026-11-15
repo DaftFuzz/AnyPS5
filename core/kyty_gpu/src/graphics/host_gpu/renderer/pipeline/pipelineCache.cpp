@@ -2,6 +2,7 @@
 #include "graphics/host_gpu/renderer/perfCounters.h"
 #include "graphics/guest_gpu/chunkCensus.h"
 #include "graphics/guest_gpu/chunkLead.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCacheTrace.h"
 #include "graphics/host_gpu/translatorGuard.h"
@@ -557,7 +558,173 @@ bool ReuseLdsStorage(const InputInfo& input_info) {
 	}
 }
 
+struct PermutationDiff {
+	std::vector<const char*> fields;
+	std::string              slots;
+
+	void Add(const char* field) {
+		if (std::find(fields.begin(), fields.end(), field) == fields.end()) fields.push_back(field);
+	}
+	void Slot(const char* kind, size_t index) {
+		if (slots.size() >= 160) return;
+		slots += fmt::format("{}{}{}", slots.empty() ? "" : ",", kind, index);
+	}
+	[[nodiscard]] std::string Text() const {
+		std::string out;
+		for (const char* field: fields) {
+			if (!out.empty()) out += ',';
+			out += field;
+		}
+		return out.empty() ? std::string("none") : out;
+	}
+};
+
+void DiffSpecialization(const ShaderRecompiler::IR::ResourceSpecialization& a,
+                        const ShaderRecompiler::IR::ResourceSpecialization& b, PermutationDiff& diff) {
+	if (a.buffers.size() != b.buffers.size()) diff.Add("buffer_count");
+	if (a.images.size() != b.images.size()) diff.Add("image_count");
+	if (a.samplers.size() != b.samplers.size()) diff.Add("sampler_count");
+	for (size_t i = 0; i < std::min(a.buffers.size(), b.buffers.size()); i++) {
+		const auto& x = a.buffers[i];
+		const auto& y = b.buffers[i];
+		if (x == y) continue;
+		diff.Slot("buf", i);
+		if (x.packed_stride != y.packed_stride) diff.Add("buf_stride");
+		if (x.descriptor_format != y.descriptor_format) diff.Add("buf_format");
+		if (x.descriptor_swizzle != y.descriptor_swizzle) diff.Add("buf_swizzle");
+		if (x.zero_stride_oob != y.zero_stride_oob) diff.Add("buf_oob");
+		if (x.scalar_empty != y.scalar_empty) diff.Add("buf_scalar_empty");
+		if (x.indirect_root != y.indirect_root || x.indirect_mapping_offset != y.indirect_mapping_offset ||
+		    x.indirect_search_iterations != y.indirect_search_iterations) {
+			diff.Add("buf_indirect");
+		}
+	}
+	for (size_t i = 0; i < std::min(a.images.size(), b.images.size()); i++) {
+		const auto& x = a.images[i];
+		const auto& y = b.images[i];
+		if (x == y) continue;
+		diff.Slot("img", i);
+		if (x.numeric_class != y.numeric_class) diff.Add("img_class");
+		if (x.dimension != y.dimension) diff.Add("img_dim");
+		if (x.mip_count != y.mip_count) diff.Add("img_mips");
+		if (x.conversion_format != y.conversion_format) diff.Add("img_conversion");
+		if (x.shader_swizzle != y.shader_swizzle) diff.Add("img_swizzle");
+		if (x.indirect_root != y.indirect_root || x.indirect_mapping_offset != y.indirect_mapping_offset ||
+		    x.indirect_search_iterations != y.indirect_search_iterations) {
+			diff.Add("img_indirect");
+		}
+		if (x.cube != y.cube) diff.Add("img_cube");
+		if (x.fmask != y.fmask) diff.Add("img_fmask");
+		if (x.bindless != y.bindless || x.bindless_stride_dwords != y.bindless_stride_dwords) diff.Add("img_bindless");
+		if (x.heap != y.heap) diff.Add("img_heap");
+	}
+	for (size_t i = 0; i < std::min(a.samplers.size(), b.samplers.size()); i++) {
+		if (a.samplers[i] == b.samplers[i]) continue;
+		diff.Slot("smp", i);
+		diff.Add("smp_indirect");
+	}
+}
+
 } // namespace
+
+bool SharedPipelineState(const GraphicContext& graphics) {
+	return graphics.unused_attachments_enabled && Common::EnvRead::ShareAttachmentSets();
+}
+
+void ClearAttachmentSet(PipelineRenderingState& rendering, PipelineStaticParameters& static_params) {
+	rendering.color_formats = {};
+	rendering.color_count   = 0;
+	std::fill(std::begin(static_params.color_mask), std::end(static_params.color_mask), 0u);
+	std::fill(std::begin(static_params.color_srcblend), std::end(static_params.color_srcblend), uint8_t {0});
+	std::fill(std::begin(static_params.color_comb_fcn), std::end(static_params.color_comb_fcn), uint8_t {0});
+	std::fill(std::begin(static_params.color_destblend), std::end(static_params.color_destblend), uint8_t {0});
+	std::fill(std::begin(static_params.alpha_srcblend), std::end(static_params.alpha_srcblend), uint8_t {0});
+	std::fill(std::begin(static_params.alpha_comb_fcn), std::end(static_params.alpha_comb_fcn), uint8_t {0});
+	std::fill(std::begin(static_params.alpha_destblend), std::end(static_params.alpha_destblend), uint8_t {0});
+	std::fill(std::begin(static_params.separate_alpha_blend), std::end(static_params.separate_alpha_blend), false);
+	std::fill(std::begin(static_params.blend_enable), std::end(static_params.blend_enable), false);
+}
+
+void ClearDynamicCull(PipelineStaticParameters& static_params) {
+	static_params.cull_front = false;
+	static_params.cull_back  = false;
+	static_params.face       = false;
+}
+
+uint32_t AttachmentSetSlots(const PipelineRenderingState& rendering) {
+	uint32_t slots = 0;
+	for (uint32_t i = 0; i < std::min<uint32_t>(rendering.color_count, RENDER_COLOR_ATTACHMENTS_MAX); i++) {
+		if (rendering.color_formats[i] != vk::Format::eUndefined) slots++;
+	}
+	return slots;
+}
+
+namespace {
+
+bool SlotPresent(const PipelineRenderingState& rendering, uint32_t slot) {
+	return slot < rendering.color_count && rendering.color_formats[slot] != vk::Format::eUndefined;
+}
+
+bool SlotStateEqual(const PipelineStaticParameters& a, const PipelineStaticParameters& b, uint32_t slot) {
+	return a.color_mask[slot] == b.color_mask[slot] && a.blend_enable[slot] == b.blend_enable[slot] &&
+	       a.color_srcblend[slot] == b.color_srcblend[slot] && a.color_comb_fcn[slot] == b.color_comb_fcn[slot] &&
+	       a.color_destblend[slot] == b.color_destblend[slot] && a.alpha_srcblend[slot] == b.alpha_srcblend[slot] &&
+	       a.alpha_comb_fcn[slot] == b.alpha_comb_fcn[slot] && a.alpha_destblend[slot] == b.alpha_destblend[slot] &&
+	       a.separate_alpha_blend[slot] == b.separate_alpha_blend[slot];
+}
+
+bool SlotStateEmpty(const PipelineStaticParameters& s, uint32_t slot) {
+	return s.color_mask[slot] == 0 && !s.blend_enable[slot] && s.color_srcblend[slot] == 0 && s.color_comb_fcn[slot] == 0 &&
+	       s.color_destblend[slot] == 0 && s.alpha_srcblend[slot] == 0 && s.alpha_comb_fcn[slot] == 0 &&
+	       s.alpha_destblend[slot] == 0 && !s.separate_alpha_blend[slot];
+}
+
+} // namespace
+
+bool AttachmentSetCovers(const PipelineRenderingState& cover_rendering, const PipelineStaticParameters& cover_static,
+                         const PipelineRenderingState& rendering, const PipelineStaticParameters& static_params) {
+	if (rendering.color_count > RENDER_COLOR_ATTACHMENTS_MAX || cover_rendering.color_count > RENDER_COLOR_ATTACHMENTS_MAX) {
+		return false;
+	}
+	uint32_t present = 0;
+	bool     extra   = false;
+	for (uint32_t i = 0; i < RENDER_COLOR_ATTACHMENTS_MAX; i++) {
+		const bool in_set   = SlotPresent(rendering, i);
+		const bool in_cover = SlotPresent(cover_rendering, i);
+		if (!in_set) {
+			if (!SlotStateEmpty(static_params, i)) return false;
+			extra = extra || in_cover;
+			continue;
+		}
+		present++;
+		if (!in_cover || cover_rendering.color_formats[i] != rendering.color_formats[i] ||
+		    !SlotStateEqual(cover_static, static_params, i)) {
+			return false;
+		}
+	}
+	if (present == 0 || !extra) return false;
+	if ((static_params.alpha_to_coverage_enable || cover_static.alpha_to_coverage_enable) &&
+	    SlotPresent(rendering, 0) != SlotPresent(cover_rendering, 0)) {
+		return false;
+	}
+	return true;
+}
+
+void CopyAttachmentSet(const PipelineRenderingState& from_rendering, const PipelineStaticParameters& from_static,
+                       PipelineRenderingState& to_rendering, PipelineStaticParameters& to_static) {
+	to_rendering.color_formats = from_rendering.color_formats;
+	to_rendering.color_count   = from_rendering.color_count;
+	std::copy(std::begin(from_static.color_mask), std::end(from_static.color_mask), std::begin(to_static.color_mask));
+	std::copy(std::begin(from_static.color_srcblend), std::end(from_static.color_srcblend), std::begin(to_static.color_srcblend));
+	std::copy(std::begin(from_static.color_comb_fcn), std::end(from_static.color_comb_fcn), std::begin(to_static.color_comb_fcn));
+	std::copy(std::begin(from_static.color_destblend), std::end(from_static.color_destblend), std::begin(to_static.color_destblend));
+	std::copy(std::begin(from_static.alpha_srcblend), std::end(from_static.alpha_srcblend), std::begin(to_static.alpha_srcblend));
+	std::copy(std::begin(from_static.alpha_comb_fcn), std::end(from_static.alpha_comb_fcn), std::begin(to_static.alpha_comb_fcn));
+	std::copy(std::begin(from_static.alpha_destblend), std::end(from_static.alpha_destblend), std::begin(to_static.alpha_destblend));
+	std::copy(std::begin(from_static.separate_alpha_blend), std::end(from_static.separate_alpha_blend),
+	          std::begin(to_static.separate_alpha_blend));
+	std::copy(std::begin(from_static.blend_enable), std::end(from_static.blend_enable), std::begin(to_static.blend_enable));
+}
 
 std::size_t PipelineCache::GraphicsPipelineKeyHash::operator()(const GraphicsPipelineKey& key) const {
 	std::size_t hash = 0;
@@ -1073,6 +1240,8 @@ struct PipelineCache::ProgramCache {
 		if (std::FILE* f = Common::EnvRead::ShaderStagesFile()) { std::fprintf(f, "STAGE compile 0x%016llx\n", static_cast<unsigned long long>(options.shader_hash)); std::fclose(f); }
 		PipelineTrace::TracePermutation(options.shader_hash, LastSpecialization(entry->second.permutations),
 		                                entry->second.permutations.size(), entry->second.specialization);
+		NotePermutationRepeat(stage_name, entry->first, entry->second, push_data_cursor);
+		GuestGpu::NoteCompileDepth("stage", params.hash);
 		// KYTY_SHADER_PRECOMPILE: a background compile of this compute permutation is waited for (its driver pipeline
 		// is then cached); one not started yet is left to this thread. A graphics permutation is recorded for the
 		// background compiles of the pipelines made from it (KYTY_SHADER_PRECOMPILE_GRAPHICS).
@@ -1430,6 +1599,54 @@ struct PipelineCache::ProgramCache {
 		return true;
 	}
 
+	void NotePermutationRepeat(const char* stage_name, const ProgramKey& key, const SourceEntry& current,
+	                           uint32_t push_data_cursor) const {
+		if (!PerfEnabled()) return;
+		size_t         earlier       = 0;
+		size_t         program_count = 0;
+		size_t         best_fields   = SIZE_MAX;
+		bool           best_same     = false;
+		PermutationDiff best;
+		const auto     function_code = current.FunctionCode();
+		for (const auto& [other_key, source]: programs) {
+			if (other_key.stage != key.stage || other_key.hash != key.hash) continue;
+			program_count++;
+			const bool same_program = &source == &current;
+			for (const auto& permutation: source.permutations) {
+				earlier++;
+				PermutationDiff diff;
+				if (!same_program) {
+					if (other_key.user_data_count != key.user_data_count) diff.Add("user_data_count");
+					if (other_key.code_size != key.code_size) diff.Add("code_size");
+					if (other_key.static_state != key.static_state) {
+						diff.Add("static_key");
+						const size_t words = std::max(other_key.static_state.size(), key.static_state.size());
+						for (size_t i = 0; i < words; i++) {
+							const bool differs = i >= other_key.static_state.size() || i >= key.static_state.size() ||
+							                     other_key.static_state[i] != key.static_state[i];
+							if (differs) diff.Slot("sk", i);
+						}
+					}
+				}
+				if (!permutation.program.bindings.PushStartMatches(push_data_cursor)) diff.Add("push_start");
+				if (current.call_source && !std::ranges::equal(permutation.function_code, function_code)) {
+					diff.Add("function_code");
+				}
+				DiffSpecialization(permutation.specialization, current.specialization, diff);
+				const size_t fields = diff.fields.size();
+				if (fields < best_fields) {
+					best_fields = fields;
+					best_same   = same_program;
+					best        = std::move(diff);
+				}
+			}
+		}
+		if (earlier == 0) return;
+		std::fprintf(stderr, "PERMUTATION_REPEAT stage=%s hash=0x%016llx earlier=%zu programs=%zu same_program=%d diff=%s slots=%s\n",
+		             stage_name, static_cast<unsigned long long>(key.hash), earlier, program_count, best_same ? 1 : 0,
+		             best.Text().c_str(), best.slots.empty() ? "-" : best.slots.c_str());
+	}
+
 	ProgramCache(GraphicContext& graphics, ShaderRecompiler::IR::ImageHeapSource* image_heap)
 	    : device(graphics.device), graphics(graphics), image_heap(image_heap), profile(ShaderCompileProfile(graphics)) {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
@@ -1579,6 +1796,7 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
                              ShaderRecompiler::IR::ImageHeapSource* image_heap)
     : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics, image_heap)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	m_share_attachments = SharedPipelineState(m_graphics);
 	InitializeDriverCache();
 	if (m_driver_cache != nullptr && ShaderPrecompiler::Enabled()) {
 		// KYTY_PERF_BINDLESS_CLASSES changes how many image resources a shader has (a resource per table field): a
@@ -1607,17 +1825,22 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
 		}
 		const bool precompile_only = Config::PrecompileOnly();
 		const auto hints = precompile_only ? Config::GetPrecompileImportHints() : HintsEnvPath("KYTY_SHADER_HINTS_IMPORT");
-		if (!hints.empty()) {
-			// --import-hints: the records found are added to the journals before the precompiler loads them.
+		std::vector<std::filesystem::path> hint_files;
+		for (std::string all = hints.string(); !all.empty();) {
+			const auto end = all.find(';');
+			if (auto item = all.substr(0, end); !item.empty()) hint_files.emplace_back(item);
+			all = end == std::string::npos ? std::string() : all.substr(end + 1);
+		}
+		const auto game_dir = precompile_only ? Config::GetGameDir() : HintsGameDir();
+		for (const auto& file: hint_files) {
 			std::string summary;
-			const auto  game_dir = precompile_only ? Config::GetGameDir() : HintsGameDir();
-			m_hints_failed = !PrecompileHintsImport(m_graphics, hints, game_dir, journal, graphics_journal, summary,
-			                                        HintsAnyVersion());
-			m_hints_line   = fmt::format("PRECOMPILE_HINTS kind=import status={} {}", m_hints_failed ? "failed" : "ok",
-			                             summary);
+			const bool  failed = !PrecompileHintsImport(m_graphics, file, game_dir, journal, graphics_journal, summary,
+			                                            HintsAnyVersion());
+			m_hints_failed     = m_hints_failed || failed;
+			const auto line    = fmt::format("PRECOMPILE_HINTS kind=import status={} {}", failed ? "failed" : "ok", summary);
+			m_hints_line       = m_hints_line.empty() ? line : m_hints_line + "; " + line;
 			if (!precompile_only) {
-				std::fprintf(stderr, "%s file=%s game_dir=%s\n", m_hints_line.c_str(), hints.string().c_str(),
-				             game_dir.string().c_str());
+				std::fprintf(stderr, "%s file=%s game_dir=%s\n", line.c_str(), file.string().c_str(), game_dir.string().c_str());
 				std::fflush(stderr);
 			}
 		}
@@ -1636,8 +1859,14 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
 }
 
 void PipelineCache::ExportHints(const char* when) {
-	const auto out = HintsEnvPath("KYTY_SHADER_HINTS_EXPORT");
-	if (out.empty() || m_hints_journal.empty()) return;
+	auto out = HintsEnvPath("KYTY_SHADER_HINTS_EXPORT");
+	if (m_hints_journal.empty() || out == std::filesystem::path("0")) return;
+	if (out.empty()) {
+		if (std::strcmp(when, "shutdown") != 0) return;
+		out = m_hints_journal;
+		out.replace_extension();
+		out.replace_extension(".kyhints");
+	}
 	std::string summary;
 	const bool  ok = PrecompileHintsExport(m_hints_journal, m_hints_graphics_journal, out, summary);
 	std::fprintf(stderr, "PRECOMPILE_HINTS kind=export when=%s status=%s %s file=%s\n", when, ok ? "ok" : "failed",
@@ -2671,7 +2900,85 @@ std::pair<PipelineCache::Pipeline*, PipelineCache::PipelineFind> PipelineCache::
 		const auto& job = *pending->second;
 		return {nullptr, job.done.load(std::memory_order_acquire) && !job.failed ? PipelineFind::PendingDone : PipelineFind::Pending};
 	}
+	if (m_share_attachments) {
+		if (auto alias = m_shared_keys.find(key); alias != m_shared_keys.end()) {
+			if (auto iter = m_graphics_pipelines.find(alias->second); iter != m_graphics_pipelines.end()) {
+				auto* found = iter->second.get();
+				if (!read_object) return {found, PipelineFind::Found};
+				return {found, found->pipeline != nullptr ? PipelineFind::Found : PipelineFind::Evicted};
+			}
+		}
+	}
 	return {nullptr, PipelineFind::Missing};
+}
+
+PipelineCache::GraphicsPipelineKey PipelineCache::ShareRest(const GraphicsPipelineKey& key) {
+	GraphicsPipelineKey rest = key;
+	ClearAttachmentSet(rest.rendering, rest.static_params);
+	return rest;
+}
+
+void PipelineCache::NoteSharedPipeline(const GraphicsPipelineKey& key) {
+	if (!m_share_attachments || AttachmentSetSlots(key.rendering) == 0) return;
+	m_share_groups[ShareRest(key)].push_back(key);
+	m_share_stats.created++;
+}
+
+PipelineCache::Pipeline* PipelineCache::FindSharedPipeline(const GraphicsPipelineKey& key,
+                                                           std::span<const ShaderVertexInputInfo> vertex_info,
+                                                           const ShaderPixelInputInfo* ps_input_info,
+                                                           const GraphicsPrograms& programs) {
+	if (!m_share_attachments) return nullptr;
+	GraphicsPipelineKey cover;
+	if (auto alias = m_shared_keys.find(key); alias != m_shared_keys.end()) {
+		cover = alias->second;
+		m_share_stats.alias_hits++;
+	} else {
+		const auto group = m_share_groups.find(ShareRest(key));
+		if (group == m_share_groups.end()) return nullptr;
+		const GraphicsPipelineKey* best       = nullptr;
+		uint32_t                   best_slots = 0;
+		for (const auto& candidate: group->second) {
+			if (!AttachmentSetCovers(candidate.rendering, candidate.static_params, key.rendering, key.static_params)) continue;
+			const uint32_t slots = AttachmentSetSlots(candidate.rendering);
+			if (best == nullptr || slots > best_slots) {
+				best       = &candidate;
+				best_slots = slots;
+			}
+		}
+		if (best == nullptr) return nullptr;
+		cover = *best;
+		{
+			const std::unique_lock pipelines_lock(m_pipelines_mutex);
+			m_shared_keys.emplace(key, cover);
+		}
+		m_share_stats.session_shared++;
+	}
+	const auto iter = m_graphics_pipelines.find(cover);
+	if (iter == m_graphics_pipelines.end()) return nullptr;
+	auto& found     = *iter->second;
+	found.last_used = static_cast<uint32_t>(DebugPresentCount().load());
+	if (found.pipeline == nullptr) RecreateGraphicsPipeline(found, iter->first, vertex_info, ps_input_info, programs);
+	ReportShare();
+	return &found;
+}
+
+void PipelineCache::ReportShare() {
+	if (!PerfEnabled()) return;
+	auto&      s   = m_share_stats;
+	const auto now = std::chrono::steady_clock::now();
+	if (s.window == std::chrono::steady_clock::time_point {}) {
+		s.window = now;
+		return;
+	}
+	if (now - s.window < std::chrono::seconds(10)) return;
+	s.window = now;
+	std::fprintf(stderr,
+	             "PERF share_attachment_sets alias_hits=%llu session_shared=%llu journal_chosen=%llu created=%llu aliases=%zu "
+	             "groups=%zu\n",
+	             static_cast<unsigned long long>(s.alias_hits), static_cast<unsigned long long>(s.session_shared),
+	             static_cast<unsigned long long>(s.journal_chosen), static_cast<unsigned long long>(s.created),
+	             m_shared_keys.size(), m_share_groups.size());
 }
 
 // N5.1 (translatorGuard.h): soft fails of the key for the plan's builder.
@@ -2841,6 +3148,7 @@ PipelineCache::GraphicsPipelineKey PipelineCache::MakeGraphicsPipelineKeyFrom(
 	static_params.provoking_vtx_last = mc.provoking_vtx_last;
 	static_params.polygon_mode =
 	    ResolvePolygonMode(mc, static_params.cull_front, static_params.cull_back);
+	if (m_share_attachments) ClearDynamicCull(static_params);
 
 	if (vs_input_info.stage.program->stage != ShaderType::Mesh) {
 		KEY_EXIT_IF(vs_input_info.buffers_num < 0 ||
@@ -2907,6 +3215,9 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		if (found.pipeline == nullptr) RecreateGraphicsPipeline(found, key, vertex_info, ps_input_info, programs);
 		return found;
 	}
+	if (Pipeline* shared = FindSharedPipeline(key, vertex_info, ps_input_info, programs); shared != nullptr) {
+		return *shared;
+	}
 	if (CompileJobsEnabled()) {
 		if (auto* ahead = TakeAheadGraphicsPipeline(key); ahead != nullptr) {
 			PrecompileGraphicsRecord record;
@@ -2939,13 +3250,31 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	PrecompileGraphicsRecord precompile;
 	const bool precompile_record = m_precompiler != nullptr && ShaderPrecompiler::GraphicsEnabled() &&
 	                               m_program_cache->PrecompileStageKeys(programs, ps_active, precompile);
+	std::optional<GraphicsPipelineKey> shared_from;
 	if (precompile_record) {
 		precompile.rendering     = rendering;
 		precompile.vertex_input  = key.vertex_input;
 		precompile.static_params = static_params;
 		precompile.revision      = ShaderPrecompiler::Revision();
+		if (PrecompileGraphicsRecord cover; m_share_attachments && m_precompiler->CoveringRecord(precompile, cover)) {
+			shared_from = key;
+			CopyAttachmentSet(cover.rendering, cover.static_params, key.rendering, key.static_params);
+			CopyAttachmentSet(cover.rendering, cover.static_params, precompile.rendering, precompile.static_params);
+			m_share_stats.journal_chosen++;
+			if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
+				{
+					const std::unique_lock pipelines_lock(m_pipelines_mutex);
+					m_shared_keys.emplace(*shared_from, key);
+				}
+				auto& found     = *iter->second;
+				found.last_used = static_cast<uint32_t>(DebugPresentCount().load());
+				if (found.pipeline == nullptr) RecreateGraphicsPipeline(found, key, vertex_info, ps_input_info, programs);
+				return found;
+			}
+		}
 		m_precompiler->BeforeCompile(precompile.Key());
 	}
+	GuestGpu::NoteCompileDepth("graphics", vertex_info.front().stage.program->shader_hash);
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
 	{
 		const CompileStallScope compile_stall;
@@ -2969,8 +3298,11 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	cached->last_used     = static_cast<uint32_t>(DebugPresentCount().load());
 	std::unique_lock pipelines_lock(m_pipelines_mutex);
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
+	if (inserted && shared_from.has_value()) m_shared_keys.emplace(*shared_from, iter->first);
 	pipelines_lock.unlock();
 	EXIT_IF(!inserted);
+	NoteSharedPipeline(iter->first);
+	ReportShare();
 	// (Upstream 959bee479 checkpoints the driver cache here; ours saves it with SaveIfDue, m_pipelines_since_save.)
 
 	return *iter->second;
@@ -3103,8 +3435,13 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipelineAsync(
 		auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(finished));
 		pipelines_lock.unlock();
 		EXIT_IF(!inserted);
+		NoteSharedPipeline(iter->first);
 		stats.draws++;
 		return iter->second.get();
+	}
+	if (Pipeline* shared = FindSharedPipeline(key, vertex_info, ps_input_info, programs); shared != nullptr) {
+		stats.draws++;
+		return shared;
 	}
 	stats.fallback++;
 	if (m_table_workers_stopped) return nullptr; // (shutting down: nothing more is queued)
@@ -3285,6 +3622,7 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	}
 
 	auto cached = std::make_unique<Pipeline>();
+	GuestGpu::NoteCompileDepth("compute", input_info.stage ? input_info.stage.program->shader_hash : 0u);
 	{
 		const CompileStallScope compile_stall;
 		ChunkCensus::t_pipelines++; // KYTY_TRACE_CHUNK_CENSUS (hole)
