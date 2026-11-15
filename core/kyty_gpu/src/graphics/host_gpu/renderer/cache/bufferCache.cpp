@@ -2559,6 +2559,15 @@ void BufferCache::NoteDirectGpuWrite(uint64_t vaddr, uint64_t size, const void* 
 		std::erase_if(m_direct_gpu_writes, [&](const DirectGpuWrite& w) { return master.IsFree(w.tick); }); RebuildDirectWriteSpans();
 	}
 	auto& write = m_direct_gpu_writes.emplace_back(DirectGpuWrite {vaddr, vaddr + size, m_scheduler.CurrentTick()});
+	if (cp_data == nullptr) m_direct_shader_writes++;
+	if (DrainFreeWaitPossible()) { // KYTY_PERF_DRAIN_FREE_WAIT
+		auto&            master = m_scheduler.GetMasterSemaphore();
+		std::lock_guard lock(m_published_direct_mutex);
+		if (m_published_direct.size() >= 256u) {
+			std::erase_if(m_published_direct, [&](const PublishedDirectWrite& w) { return master.IsFree(w.tick); });
+		}
+		m_published_direct.push_back({vaddr, vaddr + size, write.tick});
+	}
 	if (m_direct_write_spans.size() != m_direct_ranges.size()) RebuildDirectWriteSpans();
 	bool spanned = false;
 	for (size_t r = 0; r < m_direct_ranges.size(); r++) {
@@ -2704,6 +2713,42 @@ void BufferCache::ServeWhileWaiting(uint64_t target) {
 	}
 	g_serve.wait_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()),
 	                          std::memory_order_relaxed);
+}
+
+// ---- KYTY_PERF_DRAIN_FREE_WAIT (bufferCache.h) ------------------------------------------------------------------------
+namespace {
+uint32_t DrainFreeWaitFixed() {
+	static const uint32_t value = [] {
+		const char*    text = std::getenv("KYTY_PERF_DRAIN_FREE_WAIT");
+		const uint32_t v    = text != nullptr ? static_cast<uint32_t>(std::strtoul(text, nullptr, 10)) : 0u;
+		if (v != 0) {
+			std::fprintf(stderr, "KYTY_PERF_DRAIN_FREE_WAIT=%u: WAIT_REG_MEM on a direct-range word skips the drain when no operation in flight can write%s\n", v,
+			             v == 2 ? " (check: drained anyway, verdicts and values compared)" : "");
+		}
+		return v;
+	}();
+	return value;
+}
+} // namespace
+
+uint32_t BufferCache::DrainFreeWaitMode() {
+	return Common::LiveAb::Gate(Common::LiveAb::Switch::DrainFreeWait, DrainFreeWaitFixed());
+}
+
+bool BufferCache::DrainFreeWaitPossible() {
+	static const bool possible = Common::LiveAb::Possible(Common::LiveAb::Switch::DrainFreeWait, DrainFreeWaitFixed());
+	return possible;
+}
+
+uint64_t BufferCache::PublishedDirectTick(uint64_t vaddr, uint64_t size) {
+	auto&           master = m_scheduler.GetMasterSemaphore();
+	std::lock_guard lock(m_published_direct_mutex);
+	std::erase_if(m_published_direct, [&](const PublishedDirectWrite& w) { return master.IsFree(w.tick); });
+	uint64_t tick = 0;
+	for (const auto& w: m_published_direct) {
+		if (w.start < vaddr + size && vaddr < w.end) tick = std::max(tick, w.tick);
+	}
+	return tick;
 }
 
 // ---- KYTY_PERF_RING_WORDS_GPU (bufferCache.h) -------------------------------------------------------------------------

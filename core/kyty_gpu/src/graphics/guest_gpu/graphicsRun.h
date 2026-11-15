@@ -106,6 +106,20 @@ public:
 	[[nodiscard]] static uint32_t PendingWriteKind(uint64_t address);
 	static void NoteCompileDepth(const char* kind, uint64_t hash);
 
+	// KYTY_PERF_DRAIN_FREE_WAIT (cache/bufferCache.h). The write verdict of each operation in flight, by sequence: 0 not
+	// known yet, 1 it cannot write buffer memory (a callback, whose command-processor writes are in the journal, or a draw
+	// or dispatch whose resolved stages write nothing: PipelineCache::ResolvedWrites), 2 it can, 3 its resolution says
+	// nothing. Published by the command processor (callbacks, at emission) and by whoever resolves the operation (before
+	// its slot is ready); a ring larger than the operations in flight.
+	void                  NoteOperationWrites(uint64_t sequence, uint8_t verdict) noexcept;
+	[[nodiscard]] uint8_t OperationWrites(uint64_t sequence) const noexcept;
+	// Command processor thread, a WAIT_REG_MEM word in a direct range that passed as read. True: no operation emitted and
+	// not executed can write buffer memory (a verdict not known yet is waited for, from the resolve side) and the newest
+	// unfinished published GPU write over the word was waited for here; the caller reads the word again through the
+	// overlay, as after a drain. False: drain as before; `reason` says why.
+	enum class DrainFreeFallback : uint8_t { Writer, Unknown, ResolveTimeout, Window, OpenBuffer, Count };
+	bool TryDrainFreeDirectWait(uint64_t address, uint64_t size, DrainFreeFallback* reason);
+
 private:
 	static constexpr uint32_t ComputePipeCount     = 7;
 	static constexpr uint32_t QueuesPerComputePipe = 8;
@@ -204,6 +218,8 @@ private:
 	static constexpr size_t         ResolvedQueueSize  = 256; // RenderExecutor::ResolvedDrawRing holds more
 	Common::SpscQueue<GpuOperation> m_operations;
 	Common::SpscQueue<GpuOperation> m_resolved;
+	static constexpr size_t                  OperationWritesSize = 8192; // > OperationQueueSize + ResolvedQueueSize + 2
+	std::unique_ptr<std::atomic<uint64_t>[]> m_operation_writes;
 	std::atomic_bool                m_execution_sleeping {false};
 	std::atomic_uint32_t            m_execution_bell {0};
 	std::atomic_bool                m_execution_stop {false};

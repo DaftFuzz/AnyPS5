@@ -2935,6 +2935,27 @@ bool PipelineCache::StagesAdoptable(const ResolvedStages& results) {
 	return results.adoptable && results.count != 0;
 }
 
+namespace {
+bool InfoWrites(const ShaderRecompiler::IR::ShaderInfo& info) {
+	return info.uses_dma || std::ranges::any_of(info.buffers, [](const auto& b) { return b.written; }) ||
+	       std::ranges::any_of(info.images, [](const auto& i) { return i.written; }) ||
+	       std::ranges::any_of(info.indirect_ranges, [](const auto& r) { return r.written; });
+}
+} // namespace
+
+uint8_t PipelineCache::ResolvedWrites(const ResolvedStages& results) {
+	if (!results.adoptable || results.count == 0) return 3;
+	bool writes = false;
+	for (uint32_t i = 0; i < std::min(results.count, 4u); i++) {
+		const auto& r = results.stages[i];
+		if (!r.ok || r.plan == nullptr || r.entry == nullptr || r.permutation == nullptr) return 3;
+		if (static_cast<const ProgramCache::SourceEntry*>(r.entry)->call_source) return 3;
+		const auto& program = static_cast<const ProgramCache::Permutation*>(r.permutation)->program;
+		writes = writes || program.has_address_writes || InfoWrites(program.info) || InfoWrites(r.plan->info);
+	}
+	return writes ? 2 : 1;
+}
+
 bool PipelineCache::AheadProgramsOk(const ResolvedStages& results) {
 	return results.ahead_programs_ok;
 }

@@ -488,6 +488,19 @@ public:
 	static void NoteVerifyRange(VerifyRangeEvent event);
 	// The number of blocking waits WaitDirectGpuWrites made so far (monotonic).
 	[[nodiscard]] static uint64_t DirectWaitTotal();
+	// KYTY_PERF_DRAIN_FREE_WAIT (default 0; 1 on, live A/B switch; 2 check, start value only): a WAIT_REG_MEM on a
+	// direct-range word that passes as read re-reads it after the command processor itself waited for the word's listed
+	// GPU writes, instead of after a drain of the execution thread, when no operation in flight can write buffer memory
+	// (guest_gpu/graphicsRun.cpp, GuestGpu::TryDrainFreeDirectWait). While the switch can be on, every listed write is also
+	// published under a lock for that thread:
+	//   - PublishedDirectTick (any thread): the newest tick of a published write over [vaddr, vaddr + size) the host GPU
+	//     has not finished as far as the known GPU tick says (0: none);
+	//   - DirectShaderWrites (GPU thread): writes of unknown bytes listed so far (monotonic), for the check that an
+	//     operation judged unable to write lists none.
+	[[nodiscard]] static uint32_t DrainFreeWaitMode();
+	[[nodiscard]] static bool     DrainFreeWaitPossible();
+	[[nodiscard]] uint64_t        PublishedDirectTick(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] uint64_t        DirectShaderWrites() const noexcept { return m_direct_shader_writes; }
 	// KYTY_PERF_SERVE_IN_WAIT (G5, design-gpuwait 2.1; default 0; 1 on, live A/B switch; 2 check, start value only), GPU
 	// thread. A compute program lookup (ServeInWaitAllow, before anything of the dispatch is recorded) lets its adoption
 	// check (ResolvedReadsHold) run its passes in ServeInWaitPass scopes: a blocking wait of WaitDirectGpuWrites inside
@@ -871,6 +884,15 @@ private:
 	[[nodiscard]] bool                       DirectWritesMayOverlap(uint64_t vaddr, uint64_t size) const;
 	// The pending command-processor writes the last WaitDirectGpuWrites left to the reader.
 	std::vector<DirectGpuWrite> m_direct_cp_overlay;
+	// KYTY_PERF_DRAIN_FREE_WAIT: the listed writes as the command processor sees them (start, end, tick).
+	struct PublishedDirectWrite {
+		uint64_t start = 0;
+		uint64_t end   = 0;
+		uint64_t tick  = 0;
+	};
+	std::mutex                        m_published_direct_mutex;
+	std::vector<PublishedDirectWrite> m_published_direct;
+	uint64_t                          m_direct_shader_writes = 0;
 	uint32_t                    m_direct_mode_seen = 0;
 	bool                        m_direct_parsed    = false;
 	bool                        m_direct_wanted    = false; // a range is wanted, or a live A/B switch waits
