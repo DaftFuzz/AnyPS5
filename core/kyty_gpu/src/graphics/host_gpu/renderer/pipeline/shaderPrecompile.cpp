@@ -2077,7 +2077,8 @@ void ShaderPrecompiler::LoadCompute(const std::unordered_set<uint64_t>& skipped,
 	});
 	torn = torn || !complete;
 	if (const char* replay = Common::ShaderEnv::Read("KYTY_DIAG_NULL_SLOT_REPLAY"); replay != nullptr && replay[0] == '1') {
-		NullSlotReplay(jobs);
+		std::thread replay_thread([this, &jobs] { NullSlotReplay(jobs); });
+		replay_thread.join();
 	}
 	// A file whose header does not match (another record layout or version): none of its records is read.
 	const bool other_layout = !bytes.empty() && !header_ok;
