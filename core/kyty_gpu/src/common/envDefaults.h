@@ -56,6 +56,7 @@ inline constexpr EnvDefault EnvDefaults[] = {
     // with it on): on a CPU write fault into a data-ring page the GPU bytes written before the previous frame are
     // downloaded like any other GPU bytes, not dropped (cache/bufferCache.cpp).
     {"KYTY_FIX_RING_DEAD_DOWNLOAD", "1", "config", ""},
+    {"KYTY_PERF_INLINE_BY_SIZE", "1", "config", ""},
     // Exactness fix, measured free (AnyPS5 v4e3: +0.6 % in-run A/B, SE 0.8; T1 byte-identical with it on): an ordinary
     // table read does not mark a direct-range page clean for its walk while a GPU write is still pending elsewhere on
     // the page (cache/bufferCache.h).
