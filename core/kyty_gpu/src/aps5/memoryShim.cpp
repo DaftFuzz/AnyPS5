@@ -8,6 +8,7 @@
 
 #include "aps5/aps5Host.h"
 #include "common/assert.h"
+#include "common/liveAb.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/virtualMemory.h"
@@ -955,7 +956,18 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 		}
 		const bool gpu_modified = buffers.IsRegionGpuModified(vaddr, size);
 		const bool gpu_dirty    = gpu_modified && buffers.HasGpuDirtyBytes(vaddr, size);
-		if (gpu_dirty) {
+		static const uint32_t srt_no_wait_fixed = [] {
+			const char* v = std::getenv("KYTY_DIAG_CEILING_SRT_NO_WAIT");
+			return v != nullptr && v[0] == '1' ? 1u : 0u;
+		}();
+		const bool srt_no_wait =
+		    gpu_dirty && Common::LiveAb::Gate(Common::LiveAb::Switch::DiagCeilingSrtNoWait, srt_no_wait_fixed) != 0u;
+		if (srt_no_wait) {
+			static std::atomic<uint64_t> skipped {0};
+			const uint64_t n = skipped.fetch_add(1, std::memory_order_relaxed) + 1;
+			if ((n & (n - 1)) == 0) std::fprintf(stderr, "DIAG_CEILING_SRT_NO_WAIT skipped=%llu\n", static_cast<unsigned long long>(n));
+		}
+		if (gpu_dirty && !srt_no_wait) {
 			KYTY_PROFILER_BLOCK("SrtWalker::Read");
 			Graphics::PerfReasonScope reason(Graphics::PerfReason::SrtWalker);
 			buffers.ReadMemory(vaddr, size);
@@ -991,7 +1003,17 @@ static Graphics::ShaderRecompiler::IR::FastVerifyResult FastVerifyLoggedReads(
 	const size_t count = log.entries.size();
 	auto&        cache = t_ordinary_read_pages;
 	stop               = begin;
+	const bool srt_classes = Ir::SrtClassTrace();
 	if (begin >= count) {
+		stop = count;
+		return Result::Unchanged;
+	}
+	static const uint32_t assume_fixed = [] {
+		const char* value = std::getenv("KYTY_DIAG_ADOPT_ASSUME_UNCHANGED");
+		return value != nullptr && value[0] == '1' ? 1u : 0u;
+	}();
+	if (Common::LiveAb::Gate(Common::LiveAb::Switch::DiagAdoptAssume, assume_fixed) != 0u) {
+		stats.entries_fast += count - begin;
 		stop = count;
 		return Result::Unchanged;
 	}
@@ -1061,7 +1083,7 @@ static Graphics::ShaderRecompiler::IR::FastVerifyResult FastVerifyLoggedReads(
 			++next;
 		}
 		uint8_t run_class = 0;
-		if (Ir::SrtClassTrace()) {
+		if (srt_classes) {
 			for (size_t i = index; i < next; ++i) run_class |= log.entries[i].cls;
 		}
 		bool clean = IsGpuAddressRange(head.address, run_size);
@@ -1099,9 +1121,9 @@ static Graphics::ShaderRecompiler::IR::FastVerifyResult FastVerifyLoggedReads(
 							}
 						}
 					}
-					const uint64_t wait_start = Ir::SrtClassTrace() ? SrtClassesNowNs() : 0;
+					const uint64_t wait_start = srt_classes ? SrtClassesNowNs() : 0;
 					const bool     page_busy  = buffers.WaitPendingReadbacks(base, 4096u);
-					if (Ir::SrtClassTrace()) SrtClassesWait("verify", run_class, base, SrtClassesNowNs() - wait_start);
+					if (srt_classes) SrtClassesWait("verify", run_class, base, SrtClassesNowNs() - wait_start);
 					if (page_busy || buffers.IsRegionGpuModified(base, 4096u)) {
 						clean = false;
 						break;
@@ -1122,9 +1144,9 @@ static Graphics::ShaderRecompiler::IR::FastVerifyResult FastVerifyLoggedReads(
 				// over what they read. The pages keep no mark, so the next run on them asks again.
 				Graphics::BufferCache::NoteVerifyRange(VerifyRangeEvent::RunCheck);
 				const uint64_t waits_before = Graphics::BufferCache::DirectWaitTotal();
-				const uint64_t wait_start   = Ir::SrtClassTrace() ? SrtClassesNowNs() : 0;
+				const uint64_t wait_start   = srt_classes ? SrtClassesNowNs() : 0;
 				const bool     run_busy     = buffers.WaitPendingReadbacks(head.address, run_size);
-				if (Ir::SrtClassTrace()) SrtClassesWait("verify", run_class, head.address, SrtClassesNowNs() - wait_start);
+				if (srt_classes) SrtClassesWait("verify", run_class, head.address, SrtClassesNowNs() - wait_start);
 				if (Graphics::BufferCache::DirectWaitTotal() != waits_before) {
 					Graphics::BufferCache::NoteVerifyRange(VerifyRangeEvent::RunWait);
 				}
