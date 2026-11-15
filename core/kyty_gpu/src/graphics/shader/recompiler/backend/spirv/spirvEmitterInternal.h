@@ -236,6 +236,8 @@ struct EmitterState {
 	// Exchanges outside per-invocation guards (guard_depth 0, counted by
 	// EmitIfCondition / EmitValueOrDefaultIfCondition) are workgroup barriers.
 	bool                       pair_barrier                          = false;
+	// Spin-exchange pairs (KYTY_PERF_PAIR_MULTIWAVE): the LDS order between the halves comes from a pair handshake.
+	bool                       pair_lds_handshake                    = false;
 	uint32_t                   guard_depth                           = 0;
 	bool                       guardless                             = false; // compute stages: RobustBuffer (spirvEmitterMemory.cpp)
 	uint32_t                   indirect_guard                        = 0;     // IndirectCallWord3
@@ -655,11 +657,14 @@ uint32_t EmitSubgroupLaneActiveBool(EmitterState& state, uint32_t lane);
 // a subgroup-uniform U32 with the other half of the same guest wave (returns the partner's value).
 uint32_t EmitSubgroupIdU32(EmitterState& state);
 uint32_t EmitPairHalf(EmitterState& state);
-uint32_t EmitPairExchange(EmitterState& state, uint32_t value);
+// `memory`: storage-class semantics the exchange orders besides Workgroup (the pair LDS handshake of LDS in a buffer).
+uint32_t EmitPairExchange(EmitterState& state, uint32_t value, uint32_t memory = 0u);
 void     EmitPairInitialize(EmitterState& state);
 bool     WavePairRequested(uint64_t shader_hash);
 // The pair rule: a compute workgroup of `threads` (64: one guest wave) and `code_words` of guest code it pairs.
 bool     WavePairRule(uint32_t threads, size_t code_words);
+// KYTY_PERF_PAIR_MULTIWAVE: the part of the rule for workgroups of several guest waves.
+bool     WavePairMultiwave(uint32_t threads, size_t code_words);
 void     NoteRulePaired(uint64_t shader_hash);
 
 inline constexpr auto EmitAddU32 = EmitNative<spv::OpIAdd, IR::Type::U32, uint32_t, uint32_t>;

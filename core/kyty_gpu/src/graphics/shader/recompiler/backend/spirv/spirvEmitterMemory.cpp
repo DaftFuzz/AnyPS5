@@ -769,14 +769,24 @@ void StoreWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) 
 // =2: KYTY_DIAG_TWIN_DISPATCH of every dispatch, 0 differences of 4000, 3993 before). In a paired shader of one wave per
 // workgroup (the barrier form) a workgroup barrier goes before an LDS write when an LDS read came since the last one (the
 // other half's read must happen before the overwrite) and after every LDS write or atomic (its later reads see it).
+// A paired shader of several waves per workgroup (KYTY_PERF_PAIR_MULTIWAVE) cannot take a workgroup barrier there (its
+// waves branch apart); the two halves of the wave meet in a pair handshake instead: an exchange (both halves reach the
+// same exchanges in the same order, as for ballots) whose release / acquire covers the LDS storage class. The same
+// points, so the same order: the partner's earlier LDS reads happen before this half's write, and this half's write
+// before the partner's later reads.
 bool PairLdsSync(const EmitterState& state, const IR::MemoryInfo& mem) {
-	return state.wave_pair && state.pair_barrier && state.guard_depth == 0u && mem.kind == IR::ResourceKind::Lds &&
-	       state.program.stage == ShaderType::Compute;
+	return state.wave_pair && (state.pair_barrier || state.pair_lds_handshake) && state.guard_depth == 0u &&
+	       mem.kind == IR::ResourceKind::Lds && state.program.stage == ShaderType::Compute;
 }
 
 void EmitPairLdsBarrier(EmitterState& state) {
 	const auto memory = state.lds_storage_class == spv::StorageClassStorageBuffer ? spv::MemorySemanticsUniformMemoryMask
 	                                                                              : spv::MemorySemanticsWorkgroupMemoryMask;
+	if (!state.pair_barrier) {
+		EmitPairExchange(state, ConstantU32(state, 0), memory);
+		state.lds_pair_synced = true;
+		return;
+	}
 	state.builder.AddFunction(spv::OpControlBarrier, ConstantU32(state, spv::ScopeWorkgroup),
 	                          ConstantU32(state, spv::ScopeWorkgroup),
 	                          ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask | memory));
