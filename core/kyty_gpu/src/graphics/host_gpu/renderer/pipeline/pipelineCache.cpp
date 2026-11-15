@@ -2376,6 +2376,85 @@ static uint8_t ObjprimIdSlot(const HW::Context& context, const ShaderPixelInputI
 	return chosen;
 }
 
+namespace {
+bool IndirectCoverEnabled() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_PERF_INDIRECT_COVER");
+		const bool  enabled = value != nullptr && value[0] == '1';
+		if (enabled) std::fprintf(stderr, "PERF_INDIRECT_COVER on\n");
+		return enabled;
+	}();
+	return on;
+}
+struct IndirectCoverTable {
+	std::shared_mutex                                     mutex;
+	std::unordered_map<uint64_t, ShaderIndirectDrawInfo> layouts;
+	std::unordered_set<uint64_t>                          conflicts;
+	std::unordered_set<uint64_t>                          direct_first;
+	std::atomic<uint64_t>                                 learned {0}, conflicted {0}, rejected {0}, applied {0}, direct_first_count {0};
+} g_indirect_cover;
+
+void LearnIndirectCover(uint64_t hash, const ShaderVertexInputInfo& info) {
+	const auto& layout = info.indirect_draw;
+	if (!layout.enabled || info.logical_stage != ShaderType::Vertex || !info.fetch_embedded || !info.draw_base_once ||
+	    info.stage.program == nullptr) {
+		return;
+	}
+	const auto& program = *info.stage.program;
+	const auto  base    = static_cast<int32_t>(program.user_data_base);
+	const bool  match   = layout.draw_index == ShaderIndirectDrawInfo::NoSgpr && program.info.vertex_offset_sgpr >= base &&
+	                   program.info.instance_offset_sgpr >= base &&
+	                   program.info.vertex_offset_sgpr - base == static_cast<int32_t>(layout.base_vertex) &&
+	                   program.info.instance_offset_sgpr - base == static_cast<int32_t>(layout.base_instance);
+	auto& t = g_indirect_cover;
+	if (!match) {
+		t.rejected.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	{
+		std::shared_lock lock(t.mutex);
+		if (const auto it = t.layouts.find(hash); it != t.layouts.end() && it->second.Key() == layout.Key()) return;
+		if (t.conflicts.contains(hash)) return;
+	}
+	std::unique_lock lock(t.mutex);
+	if (const auto it = t.layouts.find(hash); it != t.layouts.end()) {
+		if (it->second.Key() != layout.Key()) {
+			t.layouts.erase(it);
+			t.conflicts.insert(hash);
+			t.conflicted.fetch_add(1, std::memory_order_relaxed);
+		}
+		return;
+	}
+	if (t.conflicts.contains(hash) || t.direct_first.contains(hash)) return;
+	t.layouts.emplace(hash, layout);
+	t.learned.fetch_add(1, std::memory_order_relaxed);
+}
+
+void ApplyIndirectCover(uint64_t hash, ShaderVertexInputInfo& info) {
+	auto& t = g_indirect_cover;
+	{
+		std::shared_lock lock(t.mutex);
+		if (const auto it = t.layouts.find(hash); it != t.layouts.end()) {
+			info.indirect_draw = it->second;
+			t.applied.fetch_add(1, std::memory_order_relaxed);
+			return;
+		}
+		if (t.direct_first.contains(hash)) return;
+	}
+	std::unique_lock lock(t.mutex);
+	if (t.layouts.contains(hash)) return;
+	if (t.direct_first.insert(hash).second) t.direct_first_count.fetch_add(1, std::memory_order_relaxed);
+}
+} // namespace
+
+void ReportIndirectCover() {
+	if (!IndirectCoverEnabled()) return;
+	const auto& t = g_indirect_cover;
+	std::fprintf(stderr, "PERF indirect_cover learned=%llu conflicted=%llu rejected=%llu applied=%llu direct_first=%llu\n",
+	             static_cast<unsigned long long>(t.learned.load()), static_cast<unsigned long long>(t.conflicted.load()),
+	             static_cast<unsigned long long>(t.rejected.load()), static_cast<unsigned long long>(t.applied.load()), static_cast<unsigned long long>(t.direct_first_count.load()));
+}
+
 // The program inputs of a draw (the part of GetGraphicsPrograms before the program lookups); the cursor before the
 // first stage in *push_data_cursor.
 static void GraphicsProgramInputs(const GraphicContext& graphics, const HW::VertexShaderInfo& vertex_regs,
@@ -2402,6 +2481,10 @@ static void GraphicsProgramInputs(const GraphicContext& graphics, const HW::Vert
 		vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]);
 		if (vertex_info[0].logical_stage == ShaderType::Vertex) {
 			vertex_info[0].indirect_draw = indirect_draw;
+			if (!indirect_draw.enabled && IndirectCoverEnabled() && vertex_info[0].fetch_embedded &&
+			    vertex_info[0].draw_base_once && user_config.GetIndexOffset() == 0u) {
+				ApplyIndirectCover(vertex_params[0].hash, vertex_info[0]);
+			}
 		}
 	}
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
@@ -2578,6 +2661,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
 		result.vertex[i] = m_program_cache->Get(vertex_params[i], vertex_info[i], push_data_cursor);
 	}
+	if (!tess_active && IndirectCoverEnabled()) LearnIndirectCover(vertex_params[0].hash, vertex_info[0]);
 	return result;
 }
 
@@ -3428,6 +3512,7 @@ struct AheadGraphicsStats {
 } // namespace
 
 void PipelineCache::ReportCompileJobs() const {
+	if (PerfEnabled()) ReportIndirectCover();
 	if (!PerfEnabled() || !CompileJobsEnabled()) return;
 	const auto& s = g_compile_scout;
 	const auto  n = [](const std::atomic<uint64_t>& v) { return static_cast<unsigned long long>(v.load(std::memory_order_relaxed)); };
