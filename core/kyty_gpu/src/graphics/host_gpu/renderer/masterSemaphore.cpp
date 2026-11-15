@@ -22,6 +22,11 @@
 namespace Libs::Graphics {
 
 MasterSemaphore::MasterSemaphore(GraphicContext& graphics): m_graphics(graphics) {
+	if (PadHot()) {
+		m_gpu_tick_p     = &m_gpu_tick_padded;
+		m_current_tick_p = &m_current_tick_padded;
+		m_last_refresh_p = &m_last_refresh_padded;
+	}
 	vk::SemaphoreTypeCreateInfo type_info {};
 	type_info.semaphoreType = vk::SemaphoreType::eTimeline;
 	type_info.initialValue  = 0;
@@ -31,6 +36,16 @@ MasterSemaphore::MasterSemaphore(GraphicContext& graphics): m_graphics(graphics)
 
 	const auto result = m_graphics.device.createSemaphore(&create_info, nullptr, &m_semaphore);
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess || m_semaphore == nullptr);
+}
+
+bool MasterSemaphore::PadHot() {
+	static const bool on = [] {
+		const char* text = std::getenv("KYTY_PERF_PAD_HOT");
+		const bool  set  = text != nullptr && text[0] == '1';
+		if (set) std::fprintf(stderr, "KYTY_PERF_PAD_HOT=1: hot shared atomics on their own cache lines\n");
+		return set;
+	}();
+	return on;
 }
 
 MasterSemaphore::~MasterSemaphore() {
@@ -77,10 +92,10 @@ void MasterSemaphore::Refresh() {
 	const auto        now    = std::chrono::duration_cast<std::chrono::nanoseconds>(
                          std::chrono::steady_clock::now().time_since_epoch())
                          .count();
-	if (now - m_last_refresh_ns.load(std::memory_order_relaxed) < PollNs) {
+	if (now - m_last_refresh_p->load(std::memory_order_relaxed) < PollNs) {
 		return;
 	}
-	m_last_refresh_ns.store(now, std::memory_order_relaxed);
+	m_last_refresh_p->store(now, std::memory_order_relaxed);
 	RefreshNow();
 }
 
@@ -102,9 +117,9 @@ void MasterSemaphore::RefreshNow() {
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
-	auto known = m_gpu_tick.load(std::memory_order_acquire);
+	auto known = m_gpu_tick_p->load(std::memory_order_acquire);
 	while (known < counter &&
-	       !m_gpu_tick.compare_exchange_weak(known, counter, std::memory_order_release,
+	       !m_gpu_tick_p->compare_exchange_weak(known, counter, std::memory_order_release,
 	                                         std::memory_order_relaxed)) {
 	}
 }
@@ -140,8 +155,8 @@ void MasterSemaphore::Wait(uint64_t tick) {
 		for (uint32_t round = 1;; round++) {
 			uint64_t counter = 0;
 			if (m_graphics.device.getSemaphoreCounterValue(m_semaphore, &counter) != vk::Result::eSuccess) break;
-			auto known = m_gpu_tick.load(std::memory_order_acquire);
-			while (known < counter && !m_gpu_tick.compare_exchange_weak(known, counter, std::memory_order_release,
+			auto known = m_gpu_tick_p->load(std::memory_order_acquire);
+			while (known < counter && !m_gpu_tick_p->compare_exchange_weak(known, counter, std::memory_order_release,
 			                                                           std::memory_order_relaxed)) {
 			}
 			if (counter >= tick) {

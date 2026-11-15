@@ -4094,6 +4094,7 @@ DrawRenderState* RenderExecutor::TakeResolvedState(const ShaderIndirectDrawInfo&
 	// not leave its plan to the expansion's draws (they fail to take the used slot).
 	m_slot_taken         = false;
 	auto* const resolved = m_resolved_draw;
+	const BufferCache::ServeInWaitAllow serve_in_wait(BufferCache::ServeDrawWaitsMode()); // KYTY_PERF_SERVE_DRAW_WAITS: nothing of the draw recorded yet
 	if (resolved == nullptr || resolved->is_compute || std::exchange(resolved->consumed, true) ||
 	    t_draw_regs.sh != resolved->shaders || indirect_draw.Key() != resolved->state.indirect_draw.Key() ||
 	    !m_context.GetPipelineCache().AdoptResolvedPrograms(*resolved->stages)) {

@@ -17,14 +17,14 @@ public:
 	KYTY_CLASS_NO_COPY(MasterSemaphore);
 
 	[[nodiscard]] uint64_t CurrentTick() const noexcept {
-		return m_current_tick.load(std::memory_order_acquire);
+		return m_current_tick_p->load(std::memory_order_acquire);
 	}
 	[[nodiscard]] uint64_t KnownGpuTick() const noexcept {
-		return m_gpu_tick.load(std::memory_order_acquire);
+		return m_gpu_tick_p->load(std::memory_order_acquire);
 	}
 	[[nodiscard]] bool     IsFree(uint64_t tick) const noexcept { return KnownGpuTick() >= tick; }
 	[[nodiscard]] uint64_t NextTick() noexcept {
-		return m_current_tick.fetch_add(1, std::memory_order_release);
+		return m_current_tick_p->fetch_add(1, std::memory_order_release);
 	}
 	[[nodiscard]] vk::Semaphore Handle() const noexcept { return m_semaphore; }
 
@@ -54,9 +54,22 @@ public:
 private:
 	GraphicContext&       m_graphics;
 	vk::Semaphore         m_semaphore = nullptr;
-	std::atomic<uint64_t> m_gpu_tick {0};
-	std::atomic<uint64_t> m_current_tick {1};
-	std::atomic<int64_t>  m_last_refresh_ns {0};
+	// KYTY_PERF_PAD_HOT=1 (route-to-30 item 5; default 0, start value only): the GPU tick (written by the completion thread
+	// and every refresh), the current tick and the refresh time (written by the GPU thread) each on their own cache line
+	// instead of one shared line; only where they live changes.
+	std::atomic<uint64_t>*            m_gpu_tick_p     = &m_gpu_tick_packed;
+	std::atomic<uint64_t>*            m_current_tick_p = &m_current_tick_packed;
+	std::atomic<int64_t>*             m_last_refresh_p = &m_last_refresh_packed;
+	std::atomic<uint64_t>             m_gpu_tick_packed {0};
+	std::atomic<uint64_t>             m_current_tick_packed {1};
+	std::atomic<int64_t>              m_last_refresh_packed {0};
+	alignas(64) std::atomic<uint64_t> m_gpu_tick_padded {0};
+	alignas(64) std::atomic<uint64_t> m_current_tick_padded {1};
+	alignas(64) std::atomic<int64_t>  m_last_refresh_padded {0};
+	alignas(64) char                  m_pad_end = 0;
+
+public:
+	[[nodiscard]] static bool PadHot(); // KYTY_PERF_PAD_HOT, read once
 };
 
 } // namespace Libs::Graphics

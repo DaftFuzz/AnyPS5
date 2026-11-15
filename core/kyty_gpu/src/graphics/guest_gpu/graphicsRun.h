@@ -185,6 +185,12 @@ private:
 	std::array<std::deque<Submission>, QueueCount> m_queues;
 	std::deque<Common::UniqueFunction<void>>       m_commands;
 	std::atomic_uint32_t                           m_pending_commands {0};
+	// KYTY_PERF_PAD_HOT (masterSemaphore.h): the count of queued commands, which the GPU thread reads after every operation,
+	// on its own cache line instead of beside the command processor's queue state; chosen once, before any thread uses it.
+	alignas(64) std::atomic_uint32_t               m_pending_commands_padded {0};
+	alignas(64) char                               m_pending_pad_end = 0;
+	std::atomic_uint32_t*                          m_pending_commands_p = &m_pending_commands;
+	[[nodiscard]] std::atomic_uint32_t&             PendingCommands() noexcept { return *m_pending_commands_p; }
 	uint32_t                                       m_next_queue        = 0;
 	uint32_t                                       m_submission_count  = 0;
 	bool                                           m_processing        = false;

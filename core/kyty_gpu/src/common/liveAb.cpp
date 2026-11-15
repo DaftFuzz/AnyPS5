@@ -111,6 +111,13 @@ constexpr SwitchInfo Switches[] = {
     // Per operation boundary: whether predicted hand-back copies are started; copies already started finish as ordinary
     // hand-back copies (their windows stay in the hand-back state until applied) whatever the phase.
     {Switch::CopyPredict, "KYTY_PERF_COPY_PREDICT", 1},
+    // Per draw adoption check, as KYTY_PERF_SERVE_IN_WAIT per dispatch.
+    {Switch::ServeDrawWaits, "KYTY_PERF_SERVE_DRAW_WAITS", 1},
+    // Per label: published by the completion thread (a plain store into a direct range with no earlier publish still
+    // queued) or handed to the execution thread; the value and the order of publishes are the same.
+    {Switch::LabelsOffThread, "KYTY_PERF_LABELS_OFF_THREAD", 1},
+    // A pure memo: both tables are kept whenever the switch can be on, every entry is checked the same way before use.
+    {Switch::MemoWays, "KYTY_PERF_MEMO_WAYS", 1},
     // Per WAIT_REG_MEM on a direct-range word that passes as read: whether the command processor drains the execution
     // thread before it reads the word again, or (no operation in flight can write buffer memory) waits for the word's
     // recorded GPU writes itself; the word reads the same either way. The listed writes are published whenever the

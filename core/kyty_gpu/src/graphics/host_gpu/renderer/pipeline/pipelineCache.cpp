@@ -304,7 +304,7 @@ bool ResolvedReadsHold(ResolvedStages& results) {
 					if (!pass.Served()) break;
 				}
 				bool checked = false, differ = false;
-				if (BufferCache::ServeInWaitMode() == 2u) {
+				if (BufferCache::ServeInWaitAllowedMode() == 2u) {
 					const BufferCache::ServeInWaitPass pass(false);
 					checked = true;
 					differ  = ShaderRecompiler::IR::ReadsUnchangedFast(results.log, runtime, nullptr) != hold;

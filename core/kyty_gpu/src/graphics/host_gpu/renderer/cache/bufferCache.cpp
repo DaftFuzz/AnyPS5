@@ -2459,6 +2459,18 @@ bool BufferCache::InDirectRange(uint64_t vaddr, uint64_t size) const {
 	return false;
 }
 
+// KYTY_PERF_LABELS_OFF_THREAD, any thread: [vaddr, vaddr + size) lies inside one active direct range and no range changed
+// meanwhile (the generation is odd while the execution thread changes them; the list never reallocates).
+bool BufferCache::DirectRangeHoldsStable(uint64_t vaddr, uint64_t size) const {
+	const uint64_t generation = g_direct_generation.load(std::memory_order_acquire);
+	if ((generation & 1u) != 0 || size == 0) return false;
+	bool inside = false;
+	for (const auto& range: m_direct_ranges) {
+		if (range.active && !range.refused && range.start <= vaddr && vaddr + size <= range.end) inside = true;
+	}
+	return inside && g_direct_generation.load(std::memory_order_acquire) == generation;
+}
+
 
 // A CPU write fault into a GPU-modified page of the data ring (two halves, each reused every second game frame; the game
 // overwrites what it allocates there and, before reusing a half, waits for the GPU work of the frame that last used
@@ -2653,8 +2665,28 @@ uint32_t BufferCache::ServeInWaitMode() {
 	return Common::LiveAb::Gate(Common::LiveAb::Switch::ServeInWait, ServeInWaitFixed());
 }
 
-BufferCache::ServeInWaitAllow::ServeInWaitAllow(): previous(t_serve_allowed) {
-	t_serve_allowed = GuestGpu::IsGpuThread() && GuestGpu::WaitsServeCommands() ? ServeInWaitMode() : 0u;
+BufferCache::ServeInWaitAllow::ServeInWaitAllow(uint32_t mode): previous(t_serve_allowed) {
+	t_serve_allowed = GuestGpu::IsGpuThread() && GuestGpu::WaitsServeCommands() ? mode : 0u;
+}
+
+uint32_t BufferCache::ServeInWaitAllowedMode() {
+	return t_serve_allowed;
+}
+
+namespace {
+uint32_t ServeDrawWaitsFixed() {
+	static const uint32_t value = [] {
+		const char*    text = std::getenv("KYTY_PERF_SERVE_DRAW_WAITS");
+		const uint32_t v    = text != nullptr ? static_cast<uint32_t>(std::strtoul(text, nullptr, 10)) : 0u;
+		if (v != 0) std::fprintf(stderr, "KYTY_PERF_SERVE_DRAW_WAITS=%u: guest commands run during draws' adoption-check GPU waits%s\n", v, v == 2 ? " (check: verdicts compared)" : "");
+		return v;
+	}();
+	return value;
+}
+} // namespace
+
+uint32_t BufferCache::ServeDrawWaitsMode() {
+	return Common::LiveAb::Gate(Common::LiveAb::Switch::ServeDrawWaits, ServeDrawWaitsFixed());
 }
 
 BufferCache::ServeInWaitAllow::~ServeInWaitAllow() {
@@ -3900,40 +3932,120 @@ bool ObtainMemoRegions(uint64_t vaddr, uint64_t size, uint64_t& first, uint32_t&
 	return true;
 }
 
-// The entry of the range when it still holds; null when it does not.
-const ObtainMemoEntry* ObtainMemoFind(uint64_t vaddr, uint64_t size) {
-	const ObtainMemoEntry* entry = &g_obtain_memo[ObtainMemoIndex(vaddr, size)];
-	const auto&            e     = *entry;
-	auto&                  miss  = ObtainMemoStatsRef().miss;
-	if (e.regions == 0) {
-		miss[0]++;
-		return nullptr;
-	}
-	if (e.vaddr != vaddr || e.size != size) {
-		miss[1]++;
-		return nullptr;
-	}
-	if (e.buffer_epoch != DrawRepeat::g_buffer_registry_epoch.load(std::memory_order_acquire)) {
-		miss[2]++;
-		return nullptr;
-	}
+// Why an entry does not hold for the range: 0 empty, 1 another range, 2 buffer epoch, 3 CPU-dirty region epoch, 4 image
+// page sum; -1: it holds.
+int ObtainMemoReason(const ObtainMemoEntry& e, uint64_t vaddr, uint64_t size) {
+	if (e.regions == 0) return 0;
+	if (e.vaddr != vaddr || e.size != size) return 1;
+	if (e.buffer_epoch != DrawRepeat::g_buffer_registry_epoch.load(std::memory_order_acquire)) return 2;
 	FaultPath::ArObserveRegions(e.region, e.regions);
 	auto* table = g_cpu_dirty_region_epochs.load(std::memory_order_acquire);
 	for (uint32_t i = 0; i < e.regions; i++) {
-		if (table[e.region + i].load(std::memory_order_acquire) != e.epochs[i]) {
-			miss[3]++;
-			return nullptr;
-		}
+		if (table[e.region + i].load(std::memory_order_acquire) != e.epochs[i]) return 3;
 	}
-	if (DrawRepeat::ImagePageEpochSum(vaddr, size) != e.image_sum) {
-		miss[4]++;
+	if (DrawRepeat::ImagePageEpochSum(vaddr, size) != e.image_sum) return 4;
+	return -1;
+}
+
+// The entry of the range when it still holds; null when it does not.
+const ObtainMemoEntry* ObtainMemoFind(uint64_t vaddr, uint64_t size) {
+	const ObtainMemoEntry* entry  = &g_obtain_memo[ObtainMemoIndex(vaddr, size)];
+	const int              reason = ObtainMemoReason(*entry, vaddr, size);
+	if (reason >= 0) {
+		ObtainMemoStatsRef().miss[reason]++;
 		return nullptr;
 	}
 	return entry;
 }
 
+// KYTY_PERF_MEMO_WAYS (route-to-30 item 8; default 0; 1 on, live A/B switch; 2 check, start value only): the obtain memo
+// keyed by the range's address with 4 entries per set (2048 sets) instead of one direct-mapped entry, so ranges that
+// repeat are not evicted by other ranges hashing to the same slot. Every entry is checked exactly as the direct-mapped
+// one (ObtainMemoReason). Both tables are kept whenever the switch can be on; an entry kept while the switch was off is
+// checked the same way when it is turned on. Check: a hit takes the full path too and compares its buffer, and that it
+// uploaded nothing and synced no image. Its key table also splits the direct-mapped memo's empty/range misses (PERF
+// obtain_memo_split): repeat (the 4-way table holds the range: an address-keyed memo would find it), new in the same
+// buffer as the evicted entry, new in another buffer, and whether the full path kept the range at all.
+struct ObtainMemoSet {
+	ObtainMemoEntry way[4];
+	uint32_t        stamp[4] {};
+};
+constexpr size_t kObtainMemoSets = 2048;
+ObtainMemoSet    g_obtain_memo4[kObtainMemoSets]; // GPU thread
+uint32_t         g_obtain_memo4_clock = 0;
+struct ObtainMemoSplit {
+	uint64_t repeat = 0, fresh = 0, fresh_same_buffer = 0, fresh_other_buffer = 0, fresh_unkept = 0;
+	uint64_t ways_hits = 0, ways_misses = 0, ways_miss[5] {}, check_compared = 0, check_bad = 0;
+} g_obtain_memo_split;
+
+uint32_t MemoWaysFixed() {
+	static const uint32_t value = [] {
+		const char*    text = std::getenv("KYTY_PERF_MEMO_WAYS");
+		const uint32_t v    = text != nullptr ? static_cast<uint32_t>(std::strtoul(text, nullptr, 10)) : 0u;
+		if (v != 0) std::fprintf(stderr, "KYTY_PERF_MEMO_WAYS=%u: the obtain memo keeps 4 entries per set%s\n", v, v == 2 ? " (check: hits take the full path too)" : "");
+		return v;
+	}();
+	return value;
+}
+
+ObtainMemoSet& ObtainMemoSetOf(uint64_t vaddr, uint64_t size) {
+	return g_obtain_memo4[ObtainMemoIndex(vaddr, size) & (kObtainMemoSets - 1u)];
+}
+
+ObtainMemoEntry* ObtainMemo4Key(uint64_t vaddr, uint64_t size) {
+	auto& set = ObtainMemoSetOf(vaddr, size);
+	for (uint32_t w = 0; w < 4u; w++) {
+		auto& e = set.way[w];
+		if (e.regions != 0 && e.vaddr == vaddr && e.size == size) {
+			set.stamp[w] = ++g_obtain_memo4_clock;
+			return &e;
+		}
+	}
+	return nullptr;
+}
+
+const ObtainMemoEntry* ObtainMemo4Find(uint64_t vaddr, uint64_t size) {
+	const ObtainMemoEntry* e      = ObtainMemo4Key(vaddr, size);
+	const int              reason = e == nullptr ? 1 : ObtainMemoReason(*e, vaddr, size);
+	auto&                  s      = g_obtain_memo_split;
+	if (reason >= 0) {
+		s.ways_misses++;
+		s.ways_miss[reason]++;
+		return nullptr;
+	}
+	s.ways_hits++;
+	return e;
+}
+
 void ObtainMemoStore(uint64_t vaddr, uint64_t size, const ObtainMemoEntry& fresh) {
 	g_obtain_memo[ObtainMemoIndex(vaddr, size)] = fresh;
+	if (!Common::LiveAb::Possible(Common::LiveAb::Switch::MemoWays, MemoWaysFixed())) return;
+	auto&    set    = ObtainMemoSetOf(vaddr, size);
+	uint32_t victim = 0;
+	for (uint32_t w = 0; w < 4u; w++) {
+		if (set.way[w].regions != 0 && set.way[w].vaddr == vaddr && set.way[w].size == size) {
+			victim = w;
+			break;
+		}
+		if (set.stamp[w] < set.stamp[victim]) victim = w;
+	}
+	set.way[victim]   = fresh;
+	set.stamp[victim] = ++g_obtain_memo4_clock;
+}
+
+void ObtainMemoSplitReport() {
+	auto& s = g_obtain_memo_split;
+	if (((s.repeat + s.fresh + s.ways_hits + s.ways_misses) & 0x3ffffu) != 0 || !Common::EnvRead::PerfLines()) return;
+	std::fprintf(stderr,
+	             "PERF obtain_memo_split repeat=%llu fresh=%llu fresh_same_buffer=%llu fresh_other_buffer=%llu fresh_unkept=%llu "
+	             "ways_hits=%llu ways_misses=%llu ways_miss(empty/range/buffers/cpu/images)=%llu/%llu/%llu/%llu/%llu check=%llu/%llu\n",
+	             static_cast<unsigned long long>(s.repeat), static_cast<unsigned long long>(s.fresh),
+	             static_cast<unsigned long long>(s.fresh_same_buffer), static_cast<unsigned long long>(s.fresh_other_buffer),
+	             static_cast<unsigned long long>(s.fresh_unkept), static_cast<unsigned long long>(s.ways_hits),
+	             static_cast<unsigned long long>(s.ways_misses), static_cast<unsigned long long>(s.ways_miss[0]),
+	             static_cast<unsigned long long>(s.ways_miss[1]), static_cast<unsigned long long>(s.ways_miss[2]),
+	             static_cast<unsigned long long>(s.ways_miss[3]), static_cast<unsigned long long>(s.ways_miss[4]),
+	             static_cast<unsigned long long>(s.check_compared), static_cast<unsigned long long>(s.check_bad));
 }
 
 void ObtainMemoReport() {
@@ -4597,12 +4709,38 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferPath(uint64_t vaddr, uint6
 	// The obtain memo: a read of a kept range (the diagnostic and approximation paths below never use it).
 	const bool memo_on = !is_written && !is_texel_buffer && !image_source && PeekCheckMode() == 0 && // =2: full path
 	                     !PlanBufferCheck();
-	const ObtainMemoEntry* memo_hit = memo_on ? ObtainMemoFind(vaddr, size) : nullptr;
+	// KYTY_PERF_MEMO_WAYS: the 4-way table (1), or the direct-mapped one with the miss split when the switch can be on.
+	static const bool      ways_possible = Common::LiveAb::Possible(Common::LiveAb::Switch::MemoWays, MemoWaysFixed());
+	const uint32_t         ways          = memo_on && ways_possible ? Common::LiveAb::Gate(Common::LiveAb::Switch::MemoWays, MemoWaysFixed()) : 0u;
+	int                    split_kind    = 0; // 1: an empty/range miss whose range the 4-way table holds, 2: one it does not
+	BufferId               split_evicted {};
+	const ObtainMemoEntry* memo_hit = nullptr;
+	if (memo_on && ways != 0u) {
+		memo_hit = ObtainMemo4Find(vaddr, size);
+		ObtainMemoSplitReport();
+	} else if (memo_on) {
+		const auto& slot   = g_obtain_memo[ObtainMemoIndex(vaddr, size)];
+		const int   reason = ObtainMemoReason(slot, vaddr, size);
+		if (reason >= 0) {
+			ObtainMemoStatsRef().miss[reason]++;
+			if (ways_possible && reason <= 1) {
+				split_kind    = ObtainMemo4Key(vaddr, size) != nullptr ? 1 : 2;
+				split_evicted = slot.id;
+				(split_kind == 1 ? g_obtain_memo_split.repeat : g_obtain_memo_split.fresh)++;
+				ObtainMemoSplitReport();
+			}
+		} else {
+			memo_hit = &slot;
+		}
+	}
+	BufferId memo_check_id {};
 	if (memo_on) {
 		auto& s = ObtainMemoStatsRef();
 		(memo_hit != nullptr ? s.hits : s.misses)++;
 		ObtainMemoReport();
-		if (memo_hit != nullptr) {
+		if (memo_hit != nullptr && ways == 2u) {
+			memo_check_id = memo_hit->id; // KYTY_PERF_MEMO_WAYS=2: the full path below, compared at its end
+		} else if (memo_hit != nullptr) {
 			auto& buffer = m_slot_buffers[memo_hit->id];
 			TouchBuffer(buffer);
 			return {&buffer, buffer.Offset(vaddr)};
@@ -4620,6 +4758,10 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferPath(uint64_t vaddr, uint6
 			    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
 			auto [mapped, offset] = Stream().Map(size, alignment, false);
 			if (mapped != nullptr) {
+				if (!IsBufferInvalid(memo_check_id)) { // KYTY_PERF_MEMO_WAYS=2: a hit for CPU-dirty bytes
+					g_obtain_memo_split.check_compared++;
+					g_obtain_memo_split.check_bad++;
+				}
 				LibKernel::Memory::ReadGuestPlain(mapped, vaddr, size);
 				Stream().Commit();
 				t_obtain_work++; // KYTY_CHECK_PEEK
@@ -4670,6 +4812,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferPath(uint64_t vaddr, uint6
 		// Kept: a range the cached path left CPU-clean, with no image over it. The epochs are read after the work above, so
 		// a CPU-dirty mark during it makes the entry stale at once.
 		ObtainMemoEntry fresh;
+		bool            kept = false;
 		if (!image_over && !image_sync && ObtainMemoRegions(vaddr, size, fresh.region, fresh.regions, fresh.epochs) &&
 		    !m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
 			fresh.vaddr        = vaddr;
@@ -4679,6 +4822,24 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferPath(uint64_t vaddr, uint6
 			fresh.id           = id;
 			ObtainMemoStore(vaddr, size, fresh);
 			ObtainMemoStatsRef().stores++;
+			kept = true;
+		}
+		if (split_kind == 2) { // KYTY_PERF_MEMO_WAYS miss split
+			auto& s = g_obtain_memo_split;
+			(!kept ? s.fresh_unkept : split_evicted == id ? s.fresh_same_buffer : s.fresh_other_buffer)++;
+		}
+		if (!IsBufferInvalid(memo_check_id)) { // KYTY_PERF_MEMO_WAYS=2
+			auto& s = g_obtain_memo_split;
+			s.check_compared++;
+			if (memo_check_id != id || memo_uploaded != 0 || image_sync || image_over) {
+				s.check_bad++;
+				static std::atomic_uint logged {0};
+				if (logged.fetch_add(1) < 16u) {
+					std::fprintf(stderr, "PERF_MEMO_WAYS_MISMATCH addr=0x%llx size=0x%llx same_buffer=%d uploaded=%llu image=%d/%d\n",
+					             static_cast<unsigned long long>(vaddr), static_cast<unsigned long long>(size), memo_check_id == id ? 1 : 0,
+					             static_cast<unsigned long long>(memo_uploaded), image_sync ? 1 : 0, image_over ? 1 : 0);
+				}
+			}
 		}
 	}
 	return {&buffer, buffer.Offset(vaddr)};
