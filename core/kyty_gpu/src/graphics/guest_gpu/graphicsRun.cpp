@@ -1405,6 +1405,8 @@ static uint32_t ResolveFaultEvery() {
 }
 
 // Based on TheCruZ/KytyPS5-GTA daaf45201 (graphicsRun.cpp), GPL-2.0.
+static std::atomic<GuestGpu*> g_scout_gpu {nullptr};
+
 void GuestGpu::ResolveThread() {
 	KYTY_PROFILER_THREAD("Thread_GpuResolve");
 	// The command processor's SMT sibling: the operations it writes are in that core's caches; the helper resolves.
@@ -1416,7 +1418,71 @@ void GuestGpu::ResolveThread() {
 	uint64_t       members    = 0;
 	auto&          hs         = m_helper_stats;
 	auto           report_at  = std::chrono::steady_clock::now();
+	const bool     scout      = CompileScoutEnabled();
+	size_t         scout_ahead = 0;
+	auto           jobs_report_at = std::chrono::steady_clock::now();
+	if (scout) {
+		g_scout_kick.store(+[] {
+			if (auto* gpu = g_scout_gpu.load(std::memory_order_acquire)) gpu->m_resolved.KickProducer();
+		}, std::memory_order_release);
+		g_scout_gpu.store(this, std::memory_order_release);
+	}
+	const auto scout_step = [&]() -> bool {
+		if (scout_ahead >= m_operations.Capacity()) return false;
+		const GpuOperation* next = m_operations.PeekAt(scout_ahead);
+		if (next == nullptr) return false;
+		scout_ahead++;
+		auto& sc = g_compile_scout;
+		sc.scouted.fetch_add(1, std::memory_order_relaxed);
+		if (scout_ahead > sc.max_ahead.load(std::memory_order_relaxed)) sc.max_ahead.store(scout_ahead, std::memory_order_relaxed);
+		const auto kind = next->kind;
+		if (kind == GpuOperationKind::DispatchDirect || kind == GpuOperationKind::DispatchIndirect) {
+			RenderExecutor::ResolveTask task;
+			task.context       = next->state.context;
+			task.user_config   = next->state.user_config;
+			task.shaders       = next->state.shaders;
+			task.dispatch      = true;
+			task.groups_x      = next->dispatch.thread_group_x;
+			task.groups_y      = next->dispatch.thread_group_y;
+			task.groups_z      = next->dispatch.thread_group_z;
+			task.mode          = next->dispatch.mode;
+			task.indirect      = kind == GpuOperationKind::DispatchIndirect;
+			task.async_compute = next->processor->IsAsyncComputeQueue();
+			executor.ScoutResolve(task);
+			sc.dispatches.fetch_add(1, std::memory_order_relaxed);
+		}
+		return true;
+	};
+	const auto push_resolved = [&](GpuOperation& op) {
+		if (!scout) {
+			m_resolved.Push(std::move(op));
+			return;
+		}
+		bool counted = false;
+		for (;;) {
+			if (g_exec_compiling.load(std::memory_order_acquire) == 0) {
+				if (m_resolved.PushUnless(op, [] { return g_exec_compiling.load(std::memory_order_acquire) != 0; })) return;
+				continue;
+			}
+			if (m_resolved.TryPush(op)) return;
+			if (!counted) {
+				counted = true;
+				g_compile_scout.stalls.fetch_add(1, std::memory_order_relaxed);
+			}
+			if (!scout_step()) {
+				g_compile_scout.polls.fetch_add(1, std::memory_order_relaxed);
+				std::this_thread::sleep_for(std::chrono::microseconds(500));
+			}
+		}
+	};
 	for (;;) {
+		if (scout && CompileJobsEnabled()) {
+			const auto now = std::chrono::steady_clock::now();
+			if (now - jobs_report_at >= std::chrono::seconds(10)) {
+				jobs_report_at = now;
+				m_renderer.GetPipelineCache().ReportCompileJobs();
+			}
+		}
 		auto operation = m_operations.TryPop();
 		if (!operation) {
 			const auto idle_start = g_gpu_stage_stats ? StageNowNs() : 0;
@@ -1426,6 +1492,7 @@ void GuestGpu::ResolveThread() {
 			}
 			if (g_gpu_stage_stats) g_stage_stats.resolve_idle_ns.fetch_add(StageNowNs() - idle_start, std::memory_order_relaxed);
 		}
+		if (scout_ahead != 0) scout_ahead--;
 		// The register snapshots stay valid until the operation executed.
 		const auto& state    = operation->state;
 		const auto  kind     = operation->kind;
@@ -1519,12 +1586,12 @@ void GuestGpu::ResolveThread() {
 		if (g_gpu_stage_stats) {
 			if (!m_resolved.TryPush(*operation)) {
 				const auto start = StageNowNs();
-				m_resolved.Push(std::move(*operation));
+				push_resolved(*operation);
 				g_stage_stats.resolved_full.fetch_add(1, std::memory_order_relaxed);
 				g_stage_stats.resolved_full_ns.fetch_add(StageNowNs() - start, std::memory_order_relaxed);
 			}
 		} else {
-			m_resolved.Push(std::move(*operation));
+			push_resolved(*operation);
 		}
 		RingExecution();
 		if (g_gpu_stage_stats) {
@@ -1576,6 +1643,10 @@ void GuestGpu::ResolveThread() {
 				std::fprintf(stderr, "PERF resolve_wait_hist count/ms[<5us <20 <100 <500 <2000 >=2000]=[%s]\n", hist.c_str());
 			}
 		}
+	}
+	if (scout) {
+		g_scout_kick.store(nullptr, std::memory_order_release);
+		g_scout_gpu.store(nullptr, std::memory_order_release);
 	}
 }
 

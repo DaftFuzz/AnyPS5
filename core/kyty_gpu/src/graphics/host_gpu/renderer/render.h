@@ -331,6 +331,7 @@ public:
 	// The helper (or, with KYTY_CHECK_RESOLVE=2, the resolve thread for the reference): resolves the task into `slot`
 	// (the draw's pre-check included) and marks it ready (empty when there was nothing to resolve).
 	bool ResolveTaskInto(ResolvedDraw& slot, const ResolveTask& task);
+	void ScoutResolve(const ResolveTask& task);
 	// The helper, taking a task: pending -> running; false when the execution thread stole it (the slot is freed then).
 	[[nodiscard]] static bool BeginResolveTask(ResolvedDraw* slot) noexcept;
 	// The execution thread: one look at a slot. Ready / Empty: resolved; Stolen: it was pending and is now the execution

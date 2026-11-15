@@ -31,6 +31,26 @@ namespace Libs::Graphics {
 
 class RenderContext;
 
+[[nodiscard]] bool CompileJobsEnabled();
+[[nodiscard]] bool CompileScoutEnabled();
+inline std::atomic<uint32_t>   g_exec_compiling {0};
+inline std::atomic<void (*)()> g_scout_kick {nullptr};
+inline thread_local bool       t_scouting = false;
+struct CompileScoutStats {
+	std::atomic<uint64_t> stalls {0}, scouted {0}, dispatches {0}, draws {0}, polls {0}, max_ahead {0};
+};
+inline CompileScoutStats g_compile_scout;
+struct CompileStallScope {
+	CompileStallScope() {
+		if (g_exec_compiling.fetch_add(1, std::memory_order_acq_rel) == 0) {
+			if (auto* kick = g_scout_kick.load(std::memory_order_acquire)) kick();
+		}
+	}
+	~CompileStallScope() { g_exec_compiling.fetch_sub(1, std::memory_order_acq_rel); }
+	CompileStallScope(const CompileStallScope&)            = delete;
+	CompileStallScope& operator=(const CompileStallScope&) = delete;
+};
+
 // The stage materializations the resolve thread made for one operation from its register snapshot (opaque;
 // pipelineCache.cpp). While the execution thread runs the operation, t_resolved_stages points at them, so a draw takes the
 // whole selection (AdoptResolvedPrograms) or ProgramCache::Get takes a matching result; either only when everything the
@@ -269,6 +289,7 @@ public:
 	// Based on chenxiao07/KytyPS5 v20261020b (src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp,
 	// CompileWorkers, TableWorkers, the pending graphics pipelines of GetGraphicsPipeline), GPL-2.0.
 	[[nodiscard]] static bool TableAsyncEnabled();
+	void                      ReportCompileJobs() const;
 	// `failed` (may be null): set when the worker could not create the pipeline (null is returned for good).
 	[[nodiscard]] Pipeline* GetGraphicsPipelineAsync(std::span<const RenderColorInfo>       colors,
 	                                                 const RenderDepthInfo&                 depth,

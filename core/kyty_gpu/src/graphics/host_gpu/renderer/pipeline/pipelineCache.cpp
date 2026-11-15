@@ -65,6 +65,7 @@
 #include <string_view>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <xxhash.h>
@@ -899,6 +900,7 @@ struct PipelineCache::ProgramCache {
 		}
 
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) t_compute_program_path = 4u; // KYTY_TRACE_DISPATCH_CENSUS
+		const CompileStallScope compile_stall;
 		ShaderStageInputInfo stage_input {};
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			stage_input.vertex = &input_info;
@@ -1195,6 +1197,42 @@ struct PipelineCache::ProgramCache {
 		precompile_stages[permutation.handle.id] = {.key = key, .spirv_hash = last_spirv_hash};
 	}
 
+	void QueueRuntimeCompile(const ShaderParams& params, const ShaderComputeInputInfo& input_info, uint32_t push_cursor,
+	                         std::span<const uint32_t> static_state,
+	                         const ShaderRecompiler::IR::ResourceSpecialization* specialization) {
+		uint64_t mark = 0;
+		if (specialization != nullptr) {
+			mark = PrecompileKey(ShaderType::Compute, params.hash, params.user_data_count,
+			                     static_cast<uint32_t>(params.code.size()), static_state, push_cursor, *specialization);
+		} else {
+			mark = XXH3_64bits(static_state.data(), static_state.size_bytes()) ^ params.hash ^
+			       (uint64_t {params.code.size()} << 40u) ^ (uint64_t {params.user_data_count} << 32u) ^ 0x46u;
+		}
+		{
+			std::lock_guard lock(runtime_jobs_mutex);
+			if (!runtime_jobs_seen.insert(mark).second) return;
+		}
+		PrecompileStageRecord record;
+		record.stage           = ShaderType::Compute;
+		record.shader_hash     = params.hash;
+		const auto user_data   = std::span(params.user_data).first(params.user_data_count);
+		record.user_data.assign(user_data.begin(), user_data.end());
+		record.code.assign(params.code.begin(), params.code.end());
+		record.back_code.assign(params.back_code.begin(), params.back_code.end());
+		if (PrecompileCodeHash(record.code, record.back_code) != params.hash) return;
+		record.compute       = input_info;
+		record.compute.stage = {};
+		record.static_key.assign(static_state.begin(), static_state.end());
+		record.push_data_start = push_cursor;
+		record.revision        = ShaderPrecompiler::Revision();
+		if (specialization != nullptr) {
+			record.specialization = *specialization;
+			precompiler->EnqueueRuntime(std::move(record));
+		} else {
+			precompiler->EnqueueFirstUse(std::move(record), params.Base(), mark);
+		}
+	}
+
 	// The record keys of a graphics pipeline's stages; false unless every stage was recorded.
 	bool PrecompileStageKeys(const GraphicsPrograms& programs, bool ps_active, PrecompileGraphicsRecord& record) const {
 		const auto find = [this](const ShaderProgram& program, uint64_t& key) {
@@ -1251,6 +1289,11 @@ struct PipelineCache::ProgramCache {
 		if (entry == nullptr || entry->call_source || results.count >= results.stages.size()) {
 			g_resolve_stats.no_program.fetch_add(1, std::memory_order_relaxed);
 			results.adoptable = false;
+			if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+				if (entry == nullptr && precompiler != nullptr && CompileJobsEnabled()) {
+					QueueRuntimeCompile(params, input_info, push_data_cursor, ahead_key.static_state, nullptr);
+				}
+			}
 			return;
 		}
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
@@ -1299,6 +1342,15 @@ struct PipelineCache::ProgramCache {
 			const ChunkLead::PartTimer perm_timer(ChunkLead::RpPermutation); // KYTY_TRACE_CHUNK_LEAD (N2.0)
 			std::shared_lock lock(programs_mutex);
 			permutation = entry->FindPermutationAhead(push_data_cursor, r.specialization);
+		}
+		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			if (permutation == nullptr && precompiler != nullptr && CompileJobsEnabled()) {
+				auto specialization = r.specialization;
+				if (!r.null_share_kinds.empty()) {
+					ShaderRecompiler::IR::PeekNullFormattedShare(*r.plan, r.null_share_kinds, specialization);
+				}
+				QueueRuntimeCompile(params, input_info, push_data_cursor, ahead_key.static_state, &specialization);
+			}
 		}
 		r.permutation    = permutation;
 		input_info.stage = {.program       = permutation != nullptr ? &permutation->program : nullptr,
@@ -1413,6 +1465,8 @@ struct PipelineCache::ProgramCache {
 		uint64_t spirv_hash = 0;
 	};
 	std::unordered_map<uint64_t, PrecompileStage> precompile_stages;
+	std::mutex                                    runtime_jobs_mutex;
+	std::unordered_set<uint64_t>                  runtime_jobs_seen;
 	// Inserts into `programs` and appends to a program's permutations take it exclusively (execution thread), the resolve
 	// thread's finds and permutation searches shared. The execution thread's own reads are unlocked: it is the only writer.
 	std::shared_mutex                                           programs_mutex;
@@ -2879,6 +2933,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	}
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
 	{
+		const CompileStallScope compile_stall;
 		ChunkCensus::t_pipelines++; // KYTY_TRACE_CHUNK_CENSUS (hole)
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
@@ -2944,6 +2999,35 @@ void TableAsyncReport(TableAsyncStats& s, size_t pending, size_t queued) {
 	             static_cast<unsigned long long>(s.failed), pending, queued, s.worker_ms);
 }
 } // namespace
+
+bool CompileJobsEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_PERF_COMPILE_JOBS");
+		const bool  on    = value != nullptr && value[0] == '1';
+		if (on) std::fprintf(stderr, "PERF_COMPILE_JOBS on\n");
+		return on;
+	}();
+	return enabled;
+}
+
+bool CompileScoutEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_PERF_COMPILE_SCOUT");
+		const bool  on    = CompileJobsEnabled() && value != nullptr && value[0] == '1';
+		if (on) std::fprintf(stderr, "PERF_COMPILE_SCOUT on\n");
+		return on;
+	}();
+	return enabled;
+}
+
+void PipelineCache::ReportCompileJobs() const {
+	if (!PerfEnabled() || !CompileJobsEnabled()) return;
+	const auto& s = g_compile_scout;
+	const auto  n = [](const std::atomic<uint64_t>& v) { return static_cast<unsigned long long>(v.load(std::memory_order_relaxed)); };
+	std::fprintf(stderr, "PERF compile_scout stalls=%llu scouted=%llu dispatches=%llu draws=%llu polls=%llu max_ahead=%llu\n",
+	             n(s.stalls), n(s.scouted), n(s.dispatches), n(s.draws), n(s.polls), n(s.max_ahead));
+	if (m_precompiler != nullptr) m_precompiler->ReportRuntimePerf();
+}
 
 bool PipelineCache::TableAsyncEnabled() {
 	static const bool enabled = [] {
@@ -3093,6 +3177,7 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	auto cached = std::make_unique<Pipeline>();
 	{
+		const CompileStallScope compile_stall;
 		ChunkCensus::t_pipelines++; // KYTY_TRACE_CHUNK_CENSUS (hole)
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,

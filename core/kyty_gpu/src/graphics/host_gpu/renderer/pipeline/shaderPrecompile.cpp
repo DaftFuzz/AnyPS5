@@ -1937,7 +1937,9 @@ void ShaderPrecompiler::Start(uint32_t requested_threads) {
 	const auto queued_graphics = static_cast<uint32_t>(std::ranges::count_if(
 	    m_jobs, [](const Job& job) { return job.state == JobState::Queued && job.graphics; }));
 	g_progress.queued_graphics.store(queued_graphics, std::memory_order_relaxed);
-	threads = std::min(threads, queued);
+	m_runtime = CompileJobsEnabled() && !Config::PrecompileOnly() && threads != 0;
+	if (!m_runtime) threads = std::min(threads, queued);
+	if (m_runtime) std::fprintf(stderr, "COMPILE_JOBS runtime jobs on: %u workers stay for misses in play\n", threads);
 	std::fprintf(stderr, "SHADER_PRECOMPILE journal=%s records=%zu queued=%u (compute %zu, graphics pipelines %zu of "
 	                     "%zu stages) threads=%u\n",
 	             m_journal_path.string().c_str(), m_jobs.size(), queued, m_compute_records.size(),
@@ -1946,7 +1948,7 @@ void ShaderPrecompiler::Start(uint32_t requested_threads) {
 	m_thread_count = threads;
 	g_progress.queued.store(queued, std::memory_order_relaxed);
 	g_progress.threads.store(threads, std::memory_order_relaxed);
-	g_progress.done.store(threads == 0, std::memory_order_relaxed);
+	g_progress.done.store(threads == 0 || (m_runtime && queued == 0), std::memory_order_relaxed);
 	g_progress.started.store(true, std::memory_order_release);
 	for (uint32_t i = 0; i < threads; i++) {
 		m_workers.emplace_back([this, i] { Worker(i); });
@@ -1959,6 +1961,7 @@ void ShaderPrecompiler::RequestStop() {
 		m_stop = true;
 	}
 	m_done.notify_all();
+	m_runtime_wake.notify_all();
 }
 
 void ShaderPrecompiler::Stop() {
@@ -2424,25 +2427,63 @@ void ShaderPrecompiler::Worker(uint32_t index) {
 	g_background_thread = true;
 	Common::Thread::SetCurrentName(fmt::format("Thread_ShaderPrecompile{}", index).c_str());
 	std::vector<vk::ShaderModule> unused;
+	bool                          boot_counted = false;
 	for (;;) {
-		Job* job = nullptr;
+		Job*        job     = nullptr;
+		RuntimeJob* runtime = nullptr;
+		bool        report  = false;
 		{
-			std::lock_guard lock(m_mutex);
+			std::unique_lock lock(m_mutex);
 			// Modules the jobs the GPU thread dropped released.
 			unused.swap(m_unused_modules);
-			while (!m_stop && m_next < m_jobs.size() && m_jobs[m_next].state != JobState::Queued) {
-				m_next++;
+			while (!m_runtime_queue.empty() && m_runtime_queue.front()->state != 0) m_runtime_queue.pop_front();
+			if (!m_stop && !m_quitting && !m_runtime_queue.empty()) {
+				runtime = m_runtime_queue.front();
+				m_runtime_queue.pop_front();
+				runtime->state  = 1;
+				runtime->worker = index;
+				if (runtime->key != 0) {
+					m_inflight.insert(runtime->key);
+					WriteInflightLocked();
+				}
+			} else {
+				while (!m_stop && m_next < m_jobs.size() && m_jobs[m_next].state != JobState::Queued) {
+					m_next++;
+				}
+				if (!m_stop && !m_quitting && m_next < m_jobs.size()) {
+					job         = &m_jobs[m_next++];
+					job->state  = JobState::Running;
+					job->worker = index;
+					m_inflight.insert(job->key);
+					WriteInflightLocked();
+				}
 			}
-			if (!m_stop && !m_quitting && m_next < m_jobs.size()) {
-				job         = &m_jobs[m_next++];
-				job->state  = JobState::Running;
-				job->worker = index;
-				m_inflight.insert(job->key);
-				WriteInflightLocked();
+			if (job == nullptr && runtime == nullptr && !boot_counted) {
+				boot_counted = true;
+				report       = m_finished.fetch_add(1) + 1 == m_thread_count;
 			}
 		}
 		DestroyModules(unused);
-		if (job == nullptr) break;
+		if (report) ReportDone(unused);
+		if (runtime != nullptr) {
+			LowerCurrentThreadPriority();
+			RunRuntimeJob(*runtime);
+			{
+				std::lock_guard lock(m_mutex);
+				runtime->state = 2;
+				if (runtime->key != 0) m_inflight.erase(runtime->key);
+				if (!m_quitting) WriteInflightLocked();
+			}
+			m_done.notify_all();
+			continue;
+		}
+		if (job == nullptr) {
+			if (!m_runtime) break;
+			std::unique_lock lock(m_mutex);
+			m_runtime_wake.wait(lock, [this] { return m_stop || m_quitting || !m_runtime_queue.empty(); });
+			if (m_stop || m_quitting) break;
+			continue;
+		}
 		// Below normal again (the GPU thread raises a worker it waits for).
 		LowerCurrentThreadPriority();
 		if (job->stage_only) {
@@ -2468,8 +2509,10 @@ void ShaderPrecompiler::Worker(uint32_t index) {
 		m_done.notify_all();
 		DestroyModules(unused);
 	}
-	if (m_finished.fetch_add(1) + 1 == m_thread_count) {
-		// The last worker: no job runs any more, every stage module goes.
+}
+
+void ShaderPrecompiler::ReportDone(std::vector<vk::ShaderModule>& unused) {
+	{
 		{
 			std::lock_guard lock(m_mutex);
 			CollectModulesLocked(unused);
@@ -3075,8 +3118,166 @@ void ShaderPrecompiler::CompileGraphics(Job& job) {
 	}
 }
 
+namespace {
+struct RuntimeJobStats {
+	std::atomic<uint64_t> queued {0}, first_use {0}, duplicate {0}, full {0}, started {0}, compiled {0}, first_use_failed {0};
+	std::atomic<uint64_t> first_use_known {0}, skipped_taken {0}, dropped {0}, waited {0}, wait_us {0}, ready {0};
+	std::atomic<uint64_t> lead_us {0}, lead_n {0};
+} g_runtime_jobs;
+constexpr size_t RuntimeQueueMax = 1024;
+} // namespace
+
+void ShaderPrecompiler::EnqueueRuntime(PrecompileStageRecord record) {
+	if (!m_runtime) return;
+	const auto key = record.Key();
+	if (!ReuseWanted(key, true)) return;
+	auto job       = std::make_unique<RuntimeJob>();
+	job->record    = std::move(record);
+	job->key       = key;
+	job->queued_at = std::chrono::steady_clock::now();
+	{
+		std::lock_guard lock(m_mutex);
+		if (m_stop || m_quitting || m_job_index.contains(key) || m_runtime_index.contains(key)) {
+			g_runtime_jobs.duplicate.fetch_add(1, std::memory_order_relaxed);
+			return;
+		}
+		if (m_runtime_queue.size() >= RuntimeQueueMax) {
+			g_runtime_jobs.full.fetch_add(1, std::memory_order_relaxed);
+			return;
+		}
+		m_runtime_index.emplace(key, job.get());
+		m_runtime_queue.push_back(job.get());
+		m_runtime_jobs.push_back(std::move(job));
+	}
+	g_runtime_jobs.queued.fetch_add(1, std::memory_order_relaxed);
+	m_runtime_wake.notify_one();
+}
+
+void ShaderPrecompiler::EnqueueFirstUse(PrecompileStageRecord record, uint64_t shader_base, uint64_t program) {
+	if (!m_runtime) return;
+	auto job         = std::make_unique<RuntimeJob>();
+	job->record      = std::move(record);
+	job->shader_base = shader_base;
+	job->first_use   = true;
+	job->queued_at   = std::chrono::steady_clock::now();
+	{
+		std::lock_guard lock(m_mutex);
+		if (m_stop || m_quitting || !m_first_use_seen.insert(program).second) return;
+		if (m_runtime_queue.size() >= RuntimeQueueMax) {
+			g_runtime_jobs.full.fetch_add(1, std::memory_order_relaxed);
+			return;
+		}
+		m_runtime_queue.push_back(job.get());
+		m_runtime_jobs.push_back(std::move(job));
+	}
+	g_runtime_jobs.first_use.fetch_add(1, std::memory_order_relaxed);
+	m_runtime_wake.notify_one();
+}
+
+bool ShaderPrecompiler::MaterializeFirstUse(PrecompileStageRecord& record, uint64_t shader_base) {
+	ShaderComputeInputInfo compute = record.compute;
+	ShaderStageInputInfo   stage_input {};
+	stage_input.compute = &compute;
+	ShaderRecompiler::CompileOptions options;
+	options.stage       = record.stage;
+	options.shader_hash = record.shader_hash;
+	options.user_data   = record.user_data;
+	options.back_code   = record.back_code;
+	options.input_info  = stage_input;
+	SetStageCompileOptions(options);
+	static const auto profile = ShaderCompileProfile(m_graphics);
+	options.profile           = &profile;
+	auto source               = ShaderRecompiler::PrepareShaderSource(record.code, options);
+	if (!source.calls.empty() || source.unsupported_call_pc != UINT32_MAX) return false;
+	auto       translated = ShaderRecompiler::TranslateProgram(source.decoded, options);
+	const auto plan       = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+	ShaderRecompiler::IR::SrtRuntime runtime {
+	    .user_data                  = std::span<const uint32_t>(record.user_data),
+	    .shader_base                = shader_base,
+	    .read_specialization_memory = &ShaderRecompiler::IR::AheadReadMemory,
+	    .workgroup_counts           = std::span<const uint32_t>(compute.workgroup_counts, 3),
+	};
+	constexpr uint32_t Slot                    = 5;
+	ShaderRecompiler::IR::t_ahead_scratch_slot = Slot;
+	ShaderRecompiler::IR::ResourceSnapshot       snapshot;
+	ShaderRecompiler::IR::ResourceSpecialization specialization;
+	ShaderRecompiler::IR::ReadLog                log;
+	if (!ShaderRecompiler::IR::MaterializeResourcesAhead(plan, runtime, snapshot, specialization, log)) return false;
+	ShaderRecompiler::IR::PeekNullFormattedShare(plan, plan.scratch[Slot].null_share_kinds, specialization);
+	record.specialization = std::move(specialization);
+	return true;
+}
+
+void ShaderPrecompiler::RunRuntimeJob(RuntimeJob& job) {
+	g_runtime_jobs.started.fetch_add(1, std::memory_order_relaxed);
+	if (job.first_use) {
+		if (!MaterializeFirstUse(job.record, job.shader_base)) {
+			g_runtime_jobs.first_use_failed.fetch_add(1, std::memory_order_relaxed);
+			return;
+		}
+		const auto key = job.record.Key();
+		{
+			std::lock_guard lock(m_mutex);
+			if (m_job_index.contains(key) || m_runtime_index.contains(key)) {
+				g_runtime_jobs.first_use_known.fetch_add(1, std::memory_order_relaxed);
+				return;
+			}
+			job.key = key;
+			m_runtime_index.emplace(key, &job);
+			m_inflight.insert(key);
+			WriteInflightLocked();
+		}
+	}
+	if (!ReuseWanted(job.key, true)) {
+		g_runtime_jobs.skipped_taken.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	Compile(job.record, job.key, false);
+	g_runtime_jobs.compiled.fetch_add(1, std::memory_order_relaxed);
+}
+
+void ShaderPrecompiler::ReportRuntimePerf() const {
+	if (!m_runtime) return;
+	const auto& s = g_runtime_jobs;
+	const auto  n = [](const std::atomic<uint64_t>& v) { return static_cast<unsigned long long>(v.load(std::memory_order_relaxed)); };
+	std::fprintf(stderr,
+	             "PERF compile_jobs queued=%llu first_use=%llu duplicate=%llu full=%llu started=%llu compiled=%llu "
+	             "first_use_failed=%llu first_use_known=%llu skipped_taken=%llu dropped=%llu waited=%llu wait_ms=%.0f "
+	             "ready=%llu lead_ms_avg=%.0f\n",
+	             n(s.queued), n(s.first_use), n(s.duplicate), n(s.full), n(s.started), n(s.compiled), n(s.first_use_failed),
+	             n(s.first_use_known), n(s.skipped_taken), n(s.dropped), n(s.waited),
+	             static_cast<double>(n(s.wait_us)) / 1000.0, n(s.ready),
+	             n(s.lead_n) != 0 ? static_cast<double>(n(s.lead_us)) / 1000.0 / static_cast<double>(n(s.lead_n)) : 0.0);
+}
+
 bool ShaderPrecompiler::BeforeCompile(uint64_t key) {
 	std::unique_lock lock(m_mutex);
+	if (const auto runtime = m_runtime_index.find(key); runtime != m_runtime_index.end()) {
+		auto& job = *runtime->second;
+		g_runtime_jobs.lead_us.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+		                                                           std::chrono::steady_clock::now() - job.queued_at)
+		                                                           .count()),
+		                                 std::memory_order_relaxed);
+		g_runtime_jobs.lead_n.fetch_add(1, std::memory_order_relaxed);
+		if (job.state == 0) {
+			job.state = 3;
+			g_runtime_jobs.dropped.fetch_add(1, std::memory_order_relaxed);
+			return true;
+		}
+		if (job.state == 1) {
+			RaiseThreadPriority(m_workers[job.worker]);
+			const auto begin = std::chrono::steady_clock::now();
+			WaitOnDone(lock, m_done, [&] { return job.state != 1; });
+			g_runtime_jobs.waited.fetch_add(1, std::memory_order_relaxed);
+			g_runtime_jobs.wait_us.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+			                                                            std::chrono::steady_clock::now() - begin)
+			                                                            .count()),
+			                                 std::memory_order_relaxed);
+		} else {
+			g_runtime_jobs.ready.fetch_add(1, std::memory_order_relaxed);
+		}
+		return false;
+	}
 	const auto found = m_job_index.find(key);
 	if (found == m_job_index.end()) return false;
 	auto& job = m_jobs[found->second];

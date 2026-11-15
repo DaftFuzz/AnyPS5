@@ -4091,6 +4091,18 @@ void RenderExecutor::ReleaseResolvedDraw(ResolvedDraw* resolved) noexcept {
 	resolved->phase.store(PhaseFree, std::memory_order_release);
 }
 
+void RenderExecutor::ScoutResolve(const ResolveTask& task) {
+	thread_local ResolvedDraw* scout = new ResolvedDraw();
+	t_scouting                       = true;
+	if (task.dispatch) {
+		(void)ResolveDispatchInto(*scout, *task.shaders, task.groups_x, task.groups_y, task.groups_z, task.mode, task.indirect,
+		                          task.async_compute);
+	} else {
+		(void)ResolveDrawInto(*scout, *task.context, *task.user_config, *task.shaders, task.indirect_draw);
+	}
+	t_scouting = false;
+}
+
 // Project 15 N2.2: the helper's resolution of a task (the draw's pre-check included) and the phases around it.
 bool RenderExecutor::ResolveTaskInto(ResolvedDraw& slot, const ResolveTask& task) {
 	bool ok = false;

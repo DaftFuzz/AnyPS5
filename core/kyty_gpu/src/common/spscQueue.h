@@ -201,6 +201,42 @@ public:
 		Construct(tail, std::move(value));
 	}
 
+	template <typename Stop>
+	bool PushUnless(T& value, Stop stop) {
+		const auto tail = m_tail.load(std::memory_order_relaxed);
+		if (tail - m_producer_head >= m_capacity) {
+			m_producer_head = m_head.load(std::memory_order_acquire);
+			if (tail - m_producer_head >= m_capacity) {
+				SpinWait spin;
+				for (;;) {
+					if (stop()) return false;
+					if (!spin.Spin()) break;
+					m_producer_head = m_head.load(std::memory_order_acquire);
+					if (tail - m_producer_head < m_capacity) break;
+				}
+				while (tail - m_producer_head >= m_capacity) {
+					m_producer_sleeping.store(true, std::memory_order_seq_cst);
+					const auto signal = m_producer_signal.load(std::memory_order_seq_cst);
+					m_producer_head   = m_head.load(std::memory_order_seq_cst);
+					if (tail - m_producer_head < m_capacity) break;
+					if (stop()) {
+						m_producer_sleeping.store(false, std::memory_order_relaxed);
+						return false;
+					}
+					m_producer_signal.wait(signal, std::memory_order_seq_cst);
+				}
+				m_producer_sleeping.store(false, std::memory_order_relaxed);
+			}
+		}
+		Construct(tail, std::move(value));
+		return true;
+	}
+
+	void KickProducer() {
+		m_producer_signal.fetch_add(1, std::memory_order_seq_cst);
+		m_producer_signal.notify_all();
+	}
+
 	// Returns false (and keeps `value`) when the ring is full.
 	bool TryPush(T& value) {
 		const auto tail = m_tail.load(std::memory_order_relaxed);

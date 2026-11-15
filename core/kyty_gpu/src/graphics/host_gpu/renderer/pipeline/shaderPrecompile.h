@@ -12,6 +12,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <cstdio>
 #include <filesystem>
 #include <memory>
@@ -312,7 +313,23 @@ public:
 	// GPU thread, after it created a graphics pipeline from recorded stages: appended unless already recorded.
 	void RecordPipeline(const PrecompileGraphicsRecord& record);
 
+	void EnqueueRuntime(PrecompileStageRecord record);
+	void EnqueueFirstUse(PrecompileStageRecord record, uint64_t shader_base, uint64_t program);
+	void ReportRuntimePerf() const;
+
 private:
+	struct RuntimeJob {
+		PrecompileStageRecord record;
+		uint64_t              key         = 0;
+		uint64_t              shader_base = 0;
+		bool                  first_use   = false;
+		uint8_t               state       = 0;
+		uint32_t              worker      = 0;
+		std::chrono::steady_clock::time_point queued_at {};
+	};
+	void RunRuntimeJob(RuntimeJob& job);
+	bool MaterializeFirstUse(PrecompileStageRecord& record, uint64_t shader_base);
+	void ReportDone(std::vector<vk::ShaderModule>& unused);
 	enum class JobState : uint8_t { Queued, Running, Done, Dropped };
 	enum class StageState : uint8_t { Idle, Compiling, Ready, Failed };
 	struct Job {
@@ -406,6 +423,12 @@ private:
 	std::vector<uint64_t>                  m_stage_order;      // their keys in file order
 	std::vector<Job>                       m_jobs; // fixed once workers start
 	std::unordered_map<uint64_t, size_t>   m_job_index;
+	bool                                         m_runtime = false;
+	std::condition_variable                      m_runtime_wake;
+	std::deque<RuntimeJob*>                      m_runtime_queue;
+	std::vector<std::unique_ptr<RuntimeJob>>     m_runtime_jobs;
+	std::unordered_map<uint64_t, RuntimeJob*>    m_runtime_index;
+	std::unordered_set<uint64_t>                 m_first_use_seen;
 	// The null share journal: the loaded records (compute and graphics stages, file order) by program key
 	// (ProgramKey of the record's identity); fixed once loaded.
 	std::unordered_map<uint64_t, std::vector<const PrecompileStageRecord*>> m_program_records;
