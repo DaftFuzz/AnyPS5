@@ -96,6 +96,12 @@ constexpr SwitchInfo Switches[] = {
     // Only how CompareBackingBatch finds each span's backing bytes (the thread's cached slot without the map's shared
     // lock, or the locked lookup), per call; the bytes compared and the verdict are the same (aps5/memoryShim.cpp).
     {Switch::CompareLockFree, "KYTY_PERF_COMPARE_LOCKFREE", 1},
+    // Per call: ReadGpuCopy reads its bytes after their own writes finished (mapping or direct guest memory) or records
+    // the copy after all recorded work; no state is changed either way.
+    {Switch::CountExact, "KYTY_PERF_COUNT_EXACT", 1},
+    // Per adoption check: whether guest commands queued during its GPU waits run inside the wait (the check then runs
+    // again) or after the operation; the verdict is that of a pass without commands either way.
+    {Switch::ServeInWait, "KYTY_PERF_SERVE_IN_WAIT", 1},
     // Project 15 way B P1 (test switch): a read-only buffer binding with a ready plan entry whose proof holds takes the
     // binding the helper computed (handle, aligned offset, range, offset byte, record stride) instead of RebindBuffers'.
 };

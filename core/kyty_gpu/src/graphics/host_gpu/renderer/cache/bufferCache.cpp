@@ -2552,6 +2552,113 @@ void BufferCache::ApplyDirectCpWrites(uint64_t vaddr, void* data, uint64_t size)
 	}
 }
 
+// ---- KYTY_PERF_SERVE_IN_WAIT (bufferCache.h) --------------------------------------------------------------------------
+namespace {
+thread_local uint32_t t_serve_allowed = 0;
+thread_local bool     t_serve_active  = false;
+thread_local bool     t_serve_served  = false;
+
+uint32_t ServeInWaitFixed() {
+	static const uint32_t value = [] {
+		const char*    text = std::getenv("KYTY_PERF_SERVE_IN_WAIT");
+		const uint32_t v    = text != nullptr ? static_cast<uint32_t>(std::strtoul(text, nullptr, 10)) : 0u;
+		if (v != 0) std::fprintf(stderr, "KYTY_PERF_SERVE_IN_WAIT=%u: guest commands run during the adoption check's GPU waits%s\n", v, v == 2 ? " (check: verdicts compared)" : "");
+		return v;
+	}();
+	return value;
+}
+
+struct ServeInWaitStats {
+	std::atomic<uint64_t> checks {0}, restarts {0}, waits {0}, wait_ns {0}, served {0}, compared {0}, differ {0}, differ_lines {0};
+	std::atomic<int64_t>  window_start {0};
+};
+ServeInWaitStats g_serve;
+
+void ReportServeInWait() {
+	if (!PerfEnabled()) return;
+	auto&         s     = g_serve;
+	const int64_t now   = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+	int64_t       start = s.window_start.load(std::memory_order_relaxed);
+	if (start == 0) {
+		s.window_start.compare_exchange_strong(start, now, std::memory_order_relaxed);
+		return;
+	}
+	if (now - start < 5000 || !s.window_start.compare_exchange_strong(start, now, std::memory_order_relaxed)) return;
+	const auto take = [](std::atomic<uint64_t>& c) { return static_cast<unsigned long long>(c.exchange(0, std::memory_order_relaxed)); };
+	const auto checks = take(s.checks), restarts = take(s.restarts), waits = take(s.waits);
+	const auto wait_ns = take(s.wait_ns), served = take(s.served), compared = take(s.compared), differ = take(s.differ);
+	std::fprintf(stderr, "PERF serve_in_wait checks=%llu restarts=%llu waits=%llu wait_ms=%.1f served=%llu compared=%llu differ=%llu (per ~5 s)\n",
+	             checks, restarts, waits, static_cast<double>(wait_ns) / 1e6, served, compared, differ);
+}
+} // namespace
+
+uint32_t BufferCache::ServeInWaitMode() {
+	return Common::LiveAb::Gate(Common::LiveAb::Switch::ServeInWait, ServeInWaitFixed());
+}
+
+BufferCache::ServeInWaitAllow::ServeInWaitAllow(): previous(t_serve_allowed) {
+	t_serve_allowed = GuestGpu::IsGpuThread() && GuestGpu::WaitsServeCommands() ? ServeInWaitMode() : 0u;
+}
+
+BufferCache::ServeInWaitAllow::~ServeInWaitAllow() {
+	t_serve_allowed = previous;
+}
+
+bool BufferCache::ServeInWaitAllowed() {
+	return t_serve_allowed != 0u && !t_serve_active;
+}
+
+BufferCache::ServeInWaitPass::ServeInWaitPass(bool on): previous_active(t_serve_active), previous_served(t_serve_served) {
+	t_serve_active = on;
+	t_serve_served = false;
+}
+
+BufferCache::ServeInWaitPass::~ServeInWaitPass() {
+	t_serve_active = previous_active;
+	t_serve_served = previous_served;
+}
+
+bool BufferCache::ServeInWaitPass::Served() const {
+	return t_serve_served;
+}
+
+void BufferCache::NoteServeInWaitCheck(uint32_t passes, bool checked, bool differ) {
+	auto& s = g_serve;
+	s.checks.fetch_add(1, std::memory_order_relaxed);
+	if (passes > 1u) s.restarts.fetch_add(passes - 1u, std::memory_order_relaxed);
+	if (checked) s.compared.fetch_add(1, std::memory_order_relaxed);
+	if (differ) {
+		s.differ.fetch_add(1, std::memory_order_relaxed);
+		if (s.differ_lines.fetch_add(1, std::memory_order_relaxed) < 32u) {
+			std::fprintf(stderr, "PERF_SERVE_IN_WAIT_DIFFER frame=%u passes=%u\n", DebugPresentCount().load(), passes);
+		}
+	}
+	ReportServeInWait();
+}
+
+// Inside an adoption-check pass: the guest commands queued while the GPU has not reached `target`, run on this thread
+// with no pass active (a command's own waits block as usual). The pass is marked served and is discarded by its check.
+void BufferCache::ServeWhileWaiting(uint64_t target) {
+	auto&      master = m_scheduler.GetMasterSemaphore();
+	const auto t0     = std::chrono::steady_clock::now();
+	g_serve.waits.fetch_add(1, std::memory_order_relaxed);
+	constexpr uint64_t SliceNs = 100'000;
+	while (!master.IsFree(target)) {
+		if (GuestGpu::CommandsWaiting()) {
+			t_serve_active = false;
+			GuestGpu::RunCommandsWhileWaiting();
+			t_serve_active = true;
+			t_serve_served = true;
+			m_direct_cp_overlay.clear();
+			g_serve.served.fetch_add(1, std::memory_order_relaxed);
+			continue;
+		}
+		if (master.WaitFor(target, SliceNs)) break;
+	}
+	g_serve.wait_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()),
+	                          std::memory_order_relaxed);
+}
+
 bool BufferCache::WaitDirectGpuWrites(uint64_t vaddr, uint64_t size, bool cp_overlay) {
 	m_direct_cp_overlay.clear();
 	if (m_direct_ranges.empty()) return false;
@@ -2611,6 +2718,7 @@ bool BufferCache::WaitDirectGpuWrites(uint64_t vaddr, uint64_t size, bool cp_ove
 			m_scheduler.Flush();
 			g_direct_stats.flushes.fetch_add(1, std::memory_order_relaxed);
 		}
+		if (t_serve_active) ServeWhileWaiting(target);
 		m_scheduler.Wait(target);
 		RenderExecutor::GpuBurnAt(RenderExecutor::GpuBurnSite::DirectWait); // KYTY_DIAG_GPU_BURN_AT=direct_wait (measurement only)
 		g_direct_stats.waits.fetch_add(1, std::memory_order_relaxed);
@@ -6561,6 +6669,127 @@ bool BufferCache::PendingReadbackCovers(uint64_t vaddr, uint64_t size) const {
 	return false;
 }
 
+// ---- KYTY_PERF_COUNT_EXACT (G2, design-gpuwait 2.3) ------------------------------------------------------------------
+// ReadGpuCopy (instance counts of GPU-executed indirect packets) waits for the bytes' own writes instead of recording a
+// copy and waiting for everything recorded so far:
+//  - bytes inside an active direct range: the newest listed GPU write overlapping them (WaitDirectGpuWrites, the rule
+//    the walker's reads of the same ranges use), then guest memory, which the GPU writes in place;
+//  - bytes all GPU-dirty in a host-mapped buffer: TryBarDownload's conditions (known granule ticks, the buffer's ready
+//    tick, written by a finished command buffer, no write obtained but not recorded), then the mapping.
+// Every other read takes the copy. 1 = on (live A/B switch), 2 = check (start value only): both reads, counted
+// mismatches; the copy's bytes are returned.
+namespace {
+uint32_t CountExactFixed() {
+	static const uint32_t value = [] {
+		const char* text = std::getenv("KYTY_PERF_COUNT_EXACT");
+		const uint32_t v = text != nullptr ? static_cast<uint32_t>(std::strtoul(text, nullptr, 10)) : 0u;
+		if (v != 0) std::fprintf(stderr, "KYTY_PERF_COUNT_EXACT=%u: instance-count reads wait for their bytes' writes%s\n", v, v == 2 ? " (check: both reads compared)" : "");
+		return v;
+	}();
+	return value;
+}
+
+enum CountExactWay : uint32_t { CeDirect, CeMapped, CeNotDirty, CeNoTick, CeOpen, CePending, CeNoMap, CeWays };
+
+struct CountExactStats {
+	std::atomic<uint64_t> calls {0}, copies {0}, copy_ns {0}, fast_ns {0}, fast_waits {0};
+	std::atomic<uint64_t> ways[CeWays] {};
+	std::atomic<uint64_t> checked {0}, mismatched {0}, mismatch_lines {0};
+	std::atomic<int64_t>  window_start {0};
+};
+CountExactStats g_count_exact;
+
+void ReportCountExact() {
+	if (!PerfEnabled()) return;
+	auto&         s   = g_count_exact;
+	const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+	int64_t       start = s.window_start.load(std::memory_order_relaxed);
+	if (start == 0) {
+		s.window_start.compare_exchange_strong(start, now, std::memory_order_relaxed);
+		return;
+	}
+	if (now - start < 5000 || !s.window_start.compare_exchange_strong(start, now, std::memory_order_relaxed)) return;
+	const auto take = [](std::atomic<uint64_t>& c) { return static_cast<unsigned long long>(c.exchange(0, std::memory_order_relaxed)); };
+	const auto cn   = take(s.copy_ns);
+	const auto fn   = take(s.fast_ns);
+	std::fprintf(stderr,
+	             "PERF count_exact calls=%llu copies=%llu copy_ms=%.2f direct=%llu mapped=%llu fast_waits=%llu fast_ms=%.2f "
+	             "declined(notdirty,notick,open,pending,nomap)=%llu,%llu,%llu,%llu,%llu checked=%llu mismatched=%llu (per ~5 s)\n",
+	             take(s.calls), take(s.copies), static_cast<double>(cn) / 1e6, take(s.ways[CeDirect]), take(s.ways[CeMapped]),
+	             take(s.fast_waits), static_cast<double>(fn) / 1e6, take(s.ways[CeNotDirty]), take(s.ways[CeNoTick]),
+	             take(s.ways[CeOpen]), take(s.ways[CePending]), take(s.ways[CeNoMap]), take(s.checked), take(s.mismatched));
+}
+} // namespace
+
+bool BufferCache::ReadCountExact(Buffer& buffer, uint64_t vaddr, uint64_t size, void* out) {
+	auto&      s    = g_count_exact;
+	const auto way  = [&](CountExactWay w) {
+		s.ways[w].fetch_add(1, std::memory_order_relaxed);
+		return false;
+	};
+	const auto timed_wait = [&](auto&& wait) {
+		const auto t0 = std::chrono::steady_clock::now();
+		if (wait()) s.fast_waits.fetch_add(1, std::memory_order_relaxed);
+		s.fast_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()),
+		                    std::memory_order_relaxed);
+	};
+	if (!GuestGpu::IsGpuThread()) return way(CeNoMap);
+	bool inside_direct = false;
+	for (const auto& range: m_direct_ranges) {
+		if (range.active && range.start <= vaddr && vaddr + size <= range.end) inside_direct = true;
+	}
+	if (inside_direct) {
+		bool overlay = false;
+		timed_wait([&] {
+			const uint64_t before = g_direct_wait_total.load(std::memory_order_relaxed);
+			overlay               = WaitDirectGpuWrites(vaddr, size, false);
+			return g_direct_wait_total.load(std::memory_order_relaxed) != before;
+		});
+		if (overlay || !LibKernel::Memory::TryReadBacking(vaddr, out, size)) return way(CeNoMap);
+		s.ways[CeDirect].fetch_add(1, std::memory_order_relaxed);
+		return true;
+	}
+	if (buffer.Mapped().empty()) return way(CeNoMap);
+	const auto base   = buffer.CpuAddress();
+	uint64_t   newest = 0, covered = 0;
+	bool       unknown = false;
+	m_memory_tracker.ForEachDownloadRange<false>(vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
+		m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
+			const uint64_t lo = std::max(start, vaddr);
+			const uint64_t hi = std::min(end, vaddr + size);
+			if (lo >= hi) return;
+			covered += hi - lo;
+			for (uint64_t page = lo & ~uint64_t {TRACKER_PAGE_SIZE - 1}; page < hi; page += TRACKER_PAGE_SIZE) {
+				const auto tick = GranuleWriteTick(WriteTickKey(page));
+				if (!tick) {
+					unknown = true;
+					return;
+				}
+				newest = std::max(newest, *tick);
+			}
+		});
+	});
+	if (covered != size) return way(CeNotDirty);
+	if (unknown) return way(CeNoTick);
+	const auto ready = m_buffer_ready_tick.find(reinterpret_cast<uint64_t>(static_cast<VkBuffer>(buffer.Handle())));
+	if (ready == m_buffer_ready_tick.end()) return way(CeNoTick);
+	newest = std::max(newest, ready->second);
+	if (newest >= m_scheduler.CurrentTick()) return way(CeOpen);
+	if (std::ranges::any_of(m_bar_pending_writes, [&](const auto& w) { return w.first < vaddr + size && vaddr < w.first + w.second; })) {
+		return way(CePending);
+	}
+	timed_wait([&] {
+		const bool blocked = !m_scheduler.IsFree(newest) || !m_scheduler.PriorityOperationsDone(newest);
+		m_scheduler.Wait(newest);
+		m_scheduler.WaitPriorityOperations(newest);
+		return blocked;
+	});
+	if (!buffer.IsCoherent()) buffer.Invalidate(0, buffer.Size());
+	CopyFromWriteCombined(static_cast<uint8_t*>(out), buffer.Mapped().data() + (vaddr - base), size);
+	s.ways[CeMapped].fetch_add(1, std::memory_order_relaxed);
+	return true;
+}
+
 bool BufferCache::ReadGpuCopy(uint64_t vaddr, uint64_t size, void* out) {
 	if (vaddr == 0 || size == 0 || size > 1024u * 1024u) return false;
 	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
@@ -6569,6 +6798,43 @@ bool BufferCache::ReadGpuCopy(uint64_t vaddr, uint64_t size, void* out) {
 	if (!buffer.IsInBounds(vaddr, size) || m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
 		return false;
 	}
+	const uint32_t exact = size <= 64u ? Common::LiveAb::Gate(Common::LiveAb::Switch::CountExact, CountExactFixed()) : 0u;
+	std::array<uint8_t, 64> fast {};
+	bool                    fast_ok = false;
+	if (exact != 0u) {
+		g_count_exact.calls.fetch_add(1, std::memory_order_relaxed);
+		fast_ok = ReadCountExact(buffer, vaddr, size, fast.data());
+		ReportCountExact();
+		if (fast_ok && exact == 1u) {
+			std::memcpy(out, fast.data(), size);
+			return true;
+		}
+	}
+	const auto copy_start = exact != 0u ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+	if (!ReadGpuCopyRecorded(buffer, vaddr, size, out)) return false;
+	if (exact != 0u) {
+		g_count_exact.copies.fetch_add(1, std::memory_order_relaxed);
+		g_count_exact.copy_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - copy_start).count()),
+		                                std::memory_order_relaxed);
+	}
+	if (fast_ok) {
+		g_count_exact.checked.fetch_add(1, std::memory_order_relaxed);
+		if (std::memcmp(out, fast.data(), size) != 0) {
+			g_count_exact.mismatched.fetch_add(1, std::memory_order_relaxed);
+			if (g_count_exact.mismatch_lines.fetch_add(1, std::memory_order_relaxed) < 32u) {
+				uint32_t a = 0, b = 0;
+				std::memcpy(&a, out, std::min<uint64_t>(size, 4));
+				std::memcpy(&b, fast.data(), std::min<uint64_t>(size, 4));
+				std::fprintf(stderr, "PERF_COUNT_EXACT_MISMATCH addr=0x%llx size=%llu copy=0x%08x fast=0x%08x direct=%d frame=%u\n",
+				             static_cast<unsigned long long>(vaddr), static_cast<unsigned long long>(size), a, b,
+				             InDirectRange(vaddr, size) ? 1 : 0, DebugPresentCount().load());
+			}
+		}
+	}
+	return true;
+}
+
+bool BufferCache::ReadGpuCopyRecorded(Buffer& buffer, uint64_t vaddr, uint64_t size, void* out) {
 	auto [mapped, offset] = m_download_buffer.Map(size, 64);
 	if (mapped == nullptr) return false;
 	m_download_buffer.Commit();

@@ -488,6 +488,32 @@ public:
 	static void NoteVerifyRange(VerifyRangeEvent event);
 	// The number of blocking waits WaitDirectGpuWrites made so far (monotonic).
 	[[nodiscard]] static uint64_t DirectWaitTotal();
+	// KYTY_PERF_SERVE_IN_WAIT (G5, design-gpuwait 2.1; default 0; 1 on, live A/B switch; 2 check, start value only), GPU
+	// thread. A compute program lookup (ServeInWaitAllow, before anything of the dispatch is recorded) lets its adoption
+	// check (ResolvedReadsHold) run its passes in ServeInWaitPass scopes: a blocking wait of WaitDirectGpuWrites inside
+	// one runs the queued guest commands (RunCommandsWhileWaiting) while the GPU works, and a pass in which any command
+	// ran is discarded and the check runs again, so the verdict is that of a pass with no command inside it, as when
+	// the commands are served between the previous operation and this one. Check: after a pass without commands the
+	// check runs a second time without serving and differing verdicts are counted.
+	[[nodiscard]] static uint32_t ServeInWaitMode();
+	struct ServeInWaitAllow {
+		ServeInWaitAllow();
+		~ServeInWaitAllow();
+		ServeInWaitAllow(const ServeInWaitAllow&)            = delete;
+		ServeInWaitAllow& operator=(const ServeInWaitAllow&) = delete;
+		uint32_t previous;
+	};
+	[[nodiscard]] static bool ServeInWaitAllowed();
+	struct ServeInWaitPass {
+		explicit ServeInWaitPass(bool on);
+		~ServeInWaitPass();
+		ServeInWaitPass(const ServeInWaitPass&)            = delete;
+		ServeInWaitPass& operator=(const ServeInWaitPass&) = delete;
+		[[nodiscard]] bool Served() const;
+		bool               previous_active;
+		bool               previous_served;
+	};
+	static void NoteServeInWaitCheck(uint32_t passes, bool checked, bool differ);
 	// KYTY_DIAG_PAGE_MARK_CHECK=1 (diagnostic, default off, read once), GPU thread. The resource walker remembers a
 	// 4 KiB page as clean for the rest of one walk (OrdinaryReadPageCache in aps5/memoryShim.cpp and kernel/memory.cpp);
 	// a read through that mark takes guest memory without a question. An ordinary read sets the mark after asking
@@ -1109,6 +1135,10 @@ private:
 	// write tick are copied from the mapping after waiting for that tick only. 1: copied and
 	// published, -1: not possible (use the GPU copy path).
 	int TryBarDownload(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	// KYTY_PERF_COUNT_EXACT: ReadGpuCopy's read by the bytes' own write ticks (false: not served), and its recorded copy.
+	bool ReadCountExact(Buffer& buffer, uint64_t vaddr, uint64_t size, void* out);
+	bool ReadGpuCopyRecorded(Buffer& buffer, uint64_t vaddr, uint64_t size, void* out);
+	void ServeWhileWaiting(uint64_t target); // KYTY_PERF_SERVE_IN_WAIT
 	// The range a CPU read of [vaddr, vaddr + size) downloads (ReadMemory, PlanCallerWait).
 	[[nodiscard]] std::pair<uint64_t, uint64_t> ReadRange(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// Its publish of the intervals from span reads of the mapping.
