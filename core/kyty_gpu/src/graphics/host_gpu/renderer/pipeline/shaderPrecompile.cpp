@@ -13,6 +13,7 @@
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCacheTrace.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kytyGitVersion.h"
@@ -2428,8 +2429,20 @@ void ShaderPrecompiler::Worker(uint32_t index) {
 // permutation already.
 bool ShaderPrecompiler::CompileModule(const PrecompileStageRecord& record, uint64_t key, bool need_module,
                                       vk::ShaderModule& module, ShaderRecompiler::IR::CompiledShaderInfo& info,
-                                      size_t& spirv_words, bool forced_lds) {
+                                      size_t& spirv_words, bool forced_lds, bool* replaced) {
 	const Common::StartupTrace::Scope startup_scope(Common::StartupTrace::Counter::ShaderBackground);
+	const auto make_module = [&](const std::vector<uint32_t>& spirv) -> vk::ShaderModule {
+		if (Common::ShaderEnv::Read("KYTY_DIAG_SPIRV_REPLACE") != nullptr) {
+			auto edited = spirv;
+			PipelineTrace::ReplaceSpirv(record.shader_hash, edited);
+			if (edited != spirv) {
+				if (replaced != nullptr) *replaced = true;
+				spirv_words = edited.size();
+				return TryCompileSPV(edited, m_graphics.device);
+			}
+		}
+		return TryCompileSPV(spirv, m_graphics.device);
+	};
 	ShaderVertexInputInfo  vertex  = record.vertex;
 	ShaderPixelInputInfo   pixel   = record.pixel;
 	ShaderComputeInputInfo compute = record.compute;
@@ -2488,13 +2501,13 @@ bool ShaderPrecompiler::CompileModule(const PrecompileStageRecord& record, uint6
 			(disk_plan.has_value() ? g_reuse.disk_plan_hits : g_reuse.disk_hits).fetch_add(1, std::memory_order_relaxed);
 			spirv_words = disk_spirv.size();
 			if (need_module) {
-				module = TryCompileSPV(disk_spirv, m_graphics.device);
+				module = make_module(disk_spirv);
 				if (module == nullptr) {
 					return false;
 				}
 			}
 			info             = disk_info;
-			info.spirv_words = static_cast<uint32_t>(disk_spirv.size());
+			info.spirv_words = static_cast<uint32_t>(spirv_words);
 			if (keep) {
 				StoreReuse(record, key, program, std::move(disk_plan), std::move(disk_spirv), info, disk_translate_ms,
 				           disk_compile_ms);
@@ -2583,13 +2596,13 @@ bool ShaderPrecompiler::CompileModule(const PrecompileStageRecord& record, uint6
 		                          std::memory_order_relaxed);
 		spirv_words = disk_spirv.size();
 		if (need_module) {
-			module = TryCompileSPV(disk_spirv, m_graphics.device);
+			module = make_module(disk_spirv);
 			if (module == nullptr) {
 				return false;
 			}
 		}
 		info             = disk_info;
-		info.spirv_words = static_cast<uint32_t>(disk_spirv.size());
+		info.spirv_words = static_cast<uint32_t>(spirv_words);
 		// The plan this translation made goes to the disk too (a frame of its own: the permutation's is there).
 		if (plan.has_value()) {
 			m_disk->Store(key, program, disk_spirv, info, &*plan, translate_ms, disk_compile_ms);
@@ -2633,13 +2646,13 @@ bool ShaderPrecompiler::CompileModule(const PrecompileStageRecord& record, uint6
 		return false;
 	}
 	if (need_module) {
-		module = TryCompileSPV(result.spirv, m_graphics.device);
+		module = make_module(result.spirv);
 		if (module == nullptr) {
 			return false;
 		}
 	}
 	info             = std::move(result.program).TakeCompiledInfo();
-	info.spirv_words = static_cast<uint32_t>(result.spirv.size());
+	info.spirv_words = static_cast<uint32_t>(spirv_words);
 	if (disk_mode != 0) {
 		if (!disk_hit) {
 			m_disk->Store(key, program, result.spirv, info, plan.has_value() ? &*plan : nullptr, translate_ms, compile_ms);
@@ -2698,7 +2711,8 @@ void ShaderPrecompiler::Compile(const PrecompileStageRecord& record, uint64_t ke
 	vk::ShaderModule                         module = nullptr;
 	ShaderRecompiler::IR::CompiledShaderInfo program;
 	size_t                                   spirv_words = 0;
-	if (!CompileModule(record, key, !warm, module, program, spirv_words, forced_lds) || warm) {
+	bool                                     replaced    = false;
+	if (!CompileModule(record, key, !warm, module, program, spirv_words, forced_lds, &replaced) || warm) {
 		return;
 	}
 	// Bindless images need the bindless table's layout; without it (KYTY_BINDLESS off) the GPU thread would not
@@ -2736,14 +2750,16 @@ void ShaderPrecompiler::Compile(const PrecompileStageRecord& record, uint64_t ke
 		                         std::max(record.compute.threads_num[2], 1u);
 		std::fprintf(stderr,
 		             "SHADER_PRECOMPILE hash=0x%016llx %.0fms (driver %.0fms) spirv_words=%zu key=%s kind=compute form=%s "
-		             "lds=%s lds_dwords=%u threads=%u wave=%u forced_lds=%d created=%d\n",
+		             "lds=%s lds_dwords=%u threads=%u wave=%u forced_lds=%d created=%d replaced=%d\n",
 		             static_cast<unsigned long long>(record.shader_hash), ms, create_ms, spirv_words, HexKey(key).c_str(),
 		             ShaderRecompiler::IR::EmitFormName(program.emit_form), ShaderRecompiler::IR::EmitLdsName(program.emit_lds),
-		             record.compute.lds_size_dwords, threads, program.wave_size, forced_lds ? 1 : 0, created ? 1 : 0);
+		             record.compute.lds_size_dwords, threads, program.wave_size, forced_lds ? 1 : 0, created ? 1 : 0,
+		             replaced ? 1 : 0);
 		std::fflush(stderr);
-	} else if (ms >= 1000.0) {
-		std::fprintf(stderr, "SHADER_PRECOMPILE hash=0x%016llx %.0fms (driver %.0fms) spirv_words=%zu\n",
-		             static_cast<unsigned long long>(record.shader_hash), ms, create_ms, spirv_words);
+	} else if (ms >= 1000.0 || replaced) {
+		std::fprintf(stderr, "SHADER_PRECOMPILE hash=0x%016llx %.0fms (driver %.0fms) spirv_words=%zu%s\n",
+		             static_cast<unsigned long long>(record.shader_hash), ms, create_ms, spirv_words,
+		             replaced ? " replaced=1" : "");
 		std::fflush(stderr);
 	}
 }

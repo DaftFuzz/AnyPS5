@@ -364,7 +364,8 @@ private:
 	void Worker(uint32_t index);
 	// `key`: the record's key. `need_module`: false for a warm job's permutation (no pipeline is made from it).
 	bool CompileModule(const PrecompileStageRecord& record, uint64_t key, bool need_module, vk::ShaderModule& module,
-	                   ShaderRecompiler::IR::CompiledShaderInfo& info, size_t& spirv_words, bool forced_lds = false);
+	                   ShaderRecompiler::IR::CompiledShaderInfo& info, size_t& spirv_words, bool forced_lds = false,
+	                   bool* replaced = nullptr);
 	void Compile(const PrecompileStageRecord& record, uint64_t key, bool warm, bool forced_lds = false);
 	// The shader reuse (workers). `any_size`: wanted also with the store at its budget.
 	[[nodiscard]] bool ReuseWanted(uint64_t key, bool any_size = false) const;
