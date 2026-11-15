@@ -925,6 +925,8 @@ private:
 		// KYTY_PERF_COPY_HANDBACK: not 0 for a hand-back copy. It wrote the backing itself on the second queue and is
 		// finished when the copy timeline reached this value (asked there, then remembered in `done`).
 		uint64_t copy_tick = 0;
+		uint64_t source    = 0; // KYTY_PERF_BAR_GPU_COPY_VERIFY: the copied buffer's handle
+		uint32_t frame     = 0; // and the presented frame of the copy's start
 	};
 	// KYTY_PERF_COPY_HANDBACK (barGpuCopy.h). CopyHandbackOn: the switch's value now. StartCopyReadback: GPU thread, in a
 	// guest fault's request before it changed anything; starts the copy of the plan's download and lists it, returns
@@ -941,7 +943,7 @@ private:
 	// KYTY_PERF_BAR_GPU_COPY_VERIFY=1 with a hand-back copy: when the finished readback is applied, its bytes in the
 	// backing are compared with the buffer's mapping, interval by interval; intervals a GPU write was recorded over
 	// since are GPU-dirty again and are skipped (PERF bar_gpu_copy verified / mismatched).
-	void                      VerifyCopyReadback(const std::vector<std::pair<uint64_t, uint64_t>>& bytes);
+	void                      VerifyCopyReadback(const EagerReadback& entry);
 	// True when an unfinished eager readback is copying one of the bytes of the range.
 	[[nodiscard]] bool PendingReadbackCovers(uint64_t vaddr, uint64_t size) const;
 	[[nodiscard]] uint32_t InFlightReadbackKinds(uint64_t vaddr, uint64_t size) const;

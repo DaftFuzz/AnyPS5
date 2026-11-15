@@ -5055,7 +5055,7 @@ void BufferCache::ApplyEagerReadbacks(uint64_t vaddr, uint64_t size, bool wait) 
 			// so it keeps none of its own pages.
 			const uint64_t lo = entry.start;
 			const uint64_t hi = entry.end;
-			if (BarGpuCopyVerify()) VerifyCopyReadback(entry.bytes); // KYTY_PERF_BAR_GPU_COPY_VERIFY (diagnostic)
+			if (BarGpuCopyVerify()) VerifyCopyReadback(entry); // KYTY_PERF_BAR_GPU_COPY_VERIFY (diagnostic)
 			entry = std::move(m_eager_readbacks.back());
 			m_eager_readbacks.pop_back();
 			InFlightRebuild();
@@ -6162,16 +6162,19 @@ uint64_t BufferCache::StartCopyReadback(CallerPlan& plan, uint64_t vaddr, bool i
 	}
 	m_eager_readbacks.push_back({.start = plan.lo, .end = plan.hi, .generation = 0, .tick = plan.newest,
 	                             .done = std::make_shared<std::atomic_bool>(false), .bytes = std::move(plan.intervals),
-	                             .copy_tick = copy_tick});
+	                             .copy_tick = copy_tick, .source = reinterpret_cast<uint64_t>(static_cast<VkBuffer>(buffer.Handle())),
+	                             .frame = DebugPresentCount().load()});
 	s.copy_issued.fetch_add(1, std::memory_order_relaxed);
 	return copy_tick;
 }
 
-void BufferCache::VerifyCopyReadback(const std::vector<std::pair<uint64_t, uint64_t>>& bytes) {
+void BufferCache::VerifyCopyReadback(const EagerReadback& entry) {
+	const auto&    bytes = entry.bytes;
 	const uint64_t view = LibKernel::Memory::GuestBackingBase();
 	if (view == 0) return;
 	static thread_local std::vector<uint8_t> from_mapping;
 	uint64_t                                 verified = 0, mismatched = 0;
+	static std::atomic_uint                  detail_lines {0};
 	for (const auto& [start, end]: bytes) {
 		const uint64_t size = end - start;
 		if (size == 0 || m_gpu_modified_ranges.Intersects(start, size)) continue;
@@ -6193,6 +6196,40 @@ void BufferCache::VerifyCopyReadback(const std::vector<std::pair<uint64_t, uint6
 				std::fprintf(stderr, "PERF_COPY_HANDBACK_MISMATCH addr=0x%llx size=%llu frame=%u\n",
 				             static_cast<unsigned long long>(start), static_cast<unsigned long long>(size),
 				             DebugPresentCount().load());
+			}
+			if (detail_lines.fetch_add(1) < 64u) {
+				const auto* guest = reinterpret_cast<const uint8_t*>(view + backing);
+				uint64_t    first = 0, last = 0, count = 0;
+				for (uint64_t i = 0; i < size; i++) {
+					if (from_mapping[i] == guest[i]) continue;
+					if (count++ == 0) first = i;
+					last = i;
+				}
+				uint64_t map8 = 0, guest8 = 0;
+				const uint64_t at = first & ~uint64_t {7};
+				std::memcpy(&map8, from_mapping.data() + at, std::min<uint64_t>(8, size - at));
+				std::memcpy(&guest8, guest + at, std::min<uint64_t>(8, size - at));
+				const uint64_t bad  = start + first;
+				const uint64_t page = bad & ~(TRACKER_PAGE_SIZE - 1);
+				std::string    history;
+				if (UploadClobberCheck()) (void)C0PageHistory(page, history);
+				std::fprintf(stderr,
+				             "HANDBACK_MISMATCH_DETAIL frame=%u copy_frame=%u interval=0x%llx+0x%llx bad=0x%llx..0x%llx n=%llu map=%016llx guest=%016llx "
+				             "write_tick=%llu copy_tick=%llu cur=%llu gpu=%llu same_buffer=%d ready=%llu page_gpu=%d page_cpu=%d dirty_page=%d "
+				             "write_frame=%llu ring_exec=%llu ring_game=%llu events:%s\n",
+				             DebugPresentCount().load(), entry.frame, static_cast<unsigned long long>(start), static_cast<unsigned long long>(size),
+				             static_cast<unsigned long long>(bad), static_cast<unsigned long long>(start + last), static_cast<unsigned long long>(count),
+				             static_cast<unsigned long long>(map8), static_cast<unsigned long long>(guest8),
+				             static_cast<unsigned long long>(entry.tick), static_cast<unsigned long long>(entry.copy_tick),
+				             static_cast<unsigned long long>(m_scheduler.CurrentTick()),
+				             static_cast<unsigned long long>(m_scheduler.GetMasterSemaphore().KnownGpuTick()),
+				             entry.source == reinterpret_cast<uint64_t>(static_cast<VkBuffer>(buffer.Handle())) ? 1 : 0,
+				             static_cast<unsigned long long>(ready->second), m_memory_tracker.IsRegionGpuModified(page, TRACKER_PAGE_SIZE) ? 1 : 0,
+				             m_memory_tracker.IsRegionCpuModified(page, TRACKER_PAGE_SIZE) ? 1 : 0,
+				             m_gpu_modified_ranges.Intersects(page, TRACKER_PAGE_SIZE) ? 1 : 0,
+				             static_cast<unsigned long long>(QueryTicks(m_write_frames, bad, bad + 1)),
+				             static_cast<unsigned long long>(g_ring_exec_data_frame),
+				             static_cast<unsigned long long>(g_ring_game_write_frame.load(std::memory_order_relaxed)), history.c_str());
 			}
 		}
 	}
