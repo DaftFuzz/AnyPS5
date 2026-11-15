@@ -2458,6 +2458,18 @@ bool BufferCache::InDirectRange(uint64_t vaddr, uint64_t size) const {
 	return false;
 }
 
+// KYTY_PERF_LABELS_OFF_THREAD, any thread: [vaddr, vaddr + size) lies inside one active direct range and no range changed
+// meanwhile (the generation is odd while the execution thread changes them; the list never reallocates).
+bool BufferCache::DirectRangeHoldsStable(uint64_t vaddr, uint64_t size) const {
+	const uint64_t generation = g_direct_generation.load(std::memory_order_acquire);
+	if ((generation & 1u) != 0 || size == 0) return false;
+	bool inside = false;
+	for (const auto& range: m_direct_ranges) {
+		if (range.active && !range.refused && range.start <= vaddr && vaddr + size <= range.end) inside = true;
+	}
+	return inside && g_direct_generation.load(std::memory_order_acquire) == generation;
+}
+
 
 // A CPU write fault into a GPU-modified page of the data ring (two halves, each reused every second game frame; the game
 // overwrites what it allocates there and, before reusing a half, waits for the GPU work of the frame that last used
@@ -2643,8 +2655,28 @@ uint32_t BufferCache::ServeInWaitMode() {
 	return Common::LiveAb::Gate(Common::LiveAb::Switch::ServeInWait, ServeInWaitFixed());
 }
 
-BufferCache::ServeInWaitAllow::ServeInWaitAllow(): previous(t_serve_allowed) {
-	t_serve_allowed = GuestGpu::IsGpuThread() && GuestGpu::WaitsServeCommands() ? ServeInWaitMode() : 0u;
+BufferCache::ServeInWaitAllow::ServeInWaitAllow(uint32_t mode): previous(t_serve_allowed) {
+	t_serve_allowed = GuestGpu::IsGpuThread() && GuestGpu::WaitsServeCommands() ? mode : 0u;
+}
+
+uint32_t BufferCache::ServeInWaitAllowedMode() {
+	return t_serve_allowed;
+}
+
+namespace {
+uint32_t ServeDrawWaitsFixed() {
+	static const uint32_t value = [] {
+		const char*    text = std::getenv("KYTY_PERF_SERVE_DRAW_WAITS");
+		const uint32_t v    = text != nullptr ? static_cast<uint32_t>(std::strtoul(text, nullptr, 10)) : 0u;
+		if (v != 0) std::fprintf(stderr, "KYTY_PERF_SERVE_DRAW_WAITS=%u: guest commands run during draws' adoption-check GPU waits%s\n", v, v == 2 ? " (check: verdicts compared)" : "");
+		return v;
+	}();
+	return value;
+}
+} // namespace
+
+uint32_t BufferCache::ServeDrawWaitsMode() {
+	return Common::LiveAb::Gate(Common::LiveAb::Switch::ServeDrawWaits, ServeDrawWaitsFixed());
 }
 
 BufferCache::ServeInWaitAllow::~ServeInWaitAllow() {

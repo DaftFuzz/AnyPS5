@@ -111,6 +111,11 @@ constexpr SwitchInfo Switches[] = {
     // Per operation boundary: whether predicted hand-back copies are started; copies already started finish as ordinary
     // hand-back copies (their windows stay in the hand-back state until applied) whatever the phase.
     {Switch::CopyPredict, "KYTY_PERF_COPY_PREDICT", 1},
+    // Per draw adoption check, as KYTY_PERF_SERVE_IN_WAIT per dispatch.
+    {Switch::ServeDrawWaits, "KYTY_PERF_SERVE_DRAW_WAITS", 1},
+    // Per label: published by the completion thread (a plain store into a direct range with no earlier publish still
+    // queued) or handed to the execution thread; the value and the order of publishes are the same.
+    {Switch::LabelsOffThread, "KYTY_PERF_LABELS_OFF_THREAD", 1},
     // Project 15 way B P1 (test switch): a read-only buffer binding with a ready plan entry whose proof holds takes the
     // binding the helper computed (handle, aligned offset, range, offset byte, record stride) instead of RebindBuffers'.
 };

@@ -439,7 +439,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	floor_phase.Next(ChunkLead::FpD2);
 	ShaderProgram compute_program;
 	{
-		const BufferCache::ServeInWaitAllow serve_in_wait; // KYTY_PERF_SERVE_IN_WAIT: nothing of the dispatch is recorded yet
+		const BufferCache::ServeInWaitAllow serve_in_wait(BufferCache::ServeInWaitMode()); // KYTY_PERF_SERVE_IN_WAIT: nothing of the dispatch is recorded yet
 		if (!TakeResolvedDispatch(input_info, compute_program)) {
 			compute_program = m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
 		}
@@ -905,7 +905,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	ShaderComputeInputInfo input_info {};
 	input_info.async_compute = async_compute;
 	census_timer.Mark(1);
-	std::optional<BufferCache::ServeInWaitAllow> serve_in_wait(std::in_place); // KYTY_PERF_SERVE_IN_WAIT: nothing recorded yet
+	std::optional<BufferCache::ServeInWaitAllow> serve_in_wait(std::in_place, BufferCache::ServeInWaitMode()); // KYTY_PERF_SERVE_IN_WAIT: nothing recorded yet
 	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
 	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
 	serve_in_wait.reset();

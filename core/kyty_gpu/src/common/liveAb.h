@@ -54,6 +54,8 @@ enum class Switch : uint32_t {
 	CopyChain,             // KYTY_PERF_COPY_CHAIN (cache/bufferCache.cpp, StartCopyReadback)
 	RingWordsGpu,          // KYTY_PERF_RING_WORDS_GPU (cache/bufferCache.h, RecordDirectWordCopy)
 	CopyPredict,           // KYTY_PERF_COPY_PREDICT (cache/bufferCache.h)
+	ServeDrawWaits,        // KYTY_PERF_SERVE_DRAW_WAITS (cache/bufferCache.h)
+	LabelsOffThread,       // KYTY_PERF_LABELS_OFF_THREAD (guest/graphicsRun.cpp, DeferLabel)
 	Count
 };
 

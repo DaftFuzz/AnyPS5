@@ -463,6 +463,7 @@ public:
 	// thread knows) are not waited for; WaitDirectGpuWrites then returns true when such writes are still pending over
 	// the range, and the caller puts ApplyDirectCpWrites over the guest memory it reads right after.
 	[[nodiscard]] bool InDirectRange(uint64_t vaddr, uint64_t size) const;
+	[[nodiscard]] bool DirectRangeHoldsStable(uint64_t vaddr, uint64_t size) const; // any thread (KYTY_PERF_LABELS_OFF_THREAD)
 	bool               WaitDirectGpuWrites(uint64_t vaddr, uint64_t size, bool cp_overlay = false);
 	// KYTY_PERF_VERIFY_RANGE=1 (default 0, off; live A/B switch), GPU thread. The resource walker's read-log check
 	// (FastVerifyLoggedReads) and its ordinary reads ask WaitPendingReadbacks about a whole 4 KiB page and then remember
@@ -497,13 +498,18 @@ public:
 	// check runs a second time without serving and differing verdicts are counted.
 	[[nodiscard]] static uint32_t ServeInWaitMode();
 	struct ServeInWaitAllow {
-		ServeInWaitAllow();
+		explicit ServeInWaitAllow(uint32_t mode);
 		~ServeInWaitAllow();
 		ServeInWaitAllow(const ServeInWaitAllow&)            = delete;
 		ServeInWaitAllow& operator=(const ServeInWaitAllow&) = delete;
 		uint32_t previous;
 	};
 	[[nodiscard]] static bool ServeInWaitAllowed();
+	[[nodiscard]] static uint32_t ServeInWaitAllowedMode(); // the open scope's mode (2: check)
+	// KYTY_PERF_SERVE_DRAW_WAITS (route-to-30 rank 1, part a; default 0; 1 on, live A/B switch; 2 check, start value only):
+	// the same scope for a draw's adoption check (RenderExecutor::TakeResolvedState), so guest requests and label publishes
+	// queued during its blocking direct-range waits run inside them, with the same restart rule.
+	[[nodiscard]] static uint32_t ServeDrawWaitsMode();
 	struct ServeInWaitPass {
 		explicit ServeInWaitPass(bool on);
 		~ServeInWaitPass();

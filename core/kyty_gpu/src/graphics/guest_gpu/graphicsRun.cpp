@@ -559,6 +559,44 @@ void ReportLabelStats() {
 	             static_cast<double>(s.max_pickup_ns.exchange(0, std::memory_order_relaxed)) / 1e6);
 }
 
+// KYTY_PERF_LABELS_OFF_THREAD=1 (route-to-30 rank 1, part b; default 0; live A/B switch; 2 check, start value only): a
+// label whose destination lies in an active direct range (where the GPU thread's publish is a plain store, no tracker
+// work) is published by the completion thread itself, unless a publish handed to the GPU thread is still queued (the
+// publishes keep their order; MarkPublished stays in sequence order). Check: every label goes to the GPU thread as
+// before, and one the completion thread found eligible must take the plain store there (counted otherwise).
+uint32_t LabelsOffThreadFixed() {
+	static const uint32_t value = [] {
+		const char*    text = std::getenv("KYTY_PERF_LABELS_OFF_THREAD");
+		const uint32_t v    = text != nullptr ? static_cast<uint32_t>(std::strtoul(text, nullptr, 10)) : 0u;
+		if (v != 0) std::fprintf(stderr, "KYTY_PERF_LABELS_OFF_THREAD=%u: direct-range labels published by the completion thread%s\n", v, v == 2 ? " (check only)" : "");
+		return v;
+	}();
+	return value;
+}
+struct LabelsOffThreadStats {
+	std::atomic<uint64_t> off_thread {0}, routed {0}, eligible_checked {0}, eligible_bad {0}, blocked_by_order {0};
+	std::atomic<int64_t>  window_start {0};
+};
+LabelsOffThreadStats   g_labels_off;
+std::atomic<uint32_t>  g_labels_routed_pending {0}; // publishes handed to the GPU thread and not run yet
+
+void ReportLabelsOffThread() {
+	const int64_t now   = LabelNowNs() / 1'000'000;
+	int64_t       start = g_labels_off.window_start.load(std::memory_order_relaxed);
+	if (start == 0) {
+		g_labels_off.window_start.compare_exchange_strong(start, now, std::memory_order_relaxed);
+		return;
+	}
+	if (now - start < 5000 || !g_labels_off.window_start.compare_exchange_strong(start, now, std::memory_order_relaxed)) return;
+	if (!Common::EnvRead::PerfLines()) return;
+	auto& s = g_labels_off;
+	std::fprintf(stderr, "PERF labels_off_thread off_thread=%llu routed=%llu blocked_by_order=%llu eligible_checked=%llu eligible_bad=%llu (per ~5 s)\n",
+	             static_cast<unsigned long long>(s.off_thread.exchange(0)), static_cast<unsigned long long>(s.routed.exchange(0)),
+	             static_cast<unsigned long long>(s.blocked_by_order.exchange(0)),
+	             static_cast<unsigned long long>(s.eligible_checked.exchange(0)),
+	             static_cast<unsigned long long>(s.eligible_bad.exchange(0)));
+}
+
 // Defers an end-of-pipe label (labels at completion); the journal holds it since its packet. Only on the GPU thread.
 void DeferLabel(CommandScheduler& scheduler, RenderContext& renderer, int event_id, uint64_t sequence, uint64_t dst,
                 uint64_t value, uint32_t size, bool with_interrupt, uint32_t interrupt_context_id) {
@@ -570,8 +608,39 @@ void DeferLabel(CommandScheduler& scheduler, RenderContext& renderer, int event_
 	                                  interrupt_context_id, recorded_ns] {
 		if (gpu->IsStopping()) return;
 		const int64_t ready_ns = LabelNowNs(); // KYTY_TRACE_PERF: the GPU thread's pickup of the publish starts here
+		const uint32_t off_mode = Common::LiveAb::Gate(Common::LiveAb::Switch::LabelsOffThread, LabelsOffThreadFixed());
+		bool           eligible = false;
+		if (off_mode != 0u) {
+			ReportLabelsOffThread();
+			if (g_labels_routed_pending.load(std::memory_order_acquire) != 0u) {
+				g_labels_off.blocked_by_order.fetch_add(1, std::memory_order_relaxed);
+			} else {
+				eligible = renderer.GetBufferCache().DirectRangeHoldsStable(dst, size);
+			}
+		}
+		if (eligible && off_mode == 1u) {
+			std::memcpy(reinterpret_cast<void*>(dst), &value, size);
+			if (sequence != 0) gpu->MarkPublished(sequence);
+			PublishCpuDirtyRange(dst, size); // BDA sync epoch
+			const auto lag = static_cast<uint64_t>(std::max<int64_t>(LabelNowNs() - recorded_ns, 0));
+			g_label_stats.published.fetch_add(1, std::memory_order_relaxed);
+			g_label_stats.lag_ns.fetch_add(lag, std::memory_order_relaxed);
+			g_labels_off.off_thread.fetch_add(1, std::memory_order_relaxed);
+			if (with_interrupt) renderer.TriggerInterrupt(event_id, interrupt_context_id);
+			return;
+		}
+		if (off_mode != 0u) g_labels_off.routed.fetch_add(1, std::memory_order_relaxed);
+		g_labels_routed_pending.fetch_add(1, std::memory_order_acq_rel);
+		const bool check_eligible = eligible && off_mode == 2u;
 		const auto publish = [gpu, &renderer, event_id, sequence, dst, value, size, with_interrupt, interrupt_context_id,
-		                      recorded_ns, ready_ns] {
+		                      recorded_ns, ready_ns, check_eligible] {
+			struct RoutedDone {
+				~RoutedDone() { g_labels_routed_pending.fetch_sub(1, std::memory_order_acq_rel); }
+			} routed_done;
+			if (check_eligible) {
+				g_labels_off.eligible_checked.fetch_add(1, std::memory_order_relaxed);
+				if (!renderer.GetBufferCache().InDirectRange(dst, size)) g_labels_off.eligible_bad.fetch_add(1, std::memory_order_relaxed);
+			}
 			// The immediate path's write (the write-through or a plain store). In a direct range
 			// (KYTY_PERF_DIRECT_RANGES) a plain store: the work before the label is done, which is when the console's CP
 			// writes it, and an update recorded now would reach guest memory only with a later submit.
