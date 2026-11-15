@@ -31,6 +31,7 @@
 #include "graphics/host_gpu/renderer/hTrace.h"
 
 #include <chrono>
+#include "graphics/host_gpu/faultPath.h"
 #include "graphics/host_gpu/regionManager.h"
 #include "graphics/host_gpu/translatorGuard.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -686,6 +687,7 @@ void GuestGpu::SendCommand(Common::UniqueFunction<void>&& command) {
 	EXIT_IF(!command);
 	if (IsGpuThread()) {
 		if (DrawStateObserverOn()) DrawStateObserver::Invalidate(DrawStateObserver::Cause(DrawStateObserver::CauseInvalidate, DrawStateObserver::InvalidateCommand)); // the draw-state observer (DrawStateObserverOn)
+		FaultPath::BeforeObservation();
 		command();
 		return;
 	}
@@ -728,6 +730,7 @@ void GuestGpu::ProcessCommands() {
 			m_commands_running = true;
 		}
 		if (DrawStateObserverOn()) DrawStateObserver::Invalidate(DrawStateObserver::Cause(DrawStateObserver::CauseInvalidate, DrawStateObserver::InvalidateCommand)); // the draw-state observer (DrawStateObserverOn)
+		FaultPath::BeforeObservation();
 		command();
 	}
 }
@@ -735,6 +738,7 @@ void GuestGpu::ProcessCommands() {
 void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 	EXIT_IF(!command);
 	if (IsGpuThread()) {
+		FaultPath::BeforeObservation();
 		command();
 		return;
 	}
@@ -982,6 +986,7 @@ void GuestGpu::ExecutionThread() {
 			const int      census_cause = census && m_operations.SizeApprox() == 0 ? 1 : 0;
 			const uint64_t census_t0 = census ? ChunkLead::Tsc() : 0;
 			bool have_operations = false;
+			FaultPath::BeforeObservation();
 			{
 				const Common::SlowFrame::Scope slow_idle(Common::SlowFrame::ExecIdle); // KYTY_TRACE_SLOW_FRAMES
 				StallWatch::g_exec_idle_since.store(std::chrono::steady_clock::now().time_since_epoch().count(),
@@ -1911,6 +1916,7 @@ void GuestGpu::RunCommandsWhileWaiting() {
 			gpu->m_commands.pop_front();
 			EXIT_IF(gpu->m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
 		}
+		FaultPath::BeforeObservation();
 		command();
 		gpu->m_work_epoch.fetch_add(1, std::memory_order_release);
 	}
@@ -2410,13 +2416,20 @@ void CommandProcessor::RunOnExecution(GpuDrain reason, GpuCallback&& callback) {
 
 void CommandProcessor::PublishDirtyRegions() {
 	// Nothing deferred before this point: the operation would have nothing to publish for it.
-	if (HasDeferredCpuDirtyRegions()) {
+	if (FaultPath::AsyncReprotectPossible()) {
+		EmitCallback([] {
+			FaultPath::ArJoinAll(FaultPath::ArSiteOrder);
+			PublishCpuDirtyRegions();
+		});
+	} else if (HasDeferredCpuDirtyRegions()) {
 		EmitCallback([] { PublishCpuDirtyRegions(); });
 	}
 }
 
 void CommandProcessor::Execute(GpuOperation& operation) {
 	EXIT_IF(operation.processor != this);
+	FaultPath::BeforeOperation(operation.kind == GpuOperationKind::DrawIndex || operation.kind == GpuOperationKind::DrawAuto ||
+	                           operation.kind == GpuOperationKind::DispatchDirect);
 	GpuTimer::t_guest_queue = static_cast<uint32_t>(m_interrupt_event_id); // KYTY_TRACE_GPU_TIMELINE
 	if (g_gpu_stage_stats) {
 		g_stage_stats.operations.fetch_add(1, std::memory_order_relaxed);

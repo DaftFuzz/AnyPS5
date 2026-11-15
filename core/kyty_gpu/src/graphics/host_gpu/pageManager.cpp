@@ -180,6 +180,65 @@ void ValidateRange(uint64_t vaddr, uint64_t size) {
 	}
 }
 
+namespace DeferRead {
+struct Run {
+	uint64_t begin;
+	uint64_t end;
+};
+thread_local uint32_t         t_mode = 0;
+thread_local std::vector<Run> t_runs;
+std::mutex                    g_window_mutex;
+std::vector<Run>              g_windows;
+std::atomic<bool>             g_windows_any {false};
+struct Stats {
+	std::atomic<uint64_t> kept {0}, kept_kb {0}, merged {0}, flushes {0}, flushed_runs {0}, protect_calls {0}, partial {0};
+	std::atomic<uint64_t> windows {0}, window_faults_read {0}, window_faults_write {0}, window_faults_gpu {0}, logged {0};
+	std::atomic<int64_t>  window_start {0};
+};
+Stats g_stats;
+
+void Report() {
+	const auto now   = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+	int64_t    start = g_stats.window_start.load(std::memory_order_relaxed);
+	if (start == 0) {
+		g_stats.window_start.compare_exchange_strong(start, now, std::memory_order_relaxed);
+		return;
+	}
+	if (now - start < 5000 || !g_stats.window_start.compare_exchange_strong(start, now, std::memory_order_relaxed)) return;
+	if (!PerfEnabled()) return;
+	const auto take = [](std::atomic<uint64_t>& c) { return static_cast<unsigned long long>(c.exchange(0, std::memory_order_relaxed)); };
+	std::fprintf(stderr,
+	             "PERF defer_read_protect kept=%llu kept_kb=%llu merged=%llu flushes=%llu flushed_runs=%llu protect_calls=%llu "
+	             "partial=%llu windows=%llu window_faults(read,write,gpu_thread)=%llu,%llu,%llu (per ~5 s)\n",
+	             take(g_stats.kept), take(g_stats.kept_kb), take(g_stats.merged), take(g_stats.flushes), take(g_stats.flushed_runs),
+	             take(g_stats.protect_calls), take(g_stats.partial), take(g_stats.windows), take(g_stats.window_faults_read),
+	             take(g_stats.window_faults_write), take(g_stats.window_faults_gpu));
+}
+
+// A no-access run [address, address + bytes) about to be applied: true when it is kept for the flush (mode 1).
+bool Take(uint64_t address, uint64_t bytes) {
+	if (t_mode == 1u) {
+		g_stats.kept.fetch_add(1, std::memory_order_relaxed);
+		g_stats.kept_kb.fetch_add(bytes >> 10u, std::memory_order_relaxed);
+		if (!t_runs.empty() && address <= t_runs.back().end && t_runs.back().begin <= address + bytes) {
+			t_runs.back().begin = std::min(t_runs.back().begin, address);
+			t_runs.back().end   = std::max(t_runs.back().end, address + bytes);
+			g_stats.merged.fetch_add(1, std::memory_order_relaxed);
+		} else {
+			t_runs.push_back({address, address + bytes});
+		}
+		return true;
+	}
+	if (t_mode == 2u) {
+		std::scoped_lock lock(g_window_mutex);
+		g_windows.push_back({address, address + bytes});
+		g_windows_any.store(true, std::memory_order_release);
+		g_stats.windows.fetch_add(1, std::memory_order_relaxed);
+	}
+	return false;
+}
+} // namespace DeferRead
+
 } // namespace
 
 struct PageManager::Impl {
@@ -273,6 +332,7 @@ struct PageManager::Impl {
 		}
 #endif
 		regions = std::make_unique<std::atomic<Region*>[]>(REGION_COUNT);
+		s_instance = this;
 	}
 
 	~Impl() {
@@ -341,10 +401,14 @@ struct PageManager::Impl {
 		uint64_t  range_begin           = 0;
 		uint64_t  range_bytes           = 0;
 		uint64_t  potential_range_bytes = 0;
+		bool      seen_writable         = false;
 
 		const auto release_pending = [&] {
 			if (range_bytes != 0) {
-				Protect(base_addr + range_begin * PAGE_SIZE, range_bytes, perms);
+				const bool kept = track && is_read && DeferRead::t_mode != 0u && !seen_writable &&
+				                  perms == Common::VirtualMemory::Mode::NoAccess &&
+				                  DeferRead::Take(base_addr + range_begin * PAGE_SIZE, range_bytes);
+				if (!kept) Protect(base_addr + range_begin * PAGE_SIZE, range_bytes, perms);
 				range_bytes           = 0;
 				potential_range_bytes = 0;
 			}
@@ -356,6 +420,7 @@ struct PageManager::Impl {
 			const bool update  = !masked || mask->Get(page_index);
 
 			const auto old_perms = PermsOf(region, page_index);
+			seen_writable        = seen_writable || old_perms == Common::VirtualMemory::Mode::ReadWrite;
 			const auto new_count = update ? page.AddDelta<track ? 1 : -1, is_read>(address)
 			                              : page.AddDelta<0, is_read>(address);
 			const auto new_perms = PermsOf(region, page_index);
@@ -499,9 +564,12 @@ struct PageManager::Impl {
 				uint64_t   run_begin = 0;
 				uint64_t   run_bytes = 0;
 				auto       run_perms = Common::VirtualMemory::Mode::NoAccess;
+				bool       seen_writable = false;
 				const auto flush     = [&] {
 					if (run_bytes != 0) {
-						Protect(run_begin, run_bytes, run_perms);
+						const bool kept = arm && DeferRead::t_mode != 0u && !seen_writable && run_perms == Common::VirtualMemory::Mode::NoAccess &&
+						                  DeferRead::Take(run_begin, run_bytes);
+						if (!kept) Protect(run_begin, run_bytes, run_perms);
 						run_bytes = 0;
 					}
 				};
@@ -509,6 +577,7 @@ struct PageManager::Impl {
 					auto&          word      = region->image_read[index / 64u];
 					const uint64_t bit       = uint64_t {1} << (index % 64u);
 					const auto     old_perms = PermsOf(*region, index);
+					seen_writable            = seen_writable || old_perms == Common::VirtualMemory::Mode::ReadWrite;
 					if constexpr (arm) {
 						word.fetch_or(bit, std::memory_order_relaxed);
 					} else {
@@ -534,6 +603,36 @@ struct PageManager::Impl {
 			chunk_begin = chunk_end;
 		}
 	}
+
+	// KYTY_PERF_DEFER_READ_PROTECT: every page of [begin, end) takes its current protection, one call per run of pages
+	// with the same mode, under its region's lock.
+	void Reapply(uint64_t begin, uint64_t end) {
+		for (auto chunk_begin = begin; chunk_begin < end;) {
+			const auto chunk_end   = std::min(end, Common::AlignUp(chunk_begin + 1, REGION_SIZE));
+			const auto region_base = Common::AlignDown(chunk_begin, REGION_SIZE);
+			auto*      region      = FindRegion(chunk_begin);
+			if (region != nullptr) {
+				const auto first = static_cast<size_t>((chunk_begin - region_base) / PAGE_SIZE);
+				const auto last  = static_cast<size_t>((chunk_end - region_base) / PAGE_SIZE);
+				SpinGuard  lock(region->lock);
+				size_t     run   = first;
+				auto       mode  = PermsOf(*region, first);
+				for (size_t index = first + 1; index <= last; index++) {
+					const bool end_of_run = index == last || PermsOf(*region, index) != mode;
+					if (!end_of_run) continue;
+					Protect(region_base + run * PAGE_SIZE, (index - run) * PAGE_SIZE, mode);
+					DeferRead::g_stats.protect_calls.fetch_add(1, std::memory_order_relaxed);
+					if (index < last) {
+						run  = index;
+						mode = PermsOf(*region, index);
+					}
+				}
+			}
+			chunk_begin = chunk_end;
+		}
+	}
+
+	static inline Impl* s_instance = nullptr;
 
 	std::unique_ptr<std::atomic<Region*>[]> regions;
 	std::vector<std::unique_ptr<Region>>    region_storage;
@@ -649,6 +748,56 @@ bool PageManager::WatchersAllow(uint64_t vaddr, bool is_write) const {
 	SpinGuard  lock(region->lock);
 	const auto perms = region->pages[(vaddr % REGION_SIZE) / PAGE_SIZE].Perms();
 	return is_write ? perms == Common::VirtualMemory::Mode::ReadWrite : perms != Common::VirtualMemory::Mode::NoAccess;
+}
+
+void PageManager::SetReadProtectDeferral(uint32_t mode) noexcept {
+	DeferRead::t_mode = mode;
+}
+
+void PageManager::FlushDeferredReadProtect() noexcept {
+	if (!DeferRead::t_runs.empty()) {
+		DeferRead::g_stats.flushes.fetch_add(1, std::memory_order_relaxed);
+		DeferRead::g_stats.flushed_runs.fetch_add(DeferRead::t_runs.size(), std::memory_order_relaxed);
+		if (auto* impl = Impl::s_instance; impl != nullptr) {
+			for (const auto& run: DeferRead::t_runs) impl->Reapply(run.begin, run.end);
+		}
+		DeferRead::t_runs.clear();
+	}
+	if (DeferRead::g_windows_any.load(std::memory_order_relaxed)) {
+		std::scoped_lock lock(DeferRead::g_window_mutex);
+		DeferRead::g_windows.clear();
+		DeferRead::g_windows_any.store(false, std::memory_order_release);
+	}
+	DeferRead::Report();
+}
+
+void PageManager::FlushDeferredReadProtect(uint64_t vaddr, uint64_t size) noexcept {
+	if (DeferRead::t_runs.empty() || size == 0) return;
+	const bool overlaps = std::any_of(DeferRead::t_runs.begin(), DeferRead::t_runs.end(),
+	                                  [&](const DeferRead::Run& run) { return vaddr < run.end && run.begin < vaddr + size; });
+	if (!overlaps) return;
+	DeferRead::g_stats.partial.fetch_add(1, std::memory_order_relaxed);
+	const uint32_t mode = DeferRead::t_mode;
+	FlushDeferredReadProtect();
+	DeferRead::t_mode = mode;
+}
+
+void PageManager::NoteWindowFault(uint64_t vaddr, bool is_write, bool gpu_thread) noexcept {
+	if (!DeferRead::g_windows_any.load(std::memory_order_acquire)) return;
+	bool inside = false;
+	{
+		std::scoped_lock lock(DeferRead::g_window_mutex);
+		inside = std::any_of(DeferRead::g_windows.begin(), DeferRead::g_windows.end(),
+		                     [&](const DeferRead::Run& run) { return run.begin <= vaddr && vaddr < run.end; });
+	}
+	if (!inside) return;
+	auto& s = DeferRead::g_stats;
+	(is_write ? s.window_faults_write : s.window_faults_read).fetch_add(1, std::memory_order_relaxed);
+	if (gpu_thread) s.window_faults_gpu.fetch_add(1, std::memory_order_relaxed);
+	if (!is_write && s.logged.fetch_add(1, std::memory_order_relaxed) < 32u) {
+		std::fprintf(stderr, "DEFER_READ_PROTECT_WINDOW_FAULT addr=0x%016" PRIx64 " write=%d gpu_thread=%d\n", vaddr, is_write ? 1 : 0,
+		             gpu_thread ? 1 : 0);
+	}
 }
 
 template void PageManager::UpdatePageWatchersForRegion<true, true>(uint64_t, RegionBits&);

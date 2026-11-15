@@ -55,6 +55,9 @@ enum class Switch : uint32_t {
 	RingWordsGpu,          // KYTY_PERF_RING_WORDS_GPU (cache/bufferCache.h, RecordDirectWordCopy)
 	CopyPredict,           // KYTY_PERF_COPY_PREDICT (cache/bufferCache.h)
 	DrainFreeWait,         // KYTY_PERF_DRAIN_FREE_WAIT (guest_gpu/graphicsRun.cpp, WaitRegMem)
+	AsyncReprotect,        // KYTY_PERF_ASYNC_REPROTECT (graphics/host_gpu/faultPath.h)
+	CountGuest,            // KYTY_PERF_COUNT_GUEST (cache/bufferCache.cpp, ReadGpuCopy)
+	DeferReadProtect,      // KYTY_PERF_DEFER_READ_PROTECT (graphics/host_gpu/faultPath.h)
 	Count
 };
 

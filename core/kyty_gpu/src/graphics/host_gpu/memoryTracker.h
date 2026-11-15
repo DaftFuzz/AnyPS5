@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_MEMORYTRACKER_H_
 
 #include "common/assert.h"
+#include "graphics/host_gpu/faultPath.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/regionManager.h"
@@ -86,6 +87,7 @@ public:
 	// that lock: it only records.
 	template <typename Conflict>
 	void MarkCleanPagesAsGpuModified(uint64_t vaddr, uint64_t size, Conflict&& on_conflict) {
+		FaultPath::ArJoinRange(vaddr, size);
 		CheckNotInUploadCallback();
 		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			std::scoped_lock lock(manager->lock);
@@ -150,6 +152,7 @@ public:
 	template <bool clear, typename Func>
 	void ForEachDownloadRange(uint64_t vaddr, uint64_t size, Func&& func) {
 		static_assert(std::is_nothrow_invocable_v<Func&, uint64_t, uint64_t>);
+		FaultPath::ArJoinRange(vaddr, size);
 		CheckNotInUploadCallback();
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			std::scoped_lock lock(manager->lock);
@@ -169,6 +172,7 @@ public:
 	                        UploadFunc&& upload_func) {
 		static_assert(std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t>);
 		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
+		FaultPath::ArJoinRange(vaddr, size);
 		CheckNotInUploadCallback();
 		if (!is_written && AllRegionsCpuClean(vaddr, size)) {
 			// The per-region early-out below would skip every region: nothing to upload.
@@ -211,6 +215,7 @@ public:
 	template <typename RangeFunc>
 	uint32_t ClaimUploadRanges(uint64_t vaddr, uint64_t size, RangeFunc&& range_func, std::vector<RegionManager*>& pending) {
 		static_assert(std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t>);
+		FaultPath::ArJoinRange(vaddr, size);
 		CheckNotInUploadCallback();
 		if (AllRegionsCpuClean(vaddr, size)) {
 			return 0;

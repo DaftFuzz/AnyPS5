@@ -1,6 +1,7 @@
 #include "common/slowFrame.h" // KYTY_TRACE_SLOW_FRAMES (diagnostic)
 #include "common/profiler.h"
 #include "graphics/host_gpu/renderer/hTrace.h"
+#include "graphics/host_gpu/faultPath.h"
 #include "graphics/guest_gpu/chunkLead.h"
 #include "graphics/host_gpu/renderer/indirectLoadFast.h"
 #include "graphics/host_gpu/renderer/perfCounters.h"
@@ -119,6 +120,7 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	if (!IsMapped(fault_vaddr, fault_size)) {
 		return false;
 	}
+	FaultPath::DrpNoteFault(fault_vaddr, access == PageFaultAccess::Write);
 	// Image read coherence (textureCache.cpp): only a guest thread's read is served; a guest thread is the one the guest
 	// kernel knows, HLE code it runs included. The access runs again when this returns.
 	const bool is_write = access == PageFaultAccess::Write;
@@ -344,6 +346,7 @@ void RenderContext::PrepareBda() {
 	}
 	// Nothing became CPU-modified and no buffer was created since the last pass: every buffer is
 	// already synchronized (each check below would find no upload range).
+	FaultPath::ArObserveAll();
 	const auto epoch = g_cpu_dirty_epoch.load(std::memory_order_acquire);
 	if (epoch != m_bda_synced_epoch) {
 		// The epoch is read before the pending regions are taken: a region dirtied after that bumps

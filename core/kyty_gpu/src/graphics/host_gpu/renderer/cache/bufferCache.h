@@ -1211,6 +1211,10 @@ private:
 	int TryBarDownload(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// KYTY_PERF_COUNT_EXACT: ReadGpuCopy's read by the bytes' own write ticks (false: not served), and its recorded copy.
 	bool ReadCountExact(Buffer& buffer, uint64_t vaddr, uint64_t size, void* out);
+	// KYTY_PERF_COUNT_GUEST: ReadGpuCopy's bytes from guest memory when guest memory holds what the buffer holds after all
+	// recorded work (false: not served).
+	bool ReadCountGuest(uint64_t vaddr, uint64_t size, void* out);
+	bool ReadGpuCopyFrom(Buffer& buffer, uint64_t vaddr, uint64_t size, void* out);
 	bool ReadGpuCopyRecorded(Buffer& buffer, uint64_t vaddr, uint64_t size, void* out);
 	void ServeWhileWaiting(uint64_t target); // KYTY_PERF_SERVE_IN_WAIT
 	// The range a CPU read of [vaddr, vaddr + size) downloads (ReadMemory, PlanCallerWait).

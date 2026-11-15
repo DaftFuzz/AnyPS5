@@ -116,6 +116,16 @@ constexpr SwitchInfo Switches[] = {
     // recorded GPU writes itself; the word reads the same either way. The listed writes are published whenever the
     // switch can be on, so either phase finds them; nothing else outlives the wait.
     {Switch::DrainFreeWait, "KYTY_PERF_DRAIN_FREE_WAIT", 1},
+    // Per upload batch commit: who protects the claimed pages and re-checks the staged bytes (the GPU thread now, or the
+    // worker before any GPU-thread tracker call over those regions and before the next ordering point). The ordering
+    // points join the worker whenever the switch can be on, so a job of either phase is finished there.
+    {Switch::AsyncReprotect, "KYTY_PERF_ASYNC_REPROTECT", 1},
+    // Per instance-count read: bytes neither GPU- nor CPU-dirty, with no readback over them and no GPU-written image
+    // over them, are read from guest memory, or copied from the buffer after all recorded work; nothing is changed.
+    {Switch::CountGuest, "KYTY_PERF_COUNT_GUEST", 1},
+    // Per plain draw or direct dispatch: whether the no-access protections it adds are kept until the next observation
+    // point; every other operation, guest command and idle wait applies what is kept, whatever the phase.
+    {Switch::DeferReadProtect, "KYTY_PERF_DEFER_READ_PROTECT", 1},
     // Project 15 way B P1 (test switch): a read-only buffer binding with a ready plan entry whose proof holds takes the
     // binding the helper computed (handle, aligned offset, range, offset byte, record stride) instead of RebindBuffers'.
 };
