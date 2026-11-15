@@ -5,6 +5,8 @@
 
 #include <cstdint>
 #include <memory>
+#include <utility>
+#include <vector>
 
 // Step F2 of the stage F design. The resolve thread materializes the resource snapshot of
 // upcoming draws ahead of the GPU thread; they also compute what FindBuffers will compute for that snapshot and store it
@@ -25,6 +27,7 @@ class RenderContext;
 
 namespace ShaderRecompiler::IR {
 struct ResourceSnapshot;
+struct CompiledShaderInfo;
 } // namespace ShaderRecompiler::IR
 
 namespace StageF {
@@ -81,6 +84,11 @@ void BuildResolveRecord(RenderContext& renderer, const ShaderRecompiler::IR::Res
                         ResolveRecordPtr& record);
 // Resolve thread: the slot has no result; its record (if any) describes nothing.
 void ClearResolveRecord(ResolveRecord* record) noexcept;
+// KYTY_PERF_DRAIN_FREE_WAIT=3: appends [first, end) of every guest range a stage with `program` and `snapshot` can write
+// through its buffers (each written binding's source found ahead) and record-keyed ranges (listed completely). False: a
+// write without a known range (address writes, DMA, a written source not found ahead).
+bool WrittenRangesAhead(const ResolveRecord* record, const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                        const ShaderRecompiler::IR::ResourceSnapshot& snapshot, std::vector<std::pair<uint64_t, uint64_t>>& out);
 
 } // namespace StageF
 } // namespace Libs::Graphics

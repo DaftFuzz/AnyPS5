@@ -121,8 +121,10 @@ constexpr SwitchInfo Switches[] = {
     // Per WAIT_REG_MEM on a direct-range word that passes as read: whether the command processor drains the execution
     // thread before it reads the word again, or (no operation in flight can write buffer memory) waits for the word's
     // recorded GPU writes itself; the word reads the same either way. The listed writes are published whenever the
-    // switch can be on, so either phase finds them; nothing else outlives the wait.
-    {Switch::DrainFreeWait, "KYTY_PERF_DRAIN_FREE_WAIT", 1},
+    // switch can be on, so either phase finds them; nothing else outlives the wait. =3 (the full variant) also lets an
+    // operation whose write ranges exclude the word stay in flight; its ranges are listed only when KYTY_LIVE_AB names
+    // the switch with =3.
+    {Switch::DrainFreeWait, "KYTY_PERF_DRAIN_FREE_WAIT", 3},
     // Per upload batch commit: who protects the claimed pages and re-checks the staged bytes (the GPU thread now, or the
     // worker before any GPU-thread tracker call over those regions and before the next ordering point). The ordering
     // points join the worker whenever the switch can be on, so a job of either phase is finished there.

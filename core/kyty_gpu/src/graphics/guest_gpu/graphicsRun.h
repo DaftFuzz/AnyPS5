@@ -117,8 +117,20 @@ public:
 	// not executed can write buffer memory (a verdict not known yet is waited for, from the resolve side) and the newest
 	// unfinished published GPU write over the word was waited for here; the caller reads the word again through the
 	// overlay, as after a drain. False: drain as before; `reason` says why.
-	enum class DrainFreeFallback : uint8_t { Writer, Unknown, ResolveTimeout, Window, OpenBuffer, Count };
-	bool TryDrainFreeDirectWait(uint64_t address, uint64_t size, DrainFreeFallback* reason);
+	// `full` (=3): a writer in flight whose ranges exclude the word does not drain when its resolution is fresh: every
+	// operation after the last one whose writes had landed when the resolution began (the executed sequence, the published
+	// label and the known GPU tick then) has writes with known ranges (the execution thread confirmed them for the
+	// executed ones, freshness for the ones in flight) that miss everything the resolution read.
+	enum class DrainFreeFallback : uint8_t { Writer, Unknown, ResolveTimeout, Window, OpenBuffer, WritesWord, Stale, Budget, Count };
+	bool TryDrainFreeDirectWait(uint64_t address, uint64_t size, bool full, DrainFreeFallback* reason);
+	// =3: the ranges the resolve side lists for a writer (any thread, before its verdict), the CP's journal writes of a
+	// callback (command processor thread), and the GPU tick each operation's recording ended in, with whether its
+	// writes stayed inside its listed ranges (execution thread, before the operation counts as executed).
+	void NoteOperationRanges(uint64_t sequence, uint64_t watermark, uint64_t published, uint64_t known_tick,
+	                         const OpWriteRanges& ranges) noexcept;
+	void NoteCpWriteRange(uint64_t sequence, uint64_t address, uint64_t size, bool unknown = false) noexcept;
+	void NoteOperationTick(uint64_t sequence, uint64_t tick, bool writes_ok) noexcept;
+	[[nodiscard]] const OpWriteRanges* OperationRanges(uint64_t sequence) const noexcept;
 
 private:
 	static constexpr uint32_t ComputePipeCount     = 7;
@@ -226,6 +238,34 @@ private:
 	Common::SpscQueue<GpuOperation> m_resolved;
 	static constexpr size_t                  OperationWritesSize = 8192; // > OperationQueueSize + ResolvedQueueSize + 2
 	std::unique_ptr<std::atomic<uint64_t>[]> m_operation_writes;
+	struct OperationRangeEntry {
+		std::atomic<uint64_t> sequence {0};
+		uint64_t              watermark = 0, published = 0, known_tick = 0;
+		OpWriteRanges         ranges;
+	};
+	struct OperationTickEntry {
+		std::atomic<uint64_t> sequence {0};
+		uint64_t              tick      = 0;
+		bool                  writes_ok = false;
+	};
+	struct CpWriteEntry {
+		uint64_t                                     sequence = 0;
+		bool                                         unknown  = false;
+		uint8_t                                      count    = 0;
+		std::array<std::pair<uint64_t, uint64_t>, 4> write {};
+	};
+	struct FreshEntry {
+		uint64_t sequence = 0;
+		uint8_t  verdict  = 0; // 1 fresh, 2 not
+	};
+	std::unique_ptr<OperationRangeEntry[]> m_operation_ranges;
+	std::unique_ptr<OperationTickEntry[]>  m_operation_ticks;
+	std::unique_ptr<CpWriteEntry[]>        m_cp_writes; // command processor thread
+	std::unique_ptr<FreshEntry[]>          m_fresh;     // command processor thread
+	// =3: whether `entry` (operation `sequence`) read nothing operations after its stream state could have changed.
+	bool DrainFreeFresh(uint64_t sequence, const OperationRangeEntry& entry, uint64_t& budget, uint32_t depth);
+	[[nodiscard]] bool DrainFreeWritesMiss(uint64_t sequence, const std::pair<uint64_t, uint64_t>* reads, uint32_t read_count,
+	                                       uint64_t& budget, uint32_t depth, bool in_flight);
 	std::atomic_bool                m_execution_sleeping {false};
 	std::atomic_uint32_t            m_execution_bell {0};
 	std::atomic_bool                m_execution_stop {false};

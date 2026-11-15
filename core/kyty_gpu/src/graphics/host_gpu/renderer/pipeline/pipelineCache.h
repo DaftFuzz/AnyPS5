@@ -71,6 +71,22 @@ void               SetResolveCheck(bool on);
 [[nodiscard]] int  ResolvedStagesCompare(const ResolvedStages& a, const ResolvedStages& b, const char** field);
 void               ResolvedStagesFault(ResolvedStages& stages, uint32_t fault);
 inline thread_local ResolvedStages* t_resolved_stages = nullptr;
+// KYTY_PERF_DRAIN_FREE_WAIT=3 (the full variant): the guest bytes a resolved operation can write and the guest bytes its
+// resolution read, each as at most a few intervals [first, second) that cover them (supersets: neighbours are joined).
+// `known`: every write has a range (no address write outside the record-keyed ranges, no DMA, every written buffer's
+// source found ahead).
+struct OpWriteRanges {
+	static constexpr uint32_t                     MaxWrites = 8;
+	static constexpr uint32_t                     MaxReads  = 16;
+	bool                                          known     = false;
+	uint8_t                                       writes    = 0;
+	uint8_t                                       reads     = 0;
+	std::array<std::pair<uint64_t, uint64_t>, 8>  write {};
+	std::array<std::pair<uint64_t, uint64_t>, 16> read {};
+};
+// Joins sorted or unsorted intervals into at most `max` covering ones (overlaps and the smallest gaps first); returns the
+// count written to `out`.
+uint32_t CoverIntervals(std::vector<std::pair<uint64_t, uint64_t>>& in, std::pair<uint64_t, uint64_t>* out, uint32_t max);
 // KYTY_TRACE_DISPATCH_CENSUS: how ProgramCache::Get<Compute> got the last compute stage's resources on this thread
 // (2 materialized, 3 the resolve thread's result, 4 compiled: a program miss). Not touched when the selection is adopted.
 inline thread_local uint32_t t_compute_program_path = 0;
@@ -272,6 +288,8 @@ public:
 	// the permutation it will run and neither it nor its source plan writes a buffer, an image, a record-keyed range,
 	// through an address or by DMA), 2 a stage can, 3 not known (not adoptable, a stage without its permutation).
 	[[nodiscard]] static uint8_t  ResolvedWrites(const ResolvedStages& results);
+	// =3: the write and read ranges of resolved stages ResolvedWrites called 2 (OpWriteRanges).
+	static void                   ResolvedWriteRanges(const ResolvedStages& results, OpWriteRanges& out);
 	[[nodiscard]] static bool     AheadProgramsOk(const ResolvedStages& results);
 	[[nodiscard]] static uint32_t StageCount(const ResolvedStages& results);
 	[[nodiscard]] static const ShaderRecompiler::IR::CompiledShaderInfo* AheadProgram(const ResolvedStages& results, uint32_t i);

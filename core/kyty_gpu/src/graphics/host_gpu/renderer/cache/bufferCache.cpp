@@ -2755,8 +2755,9 @@ uint32_t DrainFreeWaitFixed() {
 		const char*    text = std::getenv("KYTY_PERF_DRAIN_FREE_WAIT");
 		const uint32_t v    = text != nullptr ? static_cast<uint32_t>(std::strtoul(text, nullptr, 10)) : 0u;
 		if (v != 0) {
-			std::fprintf(stderr, "KYTY_PERF_DRAIN_FREE_WAIT=%u: WAIT_REG_MEM on a direct-range word skips the drain when no operation in flight can write%s\n", v,
-			             v == 2 ? " (check: drained anyway, verdicts and values compared)" : "");
+			std::fprintf(stderr, "KYTY_PERF_DRAIN_FREE_WAIT=%u: WAIT_REG_MEM on a direct-range word skips the drain when no operation in flight can write %s%s\n", v,
+			             v >= 3 ? "it (write ranges found ahead, fresh resolutions)" : "at all",
+			             v == 2 || v == 4 ? " (check: drained anyway, verdicts and values compared)" : "");
 		}
 		return v;
 	}();
@@ -2770,6 +2771,16 @@ uint32_t BufferCache::DrainFreeWaitMode() {
 
 bool BufferCache::DrainFreeWaitPossible() {
 	static const bool possible = Common::LiveAb::Possible(Common::LiveAb::Switch::DrainFreeWait, DrainFreeWaitFixed());
+	return possible;
+}
+
+bool BufferCache::DrainFreeRangesPossible() {
+	static const bool possible = [] {
+		if (DrainFreeWaitFixed() >= 3u) return true;
+		const char* live = std::getenv("KYTY_LIVE_AB");
+		return live != nullptr && std::strstr(live, "KYTY_PERF_DRAIN_FREE_WAIT=3") != nullptr &&
+		       Common::LiveAb::Listed(Common::LiveAb::Switch::DrainFreeWait);
+	}();
 	return possible;
 }
 
@@ -4847,6 +4858,13 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferPath(uint64_t vaddr, uint6
 
 void BufferCache::NoteObtainedWrite(uint64_t vaddr, uint64_t size) {
 	if (t_translator != 0) TranslatorNote(4); // project 15 S2a: a write note inside a peek
+	if (m_watch_on) { // KYTY_PERF_DRAIN_FREE_WAIT=3
+		bool inside = false;
+		for (uint32_t i = 0; i < m_watch_count && !inside; i++) {
+			inside = m_watch_intervals[i].first <= vaddr && vaddr + size <= m_watch_intervals[i].second;
+		}
+		if (!inside) m_watch_outside++;
+	}
 	if (!m_append_pools.empty() || !m_append_windows.empty()) AppendForeignWrite(vaddr, size); // D4b step 1 (append windows)
 	if (UploadClobberCheck()) { // D4 step K0
 		C0Note(vaddr, size, InDirectRange(vaddr, size) ? C0Event::DirectWrite : C0Event::ShaderWrite,

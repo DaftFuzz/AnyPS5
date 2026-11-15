@@ -430,9 +430,14 @@ static GuestGpu* StreamGpu() noexcept {
 
 // KYTY_PERF_DRAIN_FREE_WAIT: the GPU whose operations the resolve side gives write verdicts for (one GuestGpu).
 static std::atomic<GuestGpu*> g_verdict_gpu {nullptr};
+// =3, execution thread: the operation just executed noted no write outside its listed ranges.
+static thread_local bool t_drain_free_writes_ok = true;
 
-static void PublishOperationWrites(uint64_t sequence, uint8_t verdict) {
-	if (auto* const gpu = g_verdict_gpu.load(std::memory_order_acquire); gpu != nullptr) gpu->NoteOperationWrites(sequence, verdict);
+static void PublishOperationWrites(const RenderExecutor::ResolveTask& task, uint8_t verdict, const OpWriteRanges* ranges) {
+	auto* const gpu = g_verdict_gpu.load(std::memory_order_acquire);
+	if (gpu == nullptr) return;
+	if (ranges != nullptr) gpu->NoteOperationRanges(task.op_sequence, task.watermark, task.published, task.known_tick, *ranges);
+	gpu->NoteOperationWrites(task.op_sequence, verdict);
 }
 
 
@@ -708,6 +713,12 @@ GuestGpu::GuestGpu(RenderContext& renderer)
 	GraphicsInitJmpTables();
 	m_pending_writes = std::make_unique<GuestWrite[]>(PendingWriteCapacity);
 	m_operation_writes = std::make_unique<std::atomic<uint64_t>[]>(OperationWritesSize);
+	if (BufferCache::DrainFreeRangesPossible()) {
+		m_operation_ranges = std::make_unique<OperationRangeEntry[]>(OperationWritesSize);
+		m_operation_ticks  = std::make_unique<OperationTickEntry[]>(OperationWritesSize);
+		m_cp_writes        = std::make_unique<CpWriteEntry[]>(OperationWritesSize);
+		m_fresh            = std::make_unique<FreshEntry[]>(OperationWritesSize);
+	}
 	g_verdict_gpu.store(this, std::memory_order_release);
 	m_neutral_context.Reset();
 	m_neutral_user_config.Reset();
@@ -763,7 +774,8 @@ void GuestGpu::SendCommand(Common::UniqueFunction<void>&& command) {
 	}
 	if (g_cp_thread) {
 		// In operation order: the operations emitted so far may write what the command reads.
-		m_gfx_cp->EmitCallback([operation = std::move(command)]() mutable { operation(); });
+		const auto sequence = m_gfx_cp->EmitCallback([operation = std::move(command)]() mutable { operation(); });
+		NoteCpWriteRange(sequence, 0, 0, true); // KYTY_PERF_DRAIN_FREE_WAIT=3: a guest command writes what it writes
 		return;
 	}
 	PostCommand(std::move(command));
@@ -934,7 +946,7 @@ void GuestGpu::RingExecution() noexcept {
 }
 
 void GuestGpu::ExecuteSync(Common::UniqueFunction<void>&& command) {
-	m_gfx_cp->EmitCallback([operation = std::move(command)]() mutable { operation(); });
+	NoteCpWriteRange(m_gfx_cp->EmitCallback([operation = std::move(command)]() mutable { operation(); }), 0, 0, true);
 	WaitForExecution(GpuDrain::Fault);
 }
 
@@ -1421,6 +1433,10 @@ void GuestGpu::ExecutionThread() {
 		const auto sequence = operation->sequence;
 		// Destroy the callback before the command processor may reuse what it references.
 		operation.reset();
+		if (m_operation_ticks) { // KYTY_PERF_DRAIN_FREE_WAIT=3
+			NoteOperationTick(sequence, m_renderer.GetCommandScheduler().CurrentTick(), t_drain_free_writes_ok);
+			t_drain_free_writes_ok = true;
+		}
 		m_executed.Publish(sequence);
 		if (PendingCommands().load(std::memory_order_acquire) != 0) {
 			const Common::SlowFrame::Scope slow_commands(Common::SlowFrame::Commands); // KYTY_TRACE_SLOW_FRAMES
@@ -1508,6 +1524,7 @@ void GuestGpu::ResolveThread() {
 	auto           report_at  = std::chrono::steady_clock::now();
 	const bool     scout      = CompileScoutEnabled();
 	const bool     drain_free_possible = BufferCache::DrainFreeWaitPossible(); // KYTY_PERF_DRAIN_FREE_WAIT
+	const bool     drain_free_ranges   = BufferCache::DrainFreeRangesPossible();
 	size_t         scout_ahead = 0;
 	auto           jobs_report_at = std::chrono::steady_clock::now();
 	if (scout) {
@@ -1664,6 +1681,12 @@ void GuestGpu::ResolveThread() {
 			auto& slot = executor.TakeResolvedSlot();
 			task.op_sequence    = operation->sequence;
 			task.writes_verdict = drain_free_possible ? &PublishOperationWrites : nullptr;
+			task.want_ranges    = drain_free_ranges;
+			if (drain_free_ranges) {
+				task.known_tick = m_renderer.GetCommandScheduler().GetMasterSemaphore().KnownGpuTick();
+				task.published  = m_published.load(std::memory_order_acquire);
+				task.watermark  = m_executed.Load();
+			}
 			if (check) {
 				// The reference: this thread resolves it as the helper will (the same function), the helper's result is
 				// compared with it before the operation executes; the operation uses the reference.
@@ -2081,6 +2104,7 @@ void GuestGpu::WaitForOldestWrite() {
 }
 
 void GuestGpu::NoteGuestWrite(uint64_t sequence, uint64_t address, uint64_t size, const void* value) {
+	NoteCpWriteRange(sequence, address, size); // KYTY_PERF_DRAIN_FREE_WAIT=3
 	if (sequence <= m_executed.Load()) {
 		return; // executed writes are in guest memory
 	}
@@ -2095,6 +2119,7 @@ void GuestGpu::NoteGuestWrite(uint64_t sequence, uint64_t address, uint64_t size
 }
 
 void GuestGpu::NoteDeferredWrite(uint64_t sequence, uint64_t address, uint64_t size, const void* value) {
+	NoteCpWriteRange(sequence, address, size); // KYTY_PERF_DRAIN_FREE_WAIT=3
 	auto& write      = NewWrite();
 	write.sequence   = sequence;
 	write.address    = address;
@@ -2105,6 +2130,7 @@ void GuestGpu::NoteDeferredWrite(uint64_t sequence, uint64_t address, uint64_t s
 }
 
 void GuestGpu::NoteStreamWrite(uint64_t sequence, uint64_t address, uint32_t value) {
+	NoteCpWriteRange(sequence, address, sizeof(value)); // KYTY_PERF_DRAIN_FREE_WAIT=3
 	auto& write    = NewWrite();
 	write.sequence = sequence;
 	write.address  = address;
@@ -2197,6 +2223,7 @@ struct DrainFreeStats {
 	std::atomic<uint64_t> skipped {0}, drained {0}, resolve_waits {0}, resolve_ns {0}, tick_waits {0}, tick_ns {0};
 	std::atomic<uint64_t> in_flight {0}, compared {0}, differ_verdicts {0}, differ_values {0}, differ_lines {0};
 	std::atomic<uint64_t> judged_none {0}, broken {0}, broken_lines {0};
+	std::atomic<uint64_t> ranged {0}, range_broken {0}, range_broken_lines {0}, kept_writers {0}, fresh_checks {0}, fresh_work {0};
 	std::array<std::atomic<uint64_t>, static_cast<size_t>(GuestGpu::DrainFreeFallback::Count)> fallback {};
 	std::atomic<int64_t> window_start {0};
 };
@@ -2220,15 +2247,31 @@ void ReportDrainFree() {
 	const auto tick_ns = take(s.tick_ns), in_flight = take(s.in_flight), compared = take(s.compared);
 	const auto differ_verdicts = take(s.differ_verdicts), differ_values = take(s.differ_values);
 	const auto judged_none = take(s.judged_none), broken = take(s.broken);
-	const auto decided = skipped + writer + unknown + timeout + window + open;
+	const auto writes_word = take(s.fallback[5]), stale = take(s.fallback[6]), budget = take(s.fallback[7]);
+	const auto ranged = take(s.ranged), range_broken = take(s.range_broken), kept_writers = take(s.kept_writers);
+	const auto fresh_checks = take(s.fresh_checks), fresh_work = take(s.fresh_work);
+	const auto decided = skipped + writer + unknown + timeout + window + open + writes_word + stale + budget;
 	std::fprintf(stderr,
-	             "PERF drain_free_wait mode=%u skipped=%llu drained=%llu fallback[writer|unknown|resolve_timeout|window|open_buffer]="
-	             "%llu|%llu|%llu|%llu|%llu in_flight_mean=%.1f resolve_waits=%llu resolve_wait_ms=%.2f tick_waits=%llu "
-	             "tick_wait_ms=%.2f compared=%llu differ_verdicts=%llu differ_values=%llu judged_none_ops=%llu broken=%llu (per ~5 s)\n",
-	             BufferCache::DrainFreeWaitMode(), skipped, drained, writer, unknown, timeout, window, open,
+	             "PERF drain_free_wait mode=%u skipped=%llu drained=%llu fallback[writer|unknown|resolve_timeout|window|open_buffer|"
+	             "writes_word|stale|budget]=%llu|%llu|%llu|%llu|%llu|%llu|%llu|%llu in_flight_mean=%.1f resolve_waits=%llu "
+	             "resolve_wait_ms=%.2f tick_waits=%llu tick_wait_ms=%.2f compared=%llu differ_verdicts=%llu differ_values=%llu "
+	             "judged_none_ops=%llu broken=%llu ranged_ops=%llu range_broken=%llu kept_writers=%llu fresh_checks=%llu "
+	             "fresh_work=%llu (per ~5 s)\n",
+	             BufferCache::DrainFreeWaitMode(), skipped, drained, writer, unknown, timeout, window, open, writes_word, stale, budget,
 	             decided != 0 ? static_cast<double>(in_flight) / static_cast<double>(decided) : 0.0, resolve_waits,
 	             static_cast<double>(resolve_ns) / 1e6, tick_waits, static_cast<double>(tick_ns) / 1e6, compared, differ_verdicts,
-	             differ_values, judged_none, broken);
+	             differ_values, judged_none, broken, ranged, range_broken, kept_writers, fresh_checks, fresh_work);
+}
+
+void NoteDrainFreeRanged(const GpuOperation& operation, bool outside) {
+	auto& s = g_drain_free;
+	s.ranged.fetch_add(1, std::memory_order_relaxed);
+	if (!outside) return;
+	s.range_broken.fetch_add(1, std::memory_order_relaxed);
+	if (s.range_broken_lines.fetch_add(1, std::memory_order_relaxed) < 32u) {
+		std::fprintf(stderr, "PERF_DRAIN_FREE_RANGE_BROKEN sequence=%llu kind=%u: an operation wrote outside the ranges listed ahead\n",
+		             static_cast<unsigned long long>(operation.sequence), static_cast<uint32_t>(operation.kind));
+	}
 }
 
 int64_t DrainFreeNowNs() {
@@ -2268,7 +2311,126 @@ uint8_t GuestGpu::OperationWrites(uint64_t sequence) const noexcept {
 	return (entry >> 2u) == sequence ? static_cast<uint8_t>(entry & 3u) : 0u;
 }
 
-bool GuestGpu::TryDrainFreeDirectWait(uint64_t address, uint64_t size, DrainFreeFallback* reason) {
+void GuestGpu::NoteOperationRanges(uint64_t sequence, uint64_t watermark, uint64_t published, uint64_t known_tick,
+                                   const OpWriteRanges& ranges) noexcept {
+	if (!m_operation_ranges) return;
+	auto& entry      = m_operation_ranges[sequence & (OperationWritesSize - 1u)];
+	entry.watermark  = watermark;
+	entry.published  = published;
+	entry.known_tick = known_tick;
+	entry.ranges     = ranges;
+	entry.sequence.store(sequence, std::memory_order_release);
+}
+
+const OpWriteRanges* GuestGpu::OperationRanges(uint64_t sequence) const noexcept {
+	if (!m_operation_ranges) return nullptr;
+	const auto& entry = m_operation_ranges[sequence & (OperationWritesSize - 1u)];
+	if (entry.sequence.load(std::memory_order_acquire) != sequence || !entry.ranges.known) return nullptr;
+	return &entry.ranges;
+}
+
+void GuestGpu::NoteCpWriteRange(uint64_t sequence, uint64_t address, uint64_t size, bool unknown) noexcept {
+	if (!m_cp_writes || sequence == 0 || (size == 0 && !unknown)) return;
+	auto& entry = m_cp_writes[sequence & (OperationWritesSize - 1u)];
+	if (entry.sequence != sequence) {
+		entry.sequence = sequence;
+		entry.unknown  = false;
+		entry.count    = 0;
+	}
+	if (unknown) {
+		entry.unknown = true;
+		return;
+	}
+	const std::pair<uint64_t, uint64_t> range {address, address + size};
+	if (entry.count < entry.write.size()) {
+		entry.write[entry.count++] = range;
+		return;
+	}
+	auto& last  = entry.write[entry.write.size() - 1u];
+	last.first  = std::min(last.first, range.first);
+	last.second = std::max(last.second, range.second);
+}
+
+void GuestGpu::NoteOperationTick(uint64_t sequence, uint64_t tick, bool writes_ok) noexcept {
+	auto& entry     = m_operation_ticks[sequence & (OperationWritesSize - 1u)];
+	entry.tick      = tick;
+	entry.writes_ok = writes_ok;
+	entry.sequence.store(sequence, std::memory_order_release);
+}
+
+namespace {
+bool IntervalsOverlap(const std::pair<uint64_t, uint64_t>* a, uint32_t na, const std::pair<uint64_t, uint64_t>* b, uint32_t nb) {
+	for (uint32_t i = 0; i < na; i++) {
+		for (uint32_t k = 0; k < nb; k++) {
+			if (a[i].first < b[k].second && b[k].first < a[i].second) return true;
+		}
+	}
+	return false;
+}
+} // namespace
+
+bool GuestGpu::DrainFreeWritesMiss(uint64_t sequence, const std::pair<uint64_t, uint64_t>* reads, uint32_t read_count,
+                                   uint64_t& budget, uint32_t depth, bool in_flight) {
+	const auto& cp = m_cp_writes[sequence & (OperationWritesSize - 1u)];
+	if (cp.sequence == sequence) {
+		if (cp.unknown) return false;
+		budget -= std::min<uint64_t>(budget, uint64_t {cp.count} * read_count);
+		if (IntervalsOverlap(cp.write.data(), cp.count, reads, read_count)) return false;
+	}
+	const uint8_t verdict = OperationWrites(sequence);
+	if (verdict == 1u) return true;
+	if (verdict != 2u) return false;
+	const auto& entry = m_operation_ranges[sequence & (OperationWritesSize - 1u)];
+	if (entry.sequence.load(std::memory_order_acquire) != sequence || !entry.ranges.known) return false;
+	if (in_flight) {
+		if (!DrainFreeFresh(sequence, entry, budget, depth + 1u)) return false;
+	} else {
+		const auto& tick = m_operation_ticks[sequence & (OperationWritesSize - 1u)];
+		if (tick.sequence.load(std::memory_order_acquire) != sequence || !tick.writes_ok) return false;
+	}
+	budget -= std::min<uint64_t>(budget, uint64_t {entry.ranges.writes} * read_count);
+	return !IntervalsOverlap(entry.ranges.write.data(), entry.ranges.writes, reads, read_count);
+}
+
+bool GuestGpu::DrainFreeFresh(uint64_t sequence, const OperationRangeEntry& entry, uint64_t& budget, uint32_t depth) {
+	auto& memo = m_fresh[sequence & (OperationWritesSize - 1u)];
+	if (memo.sequence == sequence) return memo.verdict == 1u;
+	if (depth > 32u || budget == 0) return false;
+	g_drain_free.fresh_checks.fetch_add(1, std::memory_order_relaxed);
+	const uint64_t start  = budget;
+	const auto     finish = [&](bool fresh) {
+        g_drain_free.fresh_work.fetch_add(start - budget, std::memory_order_relaxed);
+        if (budget != 0) {
+            memo.sequence = sequence;
+            memo.verdict  = fresh ? 1u : 2u;
+        }
+        return fresh;
+	};
+	const uint64_t floor = m_emitted >= OperationWritesSize ? m_emitted - OperationWritesSize + 1u : 1u;
+	// The newest operation up to the watermark whose recording had finished on the GPU when the resolution began.
+	uint64_t landed = entry.watermark;
+	while (landed != 0) {
+		if (landed < floor || budget == 0) return finish(false);
+		budget--;
+		const auto& tick = m_operation_ticks[landed & (OperationWritesSize - 1u)];
+		if (tick.sequence.load(std::memory_order_acquire) != landed) return finish(false);
+		if (tick.tick <= entry.known_tick) break;
+		landed--;
+	}
+	const uint64_t from = std::min(landed, entry.published);
+	if (from + 1u < floor) return finish(false);
+	const uint64_t executed = m_executed.Load();
+	for (uint64_t other = from + 1u; other < sequence; other++) {
+		if (budget == 0) return finish(false);
+		budget--;
+		if (!DrainFreeWritesMiss(other, entry.ranges.read.data(), entry.ranges.reads, budget, depth, other > executed)) {
+			return finish(false);
+		}
+	}
+	return finish(true);
+}
+
+bool GuestGpu::TryDrainFreeDirectWait(uint64_t address, uint64_t size, bool full, DrainFreeFallback* reason) {
 	auto&      s    = g_drain_free;
 	const auto fail = [&](DrainFreeFallback why) {
 		*reason = why;
@@ -2285,6 +2447,7 @@ bool GuestGpu::TryDrainFreeDirectWait(uint64_t address, uint64_t size, DrainFree
 	if (pending >= OperationWritesSize) return fail(DrainFreeFallback::Window);
 	constexpr int64_t ResolveLimitNs = 20'000'000;
 	int64_t           resolve_start  = 0;
+	uint64_t          fresh_budget   = 400'000; // =3: interval comparisons per wait
 	for (uint64_t sequence = executed + 1u; sequence <= emitted; sequence++) {
 		uint8_t verdict = OperationWrites(sequence);
 		if (verdict == 0u && m_executed.Load() < sequence) {
@@ -2300,6 +2463,27 @@ bool GuestGpu::TryDrainFreeDirectWait(uint64_t address, uint64_t size, DrainFree
 		}
 		// An operation that executed meanwhile listed its writes before its sequence was published.
 		if (verdict == 0u || verdict == 1u || m_executed.Load() >= sequence) continue;
+		if (verdict == 2u && full && m_operation_ranges) {
+			// =3: a writer whose ranges miss the word and whose resolution is fresh writes what it was resolved to write.
+			const auto& entry = m_operation_ranges[sequence & (OperationWritesSize - 1u)];
+			DrainFreeFallback why = DrainFreeFallback::Writer;
+			if (entry.sequence.load(std::memory_order_acquire) == sequence && entry.ranges.known) {
+				const std::pair<uint64_t, uint64_t> word {address, address + size};
+				if (IntervalsOverlap(entry.ranges.write.data(), entry.ranges.writes, &word, 1u)) {
+					why = DrainFreeFallback::WritesWord;
+				} else if (DrainFreeFresh(sequence, entry, fresh_budget, 0u)) {
+					s.kept_writers.fetch_add(1, std::memory_order_relaxed);
+					continue;
+				} else {
+					why = fresh_budget == 0 ? DrainFreeFallback::Budget : DrainFreeFallback::Stale;
+				}
+			}
+			if (resolve_start != 0) {
+				s.resolve_waits.fetch_add(1, std::memory_order_relaxed);
+				s.resolve_ns.fetch_add(static_cast<uint64_t>(DrainFreeNowNs() - resolve_start), std::memory_order_relaxed);
+			}
+			return fail(why);
+		}
 		if (resolve_start != 0) {
 			s.resolve_waits.fetch_add(1, std::memory_order_relaxed);
 			s.resolve_ns.fetch_add(static_cast<uint64_t>(DrainFreeNowNs() - resolve_start), std::memory_order_relaxed);
@@ -2530,6 +2714,13 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 	const bool        drain_free_judged = drain_free_watch && g_gpu_state != nullptr && operation.kind != GpuOperationKind::Callback &&
 	                               operation.kind != GpuOperationKind::StateCallback && g_gpu_state->OperationWrites(operation.sequence) == 1u;
 	const uint64_t    direct_writes0 = drain_free_judged ? m_renderer.GetBufferCache().DirectShaderWrites() : 0u;
+	const OpWriteRanges* drain_free_ranges = drain_free_watch && g_gpu_state != nullptr && operation.kind != GpuOperationKind::Callback &&
+	                                                 operation.kind != GpuOperationKind::StateCallback &&
+	                                                 g_gpu_state->OperationWrites(operation.sequence) == 2u
+	                                             ? g_gpu_state->OperationRanges(operation.sequence)
+	                                             : nullptr;
+	const uint64_t outside0 = drain_free_ranges != nullptr ? m_renderer.GetBufferCache().WatchedOutside() : 0u;
+	if (drain_free_ranges != nullptr) m_renderer.GetBufferCache().WatchWrites(drain_free_ranges->write.data(), drain_free_ranges->writes);
 	switch (operation.kind) {
 		case GpuOperationKind::DrawIndex: ExecuteDrawIndex(operation, operation.draw_index); break;
 		case GpuOperationKind::DrawAuto: ExecuteDrawAuto(operation, operation.draw_auto); break;
@@ -2547,6 +2738,11 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 			break;
 	}
 	if (drain_free_judged) NoteDrainFreeJudged(operation, m_renderer.GetBufferCache().DirectShaderWrites() != direct_writes0);
+	if (drain_free_ranges != nullptr) {
+		m_renderer.GetBufferCache().UnwatchWrites();
+		t_drain_free_writes_ok = m_renderer.GetBufferCache().WatchedOutside() == outside0;
+		NoteDrainFreeRanged(operation, !t_drain_free_writes_ok);
+	}
 	if (operation.resolved != nullptr) {
 		executor.UseResolvedDraw(nullptr);
 		RenderExecutor::ReleaseResolvedDraw(operation.resolved);
@@ -2694,9 +2890,11 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 			static const bool drain_free_possible = BufferCache::DrainFreeWaitPossible();
 			const uint32_t    drain_free          = g_cp_thread && drain_free_possible ? BufferCache::DrainFreeWaitMode() : 0u;
 			GuestGpu::DrainFreeFallback fallback {};
-			const bool skip = drain_free != 0u && g_stream_gpu->TryDrainFreeDirectWait(reinterpret_cast<uint64_t>(addr), sizeof(T), &fallback);
+			const bool check = drain_free == 2u || drain_free == 4u;
+			const bool skip  = drain_free != 0u &&
+			                  g_stream_gpu->TryDrainFreeDirectWait(reinterpret_cast<uint64_t>(addr), sizeof(T), drain_free >= 3u, &fallback);
 			if (skip) read();
-			if (!skip || drain_free == 2u) {
+			if (!skip || check) {
 				const T free_value = value;
 				RunOnExecution(GpuDrain::DirectWrites, [this, addr] {
 					m_renderer.GetBufferCache().WaitDirectGpuWrites(reinterpret_cast<uint64_t>(addr), sizeof(T));
@@ -4299,6 +4497,8 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 		gpu->NoteDeferredWrite(sequence, destination, sizeof(label), &label);
 	} else if (gpu != nullptr && write == EndOfPipeWrite::Qword && !stamped) {
 		gpu->NoteDeferredWrite(sequence, destination, sizeof(data), &data);
+	} else if (gpu != nullptr && write == EndOfPipeWrite::Qword) {
+		gpu->NoteCpWriteRange(sequence, destination, sizeof(data)); // KYTY_PERF_DRAIN_FREE_WAIT=3: a clock value, known when it lands
 	}
 	EmitCallback([=, this] {
 		ExecuteEndOfPipe(write, sequence, dst_gpu_addr, data, gpu_clock, with_interrupt, interrupt_context_id);
