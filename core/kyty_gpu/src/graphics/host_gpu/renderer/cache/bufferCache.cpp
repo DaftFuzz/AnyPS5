@@ -2761,9 +2761,26 @@ void BufferCache::NoteRingWordWait(uint64_t nanoseconds) {
 }
 
 void BufferCache::CheckRingWordGpu(uint64_t address, uint32_t cpu_value) {
-	const bool recorded = PeekGpuCopyAsync(address, sizeof(uint32_t), [address, cpu_value](const uint8_t* bytes) {
+	auto [mapped, offset] = m_download_buffer.Map(sizeof(uint32_t), 64);
+	if (mapped == nullptr) {
+		g_ring_words.unchecked.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	m_download_buffer.Commit();
+	if (!RecordDirectWordCopy(address, m_download_buffer.Handle(), offset)) {
+		g_ring_words.unchecked.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	g_ring_words.copies.fetch_sub(1, std::memory_order_relaxed);
+	vk::MemoryBarrier host {};
+	host.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	host.dstAccessMask = vk::AccessFlagBits::eHostRead;
+	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, 1,
+	                                               &host, 0, nullptr, 0, nullptr);
+	m_scheduler.DeferPriorityOperation([this, mapped, offset, address, cpu_value] {
+		m_download_buffer.Invalidate(offset, sizeof(uint32_t));
 		uint32_t gpu_value = 0;
-		std::memcpy(&gpu_value, bytes, sizeof(gpu_value));
+		std::memcpy(&gpu_value, mapped, sizeof(gpu_value));
 		g_ring_words.checked.fetch_add(1, std::memory_order_relaxed);
 		if (gpu_value == cpu_value) return;
 		g_ring_words.touched.fetch_add(1, std::memory_order_relaxed);
@@ -2772,7 +2789,6 @@ void BufferCache::CheckRingWordGpu(uint64_t address, uint32_t cpu_value) {
 			             static_cast<unsigned long long>(address), cpu_value, gpu_value, DebugPresentCount().load());
 		}
 	});
-	if (!recorded) g_ring_words.unchecked.fetch_add(1, std::memory_order_relaxed);
 }
 
 bool BufferCache::WaitDirectGpuWrites(uint64_t vaddr, uint64_t size, bool cp_overlay) {
