@@ -95,6 +95,25 @@ struct PrecompileGraphicsRecord {
 	[[nodiscard]] uint64_t Key() const;
 };
 
+struct PrecompileMissStage {
+	bool                                            missing = false;
+	PrecompileStageRecord                           record;
+	uint32_t                                        code_size = 0;
+	const ShaderRecompiler::IR::CompiledShaderInfo* info      = nullptr;
+	vk::ShaderModule                                module    = nullptr;
+};
+
+struct PrecompileGraphicsMiss {
+	std::array<PrecompileMissStage, 2> stages;
+	bool                               ps_active  = false;
+	uint32_t                           push_start = 0;
+	ShaderVertexInputInfo              vertex;
+	ShaderPixelInputInfo               pixel;
+	PipelineRenderingState             rendering;
+	PipelineVertexInputState           vertex_input;
+	PipelineStaticParameters           static_params;
+};
+
 // A compute key leaves the stage out (the compute journal's records were keyed so).
 [[nodiscard]] uint64_t PrecompileKey(ShaderType stage, uint64_t shader_hash, uint32_t user_data_count,
                                      uint32_t code_words, std::span<const uint32_t> static_key,
@@ -316,6 +335,7 @@ public:
 
 	void EnqueueRuntime(PrecompileStageRecord record);
 	void EnqueueFirstUse(PrecompileStageRecord record, uint64_t shader_base, uint64_t program);
+	void EnqueueGraphicsMiss(std::unique_ptr<PrecompileGraphicsMiss> miss);
 	void ReportRuntimePerf() const;
 
 private:
@@ -327,8 +347,10 @@ private:
 		uint8_t               state       = 0;
 		uint32_t              worker      = 0;
 		std::chrono::steady_clock::time_point queued_at {};
+		std::unique_ptr<PrecompileGraphicsMiss> miss;
 	};
 	void RunRuntimeJob(RuntimeJob& job);
+	void RunGraphicsMiss(RuntimeJob& job);
 	bool MaterializeFirstUse(PrecompileStageRecord& record, uint64_t shader_base);
 	void ReportDone(std::vector<vk::ShaderModule>& unused);
 	enum class JobState : uint8_t { Queued, Running, Done, Dropped };

@@ -4461,12 +4461,16 @@ void RenderExecutor::PeekAhead(ResolvedDraw* slot, const HW::Context& ctx, const
 	static const bool slim = std::getenv("KYTY_CHECK_PEEK") == nullptr && std::getenv("KYTY_CHECK_CHUNKS") == nullptr;
 	t_peek_slim            = slim;
 	++t_translator;
+	bool standin = false;
 	if (!pc.PeekAdoptAhead(*slot->stages, distance)) {
-		--t_translator;
-		a.compile++;
-		return;
+		if (CompileJobsMode() < 2u || !pc.PeekStandIn(*slot->stages)) {
+			--t_translator;
+			a.compile++;
+			return;
+		}
+		standin = true;
 	}
-	slot->ahead.planned = true;
+	slot->ahead.planned = !standin;
 	PipelineCache::AheadSaved saved;
 	PipelineCache::InstallAhead(*slot->stages, saved);
 	auto& state = slot->state;
@@ -4513,6 +4517,12 @@ void RenderExecutor::PeekAhead(ResolvedDraw* slot, const HW::Context& ctx, const
 			a.describe_failed++;
 			PipelineCache::RestoreAhead(*slot->stages, saved);
 			slot->ahead.planned = false;
+			--t_translator;
+			return;
+		}
+		if (standin) {
+			pc.QueueAheadGraphicsMiss(*slot->stages, slot->ahead.key, vertex_stages, state.ps_active ? &state.ps_input_info : nullptr);
+			PipelineCache::RestoreAhead(*slot->stages, saved);
 			--t_translator;
 			return;
 		}

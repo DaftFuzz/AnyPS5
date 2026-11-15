@@ -20,7 +20,9 @@
 #include <memory>
 #include <span>
 #include <type_traits>
+#include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <thread>
 #include <vector>
 
@@ -32,6 +34,7 @@ namespace Libs::Graphics {
 
 class RenderContext;
 
+[[nodiscard]] uint32_t CompileJobsMode();
 [[nodiscard]] bool CompileJobsEnabled();
 [[nodiscard]] bool CompileScoutEnabled();
 inline std::atomic<uint32_t>   g_exec_compiling {0};
@@ -361,10 +364,14 @@ public:
 	[[nodiscard]] size_t GraphicsPipelineCount() const { return m_graphics_pipelines.size() + m_table_pending.size(); }
 	void QueueAheadGraphicsPipeline(const GraphicsPipelineKey& key, std::span<const ShaderVertexInputInfo> vertex_info,
 	                                const ShaderPixelInputInfo* ps_input_info, const GraphicsPrograms& programs);
+	[[nodiscard]] bool PeekStandIn(ResolvedStages& results);
+	void QueueAheadGraphicsMiss(const ResolvedStages& results, const GraphicsPipelineKey& key,
+	                            std::span<const ShaderVertexInputInfo> vertex_info, const ShaderPixelInputInfo* ps_input_info);
 
 private:
 	Pipeline* TakeAheadGraphicsPipeline(const GraphicsPipelineKey& key);
 	std::mutex m_ahead_workers_mutex;
+	std::unordered_set<uint64_t> m_ahead_miss_seen;
 
 	GraphicContext&               m_graphics;
 	std::unique_ptr<ProgramCache> m_program_cache;

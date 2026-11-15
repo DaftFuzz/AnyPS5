@@ -84,6 +84,9 @@ struct ResolvedStage {
 	ShaderStageRuntime*                          out_stage   = nullptr; // where the stage's runtime went
 	ShaderProgram*                               out_program = nullptr;
 	uint64_t                                     shader_base = 0;
+	uint64_t                                     shader_hash = 0;
+	uint32_t                                     code_size   = 0;
+	std::vector<uint32_t>                        static_key;
 	std::array<uint32_t, 40>                     user_data {};
 	uint32_t                                     user_data_count = 0;
 	std::array<uint32_t, 3>                      workgroup_counts {}; // a compute stage's runtime
@@ -146,6 +149,8 @@ struct ResolvedStages {
 	uint32_t                                                       ahead_distance    = 0;
 	std::array<const ShaderRecompiler::IR::CompiledShaderInfo*, 4> ahead_programs {};
 	std::array<ShaderProgram, 4>                                   ahead_handles {};
+	std::array<const void*, 4>                                     standin_permutations {};
+	std::array<bool, 4>                                            standin_missing {};
 
 	void Reset() {
 		ahead_valid       = false;
@@ -1476,6 +1481,9 @@ struct PipelineCache::ProgramCache {
 		r.out_stage       = &input_info.stage;
 		r.out_program     = &out_program;
 		r.shader_base     = params.Base();
+		r.shader_hash     = params.hash;
+		r.code_size       = static_cast<uint32_t>(params.code.size());
+		r.static_key.assign(ahead_key.static_state.begin(), ahead_key.static_state.end());
 		r.user_data_count = params.user_data_count;
 		std::copy_n(params.user_data.begin(), params.user_data_count, r.user_data.begin());
 		r.taken = false;
@@ -1597,6 +1605,35 @@ struct PipelineCache::ProgramCache {
 			permutation->program.bindings.AdvancePushData(cursor);
 		}
 		return true;
+	}
+
+	[[nodiscard]] bool PeekStandIn(ResolvedStages& results) {
+		uint32_t cursor  = results.push_start;
+		bool     missing = false;
+		for (uint32_t i = 0; i < results.count && i < 4u; i++) {
+			const auto& r     = results.stages[i];
+			const auto& entry = *static_cast<const SourceEntry*>(r.entry);
+			if (!r.ok || entry.call_source) return false;
+			auto specialization = r.specialization;
+			if (!r.null_share_kinds.empty()) ShaderRecompiler::IR::PeekNullFormattedShare(*r.plan, r.null_share_kinds, specialization);
+			std::shared_lock   lock(programs_mutex);
+			const Permutation* permutation = entry.PeekPermutation(cursor, specialization);
+			results.standin_missing[i]      = permutation == nullptr;
+			results.standin_permutations[i] = permutation;
+			if (permutation == nullptr) {
+				if (entry.permutations.empty()) return false;
+				permutation = &entry.permutations.front();
+				missing     = true;
+			}
+			results.ahead_programs[i] = &permutation->program;
+			results.ahead_handles[i]  = permutation->handle;
+			permutation->program.bindings.AdvancePushData(cursor);
+		}
+		return missing;
+	}
+
+	[[nodiscard]] static const ShaderRecompiler::IR::ResourceSpecialization* PermutationSpecialization(const void* permutation) {
+		return permutation != nullptr ? &static_cast<const Permutation*>(permutation)->specialization : nullptr;
 	}
 
 	void NotePermutationRepeat(const char* stage_name, const ProgramKey& key, const SourceEntry& current,
@@ -3360,14 +3397,18 @@ void TableAsyncReport(TableAsyncStats& s, size_t pending, size_t queued) {
 }
 } // namespace
 
-bool CompileJobsEnabled() {
-	static const bool enabled = [] {
-		const char* value = std::getenv("KYTY_PERF_COMPILE_JOBS");
-		const bool  on    = value != nullptr && value[0] == '1';
-		if (on) std::fprintf(stderr, "PERF_COMPILE_JOBS on\n");
-		return on;
+uint32_t CompileJobsMode() {
+	static const uint32_t mode = [] {
+		const char*    value = std::getenv("KYTY_PERF_COMPILE_JOBS");
+		const uint32_t m     = value != nullptr && (value[0] == '1' || value[0] == '2') ? static_cast<uint32_t>(value[0] - '0') : 0u;
+		if (m != 0u) std::fprintf(stderr, "PERF_COMPILE_JOBS on (mode %u)\n", m);
+		return m;
 	}();
-	return enabled;
+	return mode;
+}
+
+bool CompileJobsEnabled() {
+	return CompileJobsMode() != 0u;
 }
 
 bool CompileScoutEnabled() {
@@ -3529,6 +3570,75 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipelineAsync(
 		job->done.store(true, std::memory_order_release);
 	});
 	return nullptr;
+}
+
+bool PipelineCache::PeekStandIn(ResolvedStages& results) {
+	if (results.count != 2u && results.count != 1u) return false;
+	return m_program_cache->PeekStandIn(results);
+}
+
+void PipelineCache::QueueAheadGraphicsMiss(const ResolvedStages& results, const GraphicsPipelineKey& key,
+                                           std::span<const ShaderVertexInputInfo> vertex_info,
+                                           const ShaderPixelInputInfo* ps_input_info) {
+	if (m_precompiler == nullptr || vertex_info.size() != 1u || vertex_info[0].logical_stage != ShaderType::Vertex) return;
+	const bool ps_active = ps_input_info != nullptr;
+	if (results.count != (ps_active ? 2u : 1u)) return;
+	uint64_t mark = GraphicsPipelineKeyHash {}(key) ^ (uint64_t {results.push_start} << 1u);
+	for (uint32_t i = 0; i < results.count; i++) {
+		mark = mark * 0x9e3779b97f4a7c15ull ^ results.stages[i].shader_hash ^ (results.standin_missing[i] ? 0x55u : 0u);
+		if (!results.standin_missing[i]) {
+			mark ^= reinterpret_cast<uintptr_t>(results.standin_permutations[i]);
+		} else {
+			mark ^= XXH3_64bits(results.stages[i].specialization.buffers.data(),
+			                    results.stages[i].specialization.buffers.size() * sizeof(results.stages[i].specialization.buffers[0]));
+		}
+	}
+	{
+		std::lock_guard lock(m_ahead_workers_mutex);
+		if (!m_ahead_miss_seen.insert(mark).second) return;
+	}
+	auto miss           = std::make_unique<PrecompileGraphicsMiss>();
+	miss->ps_active     = ps_active;
+	miss->push_start    = results.push_start;
+	miss->vertex        = vertex_info[0];
+	miss->vertex.stage  = {};
+	if (ps_active) {
+		miss->pixel       = *ps_input_info;
+		miss->pixel.stage = {};
+	}
+	miss->rendering     = key.rendering;
+	miss->vertex_input  = key.vertex_input;
+	miss->static_params = key.static_params;
+	for (uint32_t i = 0; i < results.count; i++) {
+		const auto& r = results.stages[i];
+		auto&       s = miss->stages[i];
+		s.missing     = results.standin_missing[i];
+		s.code_size   = r.code_size;
+		auto& rec     = s.record;
+		rec.stage       = r.stage;
+		rec.shader_hash = r.shader_hash;
+		rec.user_data.assign(r.user_data.begin(), r.user_data.begin() + r.user_data_count);
+		rec.static_key  = r.static_key;
+		rec.revision    = ShaderPrecompiler::Revision();
+		if (s.missing) {
+			const auto* code = reinterpret_cast<const uint32_t*>(r.shader_base);
+			if (code == nullptr || r.code_size == 0u) return;
+			rec.code.assign(code, code + r.code_size);
+			if (PrecompileCodeHash(rec.code, {}) != r.shader_hash) return;
+			rec.specialization = r.specialization;
+			if (!r.null_share_kinds.empty()) ShaderRecompiler::IR::PeekNullFormattedShare(*r.plan, r.null_share_kinds, rec.specialization);
+			if (i == 0) {
+				rec.vertex       = miss->vertex;
+			} else {
+				rec.pixel        = miss->pixel;
+			}
+		} else {
+			rec.specialization = *ProgramCache::PermutationSpecialization(results.standin_permutations[i]);
+			s.info             = results.ahead_programs[i];
+			s.module           = results.ahead_handles[i].module;
+		}
+	}
+	m_precompiler->EnqueueGraphicsMiss(std::move(miss));
 }
 
 void PipelineCache::QueueAheadGraphicsPipeline(const GraphicsPipelineKey& key, std::span<const ShaderVertexInputInfo> vertex_info,
