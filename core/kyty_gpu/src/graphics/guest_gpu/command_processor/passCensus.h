@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_GUEST_GPU_COMMAND_PROCESSOR_PASSCENSUS_H_
 
 #include <cstdint>
+#include <string>
 
 // Parallel-translation project, step S0 (diagnostic only,
 // default off, removed with the project's decision):
@@ -24,6 +25,14 @@ void Marker(const void* cp, const char* push_name);
 [[nodiscard]] bool Packet(const void* cp, bool dispatch);
 // A dispatch's compute shader (the code hash; the census lists each pass's shaders: PASS_CENSUS shaders lines).
 void NoteShader(uint64_t hash);
+// PASS_EXEC (KYTY_TRACE_PASS_CENSUS=1): the pass id of a command processor's current marker pass (PM4 thread,
+// at emission) and the execution time of an operation of that pass (execution thread; kind 1 draw, 2 dispatch,
+// 0 other), less its card wait.
+[[nodiscard]] uint16_t CurrentPassId(const void* cp);
+// The name of an interned pass id ("-" when unknown).
+[[nodiscard]] std::string PassName(uint16_t id);
+// gfx: the operation came from the graphics queue (false: a compute queue; the second-execution-thread ceiling, 11.11).
+void NoteExecute(uint16_t pass, int kind, uint64_t ns, uint64_t wait_ns, bool gfx = true);
 
 } // namespace Libs::Graphics::PassCensus
 

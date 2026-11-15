@@ -1,4 +1,7 @@
+#include "graphics/guest_gpu/stallWatch.h" // KYTY_DIAG_STALL_WATCH_DRIVER_MS
+#include "common/slowFrame.h" // KYTY_TRACE_SLOW_FRAMES (diagnostic)
 #include "graphics/host_gpu/renderer/commandRecorder.h"
+#include "graphics/guest_gpu/chunkCensus.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #if defined(__clang__)
@@ -103,7 +106,9 @@ uint64_t NanosSince(std::chrono::steady_clock::time_point start) {
 
 VKAPI_ATTR VkResult VKAPI_CALL TimedAllocateMemory(VkDevice device, const VkMemoryAllocateInfo* info,
                                                    const VkAllocationCallbacks* callbacks, VkDeviceMemory* memory) {
+	const Common::SlowFrame::Scope slow_frame_scope(Common::SlowFrame::MemAlloc); // KYTY_TRACE_SLOW_FRAMES
 	const auto     start  = std::chrono::steady_clock::now();
+	const StallWatch::DriverCallMark driver_mark(Common::SlowFrame::t_exec); // KYTY_DIAG_STALL_WATCH_DRIVER_MS
 	const VkResult result = g_real_allocate(device, info, callbacks, memory);
 	const uint64_t ns     = NanosSince(start);
 	auto&          c      = g_memory_calls;
@@ -112,6 +117,20 @@ VKAPI_ATTR VkResult VKAPI_CALL TimedAllocateMemory(VkDevice device, const VkMemo
 	c.alloc_bytes.fetch_add(info->allocationSize, std::memory_order_relaxed);
 	c.alloc_ns.fetch_add(ns, std::memory_order_relaxed);
 	if (info->allocationSize >= BigBytes) c.big_allocs.fetch_add(1, std::memory_order_relaxed);
+	if (Common::SlowFrame::Threshold() != 0u && ns >= 5'000'000u) {
+		// KYTY_TRACE_SLOW_FRAMES: which allocations stall (size, type, dedicated or a VMA block, which thread)
+		const auto* dedicated = static_cast<const VkMemoryDedicatedAllocateInfo*>(nullptr);
+		for (auto* next = static_cast<const VkBaseInStructure*>(info->pNext); next != nullptr; next = next->pNext) {
+			if (next->sType == VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO) {
+				dedicated = reinterpret_cast<const VkMemoryDedicatedAllocateInfo*>(next);
+			}
+		}
+		std::fprintf(stderr, "SLOW_ALLOC MiB=%.1f ms=%.1f type=%u dedicated=%s exec=%d\n",
+		             static_cast<double>(info->allocationSize) / 1048576.0, static_cast<double>(ns) / 1e6,
+		             info->memoryTypeIndex,
+		             dedicated == nullptr ? "no" : dedicated->buffer != VK_NULL_HANDLE ? "buffer" : "image",
+		             Common::SlowFrame::t_exec ? 1 : 0);
+	}
 	uint64_t max = c.alloc_max_ns.load(std::memory_order_relaxed);
 	while (ns > max && !c.alloc_max_ns.compare_exchange_weak(max, ns, std::memory_order_relaxed)) {
 	}
@@ -123,6 +142,7 @@ VKAPI_ATTR VkResult VKAPI_CALL TimedAllocateMemory(VkDevice device, const VkMemo
 }
 
 VKAPI_ATTR void VKAPI_CALL TimedFreeMemory(VkDevice device, VkDeviceMemory memory, const VkAllocationCallbacks* callbacks) {
+	const Common::SlowFrame::Scope slow_frame_scope(Common::SlowFrame::MemFree); // KYTY_TRACE_SLOW_FRAMES
 	const auto start = std::chrono::steady_clock::now();
 	g_real_free(device, memory, callbacks);
 	auto& c = g_memory_calls;
@@ -503,6 +523,7 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	}
 
 	g_image_creates.fetch_add(1, std::memory_order_relaxed);
+	ChunkCensus::t_image_creates++; // KYTY_TRACE_CHUNK_CENSUS (hole)
 	if (t_allocs != allocs_before) {
 		g_image_alloc_calls.fetch_add(1, std::memory_order_relaxed);
 		char key[128];

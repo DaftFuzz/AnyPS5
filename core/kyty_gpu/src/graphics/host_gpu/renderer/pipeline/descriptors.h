@@ -26,6 +26,19 @@ struct TextureBinding {
 	std::vector<vk::ImageView> mip_views;
 };
 
+// Project 15 S2b/N4.1: a stage's images and samplers answered without a write (RenderExecutor::PeekStageImages).
+struct PeekStageImagesResult {
+	bool                                    pending = false, samplers_answered = false;
+	std::vector<uint8_t>                    stale; // today's path took a slow path for the slot
+	uint64_t                                epoch = 0; // the image registry epoch at the peek
+	uint64_t                                set_version = 0; // the table set that answered (0: none)
+	std::vector<uint8_t>                    klass;
+	std::vector<ImageId>                    ids;
+	std::vector<vk::ImageView>              views;
+	std::vector<std::vector<vk::ImageView>> mips;
+	std::vector<vk::Sampler>                samplers;
+};
+
 struct PreparedBindings {
 	struct BufferSource {
 		uint64_t address = 0;
@@ -38,6 +51,8 @@ struct PreparedBindings {
 	// Keep the resolved guest range through cache preparation; only the host buffer ID may
 	// become stale and need resolving again when bindings are rebound.
 	std::vector<BufferSource>             buffer_sources;
+	// Project 15 way B P1.2: per buffer binding, the plan entry FindBuffers took its source from (RebindBuffers answers it)
+	std::vector<struct PlanBuffer*>       plan_entries;
 	std::vector<vk::DescriptorBufferInfo> buffers;
 	std::vector<TextureBinding>           images;
 	std::vector<vk::Sampler>              samplers;
@@ -74,6 +89,9 @@ struct PreparedBindings {
 		BufferId id;
 	};
 	std::vector<IndirectRange>            indirect_ranges;
+	// KYTY_CHECK_CHUNKS=2: the GPU-read SRT words as the shader reaches them, without the word stream's offsets (a direct
+	// word: its guest address and value; a cached one: its device address) - the fingerprint's stable form.
+	uint64_t                              gpu_words_key = 0;
 };
 
 [[nodiscard]] vk::DescriptorType

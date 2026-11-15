@@ -12,10 +12,12 @@
 
 #include <unordered_set>
 #include <array>
+#include <chrono>
 #include <memory>
 #include <optional>
 #include <span>
 #include <unordered_map>
+#include <tuple>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -298,13 +300,68 @@ public:
 	// snapshots, which stay valid until it executed; null when there is nothing to resolve. Based on
 	// TheCruZ/KytyPS5-GTA daaf45201 (render.h), GPL-2.0.
 	struct ResolvedDraw;
-	[[nodiscard]] ResolvedDraw* ResolveDrawAhead(const HW::Context& context, const HW::UserConfig& user_config,
-	                                             const HW::Shader& shaders, const ShaderIndirectDrawInfo& indirect_draw);
-	[[nodiscard]] ResolvedDraw* ResolveDispatchAhead(const HW::Shader& shaders, uint32_t groups_x, uint32_t groups_y,
-	                                                 uint32_t groups_z, uint32_t mode, bool indirect, bool async_compute);
+	// Project 15 N2.1/N2.2: TakeResolvedSlot (the resolve thread, which keeps the stream order) gives the next slot of the
+	// ring, pending at once; ResolveDrawInto / ResolveDispatchInto fill it (the helper through ResolveTaskInto) and return
+	// false when there is nothing to resolve.
+	[[nodiscard]] ResolvedDraw& TakeResolvedSlot();
+	// Project 15 N2.2: a draw's or dispatch's resolution handed to the resolve helper: its slot, register snapshots (valid
+	// until the operation executed) and arguments. `fault`: KYTY_CHECK_RESOLVE_FAULT's error number (0: none).
+	struct ResolveTask {
+		ResolvedDraw*          slot        = nullptr;
+		const HW::Context*     context     = nullptr;
+		const HW::UserConfig*  user_config = nullptr;
+		const HW::Shader*      shaders     = nullptr;
+		ShaderIndirectDrawInfo indirect_draw {};
+		uint32_t               groups_x = 0, groups_y = 0, groups_z = 0, mode = 0;
+		bool                   dispatch = false, indirect = false, async_compute = false;
+		uint16_t               pass_id = 0;
+		uint32_t               fault   = 0;
+		// N5.1: a chunk-member draw's arguments for its plan (PeekAhead on the helper, N5.3)
+		bool                   member = false, indexed = false;
+		uint32_t               draw_count = 0, index_type = 0, slice_offset = 0;
+		uint64_t               draw_indirect = 0, index_address = 0;
+		// N5.3: the dispatcher's number of the task, and whether the helper builds the draw's plan (it has the lead)
+		uint64_t               seq = 0;
+		bool                   build_plan = false;
+		uint32_t               lead       = 0;
+		// N7.2: a GPU indirect packet (the SGPR layout made: indirect_draw.enabled) and its arguments
+		bool                   gpu_indirect = false;
+		DrawIndirectGpuArgs    indirect_args {};
+	};
+	// The helper (or, with KYTY_CHECK_RESOLVE=2, the resolve thread for the reference): resolves the task into `slot`
+	// (the draw's pre-check included) and marks it ready (empty when there was nothing to resolve).
+	bool ResolveTaskInto(ResolvedDraw& slot, const ResolveTask& task);
+	// The helper, taking a task: pending -> running; false when the execution thread stole it (the slot is freed then).
+	[[nodiscard]] static bool BeginResolveTask(ResolvedDraw* slot) noexcept;
+	// The execution thread: one look at a slot. Ready / Empty: resolved; Stolen: it was pending and is now the execution
+	// thread's to do itself (the helper frees the slot); Running: a helper resolves it now (or, with steal false, pending).
+	enum class ResolvedClaim : uint8_t { Ready, Empty, Stolen, Running };
+	[[nodiscard]] static ResolvedClaim TryClaimResolvedDraw(ResolvedDraw* resolved, bool steal) noexcept;
+	// KYTY_CHECK_RESOLVE=2: the helper's slot of the operation whose reference `resolved` is, and the comparison of the
+	// two (0 both empty, 1 refused, 2 reads differ, 3 compared and equal, 4 compared and different: `field` names it).
+	[[nodiscard]] static ResolvedDraw* ResolvedCheckSlot(ResolvedDraw* resolved) noexcept;
+	static void                        SetResolvedCheckSlot(ResolvedDraw* resolved, ResolvedDraw* check) noexcept;
+	[[nodiscard]] static int           CompareResolved(const ResolvedDraw& reference, const ResolvedDraw& helper, const char** field);
+	// KYTY_CHECK_RESOLVE_FAULT=N: error number `fault` (1...) put into a helper's result (never used); the error a result
+	// carries (0: none).
+	static void                        ResolveCheckFault(ResolvedDraw& slot, uint32_t fault);
+	[[nodiscard]] static uint32_t      ResolvedFault(const ResolvedDraw* slot) noexcept;
+	// KYTY_CHECK_RESOLVE=2, once at start: the resolutions keep what the comparison needs.
+	static void                        SetResolveCheckMode(bool on);
+	[[nodiscard]] bool ResolveDrawInto(ResolvedDraw& draw, const HW::Context& context, const HW::UserConfig& user_config,
+	                                   const HW::Shader& shaders, const ShaderIndirectDrawInfo& indirect_draw);
+	[[nodiscard]] bool ResolveDispatchInto(ResolvedDraw& draw, const HW::Shader& shaders, uint32_t groups_x, uint32_t groups_y,
+	                                       uint32_t groups_z, uint32_t mode, bool indirect, bool async_compute);
 	// The execution thread, around the operation. Release gives the resolution back.
 	void        UseResolvedDraw(ResolvedDraw* resolved) noexcept;
 	static void ReleaseResolvedDraw(ResolvedDraw* resolved) noexcept;
+	// Project 15 N4.1 (KYTY_CHECK_PEEK=2): the chunk's opening peeks a draw ahead in the queue (programs, targets,
+	// pipeline, stage images) into its slot, without a write; distance from the opening draw.
+	void PeekAhead(ResolvedDraw* slot, const HW::Context& ctx, const HW::UserConfig& ucfg, const HW::Shader& shaders, bool indexed,
+	               uint32_t count, uint32_t instances, uint32_t index_type, uint32_t slice_offset, uint64_t indirect, uint32_t distance,
+	               uint64_t index_address = 0, const DrawIndirectGpuArgs* gpu_indirect = nullptr);
+	// N4.2b: hands the running draw's buffer plan entries to the buffer cache's check (null: none).
+	void PlanBuffersBegin();
 	// KYTY_DIAG_GPU_BURN_NS / KYTY_DIAG_GPU_BURN_AT (measurement only): GPU-thread spin at one of these places.
 	// InvalidateCaller: the guest thread whose write fault reads GPU-modified bytes back, not the GPU thread.
 	// Readback and Pm4 (measurement only): a GPU-thread guest read of GPU-written data, a PM4 packet of the GPU thread.
@@ -348,6 +405,12 @@ public:
 	// region; false when the arena has no room. shader_hash: the reader, for the BINDLESS_TABLE layout log.
 	[[nodiscard]] bool TranslateBindlessTable(BindlessTable::Table& table, uint32_t covered, uint64_t hash,
 	                                          uint64_t frame, uint64_t shader_hash);
+	// The entry-by-entry translation (a table's first one, small tables, and when the difference does not apply).
+	[[nodiscard]] bool TranslateBindlessTableFull(BindlessTable::Table& table, uint32_t covered, uint64_t hash,
+	                                              uint64_t frame, uint64_t shader_hash);
+	// differential tables: a large table's translation by difference from its last one (the entries whose words changed or whose slot
+	// died); -1 when it does not apply (the full translation runs), else whether the region was stored.
+	[[nodiscard]] int TranslateTableDiff(BindlessTable::Table& table, uint32_t covered, uint64_t hash, uint64_t frame);
 	// The table slot of one descriptor, resolving its texture now when no table slot shows it yet; 0 = placeholder.
 	[[nodiscard]] uint32_t ResolveTableDescriptor(BindlessTable::Table& table, const std::array<uint32_t, 8>& words,
 	                                              uint64_t frame);
@@ -405,10 +468,39 @@ private:
 	void PrepareGraphicsBuffersHead(std::span<PreparedBindings* const> stages);
 	void PrepareGraphicsImages(std::span<PreparedBindings* const> stages, std::span<RenderColorInfo> colors);
 	void PrepareGraphicsBuffersTail(std::span<PreparedBindings* const> stages);
+	// A draw's bindings after its stages' PrepareBindings: PrepareGraphicsBindings' parts, then the vertex, index and indirect
+	// buffers, the buffer part taken again while the buffer registry changed under it (renderDraw.cpp, the registry epoch
+	// guard). buffers_mark: set after the stages' buffers of the first pass (KYTY_TRACE_LONG_PREP).
+	void PrepareDrawBindings(DrawPlan& plan, CommandBuffer& buffer, std::span<RenderColorInfo> colors,
+	                         std::chrono::steady_clock::time_point* buffers_mark);
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
 	                              uint32_t render_target_slice_offset, uint32_t render_target_slot,
 	                              bool ignore_target_mask = false, bool exact_format = false);
 	void ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& target);
+	// Project 15 S2c: the color target from the registers alone (colorRenderTarget.cpp); false: no color output.
+	[[nodiscard]] static bool DescribeRenderColorTarget(const HW::Context& hw, RenderColorInfo& r, uint32_t render_target_slice_offset,
+	                                                    uint32_t rt_slot, bool ignore_target_mask);
+	// Project 15 S2c: the depth target from the registers alone (depthRenderTarget.cpp); false: no attachment.
+	[[nodiscard]] static bool DescribeRenderDepthTarget(GraphicContext& graphics, const HW::Context& hw, RenderDepthInfo& r);
+	// The registers ask a depth/stencil copy instead of a draw (DepthStencilCopy's condition).
+	[[nodiscard]] static bool DepthStencilCopyAsked(const HW::Context& hw);
+	// Project 15 S2b: a stage's images and samplers without a write (descriptors.cpp); true: every slot and the samplers
+	// answered. count: the KYTY_CHECK_PEEK=2 statistics of today's peek (false for the peeks ahead).
+	bool PeekStageImages(const ShaderRecompiler::IR::CompiledShaderInfo& program, const ShaderRecompiler::IR::ResourceSnapshot& snapshot,
+	                     bool soft, PeekStageImagesResult& peek, bool count);
+	// N4.1: the stage images PeekAhead found for `program` in the running draw's slot (taken once), and the running draw's
+	// ahead key against today's (renderDraw.cpp, after ResolvedDraw).
+	bool TakeAheadImages(const void* program, PeekStageImagesResult& out, uint32_t& distance);
+	void CheckAheadKey(const PipelineCache::GraphicsPipelineKey& key_today);
+	// N4.2b: a stage's buffer plan entries (descriptors.cpp).
+	void PeekStageBuffers(const ShaderRecompiler::IR::CompiledShaderInfo& program, const ShaderRecompiler::IR::ResourceSnapshot& snapshot,
+	                      const StageF::ResolveRecord* record, uint32_t distance, std::vector<PlanBuffer>& out);
+	// N4.2a: the running draw's plan (PeekAhead): whether there is one, the set version it names for a stage's program, and
+	// whether today's adoption took the predicted programs; the pipeline it found (null: none).
+	[[nodiscard]] bool                     PlanPresent() const;
+	[[nodiscard]] uint64_t                 PlanSetVersion(const void* program) const;
+	[[nodiscard]] bool                     PlanProgramsHold() const;
+	[[nodiscard]] PipelineCache::Pipeline* PlanPipeline() const;
 	[[nodiscard]] bool DepthStencilCopy(CommandBuffer& buffer);
 	[[nodiscard]] bool CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo& draw,
 	                                   const DrawEmitInfo& emit, DrawRenderState& state);
@@ -424,6 +516,13 @@ private:
 	// S1: the part of a draw after its "cannot touch guest memory" point,
 	// from what ExecutePreparedDraw prepared (the plan).
 	void CommitPreparedDraw(DrawPlan& plan);
+	// KYTY_CHECK_CHUNKS=2 (project 15, the oracle v2, renderDraw.cpp): a chunk member is prepared twice. ChunkCheckFirst
+	// takes the print of the first preparation (with KYTY_CHECK_CHUNKS_FAULT's error in it, when due), ChunkCheckSecond
+	// compares the second's with it (PERF chunk_check). `plan`: the draw's (vertex and index buffers), null for a dispatch.
+	void ChunkCheckFirst(std::span<PreparedBindings* const> stages, DrawPlan* plan);
+	void ChunkCheckSecond(std::span<PreparedBindings* const> stages, const DrawPlan* plan, bool dispatch);
+	// The first preparation's own bindings: 0..2 the vertex stages, 3 the pixel stage, 4 a dispatch.
+	[[nodiscard]] static PreparedBindings& ChunkScratchBindings(uint32_t index);
 	// The steps the draw entries share. DrawEntryStart: DrawIndex and DrawAuto.
 	// ColorOperationInstead: a metadata, copy or resolve operation took the place of the draw (true: it ends here).
 	void DrawEntryStart(CommandBuffer& buffer);
@@ -439,7 +538,10 @@ private:
 	// The same for a direct dispatch: `input_info` and `program` as GetComputeProgram would leave them (false: it runs).
 	[[nodiscard]] bool TakeResolvedDispatch(ShaderComputeInputInfo& input_info, ShaderProgram& program);
 	ResolvedDraw* m_resolved_draw  = nullptr; // the operation's
+	uint64_t      m_plan_set_version = 0;      // N4.2a: the table set a plan names for the stage being prepared
+	bool          m_slot_taken       = false;  // N4.2: TakeResolvedState took the running draw's slot (UseResolvedDraw clears it)
 	bool          m_state_resolved = false;   // the draw being prepared adopted its state
+	bool          m_bind_suppressed = false;  // T1b check (KYTY_CHECK_TARGET_MEMO=2): the second search binds nothing
 	std::unique_ptr<ResolvedDrawRing, void (*)(ResolvedDrawRing*)> m_resolved_ring {nullptr, nullptr};
 	DrawSlot* m_draw_slot    = nullptr; // allocated on first use
 	DrawSlot* m_current_slot = nullptr;
@@ -490,6 +592,12 @@ private:
 	std::vector<uint32_t>                 m_bindless_requests;
 		// Defined in descriptors.cpp (MinGW GCC emits an inline thread_local's TLS init function in every object file).
 		static thread_local std::vector<uint32_t> m_bindless_srt;
+	// KYTY_PERF_SRT_GPU_WORDS (RebindBuffers): flat SRT words holding the device addresses of shader-only words, as
+	// {flat index, value}, and the guest addresses sorted into ranges.
+	// Defined in descriptors.cpp, as m_bindless_srt.
+	static thread_local std::vector<std::pair<uint32_t, uint32_t>> m_gpu_word_patches;
+	static thread_local std::vector<std::pair<uint64_t, uint32_t>> m_gpu_word_addresses;
+	static thread_local std::vector<std::tuple<uint32_t, uint32_t, uint64_t>> m_gpu_word_values; // index, value, guest
 	// The last bindless image lists CommitBindings walked, with the epochs of that walk.
 	struct BindlessLayoutMemo {
 		std::vector<ImageId> ids;
@@ -518,6 +626,12 @@ private:
 	std::vector<ImageId>                  m_table_touch; // refresh events: unchanged slots' images (RefreshTableSlots)
 	// The slot journal: a translated table's slots before it (TranslateBindlessTable).
 	std::vector<std::pair<uint32_t, uint32_t>> m_table_old_slots;
+	// The difference translation's scratch: dead-slot marks and the new slot list.
+	std::vector<uint8_t>                       m_diff_dead;
+	std::vector<uint32_t>                      m_diff_new;   // the slots a difference translation took
+	std::vector<uint32_t>                      m_diff_seen;  // per slot, the stamp of the difference translation that listed it
+	std::vector<ImageId>                       m_diff_touch; // their images to touch (differential tables step 2)
+	std::vector<std::pair<uint32_t, uint32_t>> m_diff_slots;
 	uint64_t                              m_table_frame         = 0;
 	uint64_t                              m_table_release_frame = 0;
 	PreparedBindings                     m_compute_bindings;

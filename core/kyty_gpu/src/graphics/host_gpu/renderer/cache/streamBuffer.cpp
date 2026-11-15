@@ -81,8 +81,12 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	// Buffers with a device address keep dedicated allocations. Upstream lets VMA suballocate them (d58aefde4, with
 	// 4644c5292 zeroing the BDA tables that suballocated memory no longer guarantees); not taken without a measurement
 	// (allocation count, BAR placement and the VRAM budget logic all see the change).
+	// A device-address buffer up to 64 MiB is suballocated from VMA blocks (11.11, camera cuts in the 2.002 intro: ~2 100
+	// buffers made and ~1 900 freed in one frame by the cache's joins, each a dedicated vkAllocateMemory / vkFreeMemory -
+	// 3.06 s frames; suballocated, the same work costs ~0.1 s; walk ABBA unchanged, fewer > 100 ms frames).
+	constexpr uint64_t small_bda_suballoc = 64ull << 20u;
 	const VmaAllocationCreateFlags bda_flag =
-	    with_bda ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
+	    with_bda && size > small_bda_suballoc ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
 	VmaAllocationCreateInfo allocation_info {};
 	allocation_info.flags =
 	    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag | AllocationFlags(usage);
@@ -183,6 +187,36 @@ bool Buffer::CanImportGuestMemory(GraphicContext& graphics, uint64_t cpu_address
 	return HostPointerTypeBits(graphics, cpu_address) != 0;
 }
 
+vk::DeviceMemory Buffer::ImportGuestMemory(GraphicContext& graphics, uint64_t cpu_address, uint64_t size) {
+	if (!CanImportGuestMemory(graphics, cpu_address, size)) return nullptr;
+	// The memory type: one a buffer with the import's usage accepts (as the GuestDirectTag constructor picks it).
+	vk::ExternalMemoryBufferCreateInfo external {};
+	external.handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT;
+	vk::BufferCreateInfo buffer_info {};
+	buffer_info.pNext = &external;
+	buffer_info.size  = size;
+	buffer_info.usage = AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress;
+	vk::Buffer probe  = nullptr;
+	if (graphics.device.createBuffer(&buffer_info, nullptr, &probe) != vk::Result::eSuccess) return nullptr;
+	vk::MemoryRequirements requirements {};
+	graphics.device.getBufferMemoryRequirements(probe, &requirements);
+	graphics.device.destroyBuffer(probe, nullptr);
+	const uint32_t types = HostPointerTypeBits(graphics, cpu_address) & requirements.memoryTypeBits;
+	if (types == 0) return nullptr;
+	vk::ImportMemoryHostPointerInfoEXT import {};
+	import.handleType   = vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT;
+	import.pHostPointer = reinterpret_cast<void*>(cpu_address);
+	vk::MemoryAllocateFlagsInfo flags {};
+	flags.flags = vk::MemoryAllocateFlagBits::eDeviceAddress;
+	flags.pNext = &import;
+	vk::MemoryAllocateInfo allocate {};
+	allocate.pNext           = &flags;
+	allocate.allocationSize  = size;
+	allocate.memoryTypeIndex = static_cast<uint32_t>(std::countr_zero(types));
+	vk::DeviceMemory memory  = nullptr;
+	return graphics.device.allocateMemory(&allocate, nullptr, &memory) == vk::Result::eSuccess ? memory : nullptr;
+}
+
 Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, GuestDirectTag tag, uint64_t cpu_address,
                uint64_t size)
     : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(MemoryUsage::DeviceLocal), m_cpu_address(cpu_address),
@@ -207,6 +241,19 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, GuestDirec
 	EXIT_NOT_IMPLEMENTED(!created);
 	vk::MemoryRequirements requirements {};
 	graphics.device.getBufferMemoryRequirements(m_buffer, &requirements);
+	if (tag.shared_memory) { // BDA map-time import (AGENTS 19): a view of an imported range
+		const bool bound = graphics.device.bindBufferMemory(m_buffer, tag.shared_memory, tag.memory_offset) == vk::Result::eSuccess;
+		if (refuse(!bound)) return;
+		EXIT_NOT_IMPLEMENTED(!bound);
+		m_direct_memory      = tag.shared_memory;
+		m_owns_direct_memory = false;
+		vk::BufferDeviceAddressInfo view_address {};
+		view_address.buffer = m_buffer;
+		m_device_address    = graphics.device.getBufferAddress(view_address);
+		EXIT_IF(m_device_address == 0);
+		m_coherent = true;
+		return;
+	}
 	const uint32_t types = HostPointerTypeBits(graphics, cpu_address) & requirements.memoryTypeBits;
 	if (refuse(types == 0 || requirements.size > size)) return;
 	EXIT_NOT_IMPLEMENTED(types == 0 || requirements.size > size);
@@ -241,7 +288,7 @@ Buffer::~Buffer() {
 	if (m_direct_memory != nullptr) {
 		CommandRecorder::DrainBeforeDestroy(); // (as below)
 		m_graphics->device.destroyBuffer(m_buffer, nullptr);
-		m_graphics->device.freeMemory(m_direct_memory, nullptr);
+		if (m_owns_direct_memory) m_graphics->device.freeMemory(m_direct_memory, nullptr);
 		return;
 	}
 	if (m_buffer != nullptr) {
@@ -360,8 +407,8 @@ void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
 }
 
 StreamBuffer::StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-                           uint64_t size, bool prefer_host)
-    : Buffer(graphics, scheduler, usage, 0, AllFlags, size, prefer_host),
+                           uint64_t size, bool prefer_host, vk::BufferUsageFlags extra_usage)
+    : Buffer(graphics, scheduler, usage, 0, AllFlags | extra_usage, size, prefer_host),
       m_current_watches(WATCHES_INITIAL_RESERVE), m_previous_watches(WATCHES_INITIAL_RESERVE) {}
 
 bool StreamBuffer::NormalizeReservation(bool coherent, uint64_t atom, uint64_t& size,

@@ -1,6 +1,10 @@
+#include "common/slowFrame.h" // KYTY_TRACE_SLOW_FRAMES (diagnostic)
 #include "graphics/host_gpu/renderer/perfCounters.h"
+#include "graphics/guest_gpu/chunkCensus.h"
+#include "graphics/guest_gpu/chunkLead.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCacheTrace.h"
+#include "graphics/host_gpu/translatorGuard.h"
 
 #include "common/assert.h"
 #include "common/cacheDir.h"
@@ -69,8 +73,6 @@ namespace Libs::Graphics {
 
 namespace {
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values);
-// The scratch slot of MaterializeResourcesAhead on the resolve thread (ir/ShaderIR.h).
-constexpr uint32_t ResolveScratchSlot = 1;
 // A stage the resolve thread resolved (see ResolvedStages in pipelineCache.h).
 struct ResolvedStage {
 	ShaderType                                   stage      = ShaderType::Unknown;
@@ -89,7 +91,9 @@ struct ResolvedStage {
 	ShaderRecompiler::IR::ResourceSpecialization specialization;
 	std::vector<uint8_t>                         null_share_kinds;
 	StageF::ResolveRecordPtr                     record; // FindBuffers' sources, found ahead
+	std::vector<uint8_t>                         active_sources; // KYTY_CHECK_RESOLVE=2 only: the plan's, for the comparison
 };
+bool g_resolve_check = false; // KYTY_CHECK_RESOLVE=2 (set once at start)
 // Why the execution thread materialized a stage itself.
 enum class ResolveMiss : uint32_t { NoResolution, Refused, Stale, NoMatch, Taken, Count };
 // PERF_RESOLVE_STAGES: stages made, without a program (which never compiles ahead) and refused by reason; taken, whole
@@ -101,6 +105,28 @@ struct ResolveStats {
 	std::array<std::array<std::atomic<uint64_t>, static_cast<size_t>(ResolveMiss::Count)>, 2> walks {}, walk_ns {};
 	std::array<std::atomic<uint64_t>, 16> missing_by_stage {};
 } g_resolve_stats;
+// Project 15 S2d (KYTY_CHECK_PEEK=2, diagnostic): PeekAdopt's prediction against what Adopt did (execution thread).
+struct PeekAdoptStats {
+	uint64_t calls = 0, keep = 0, refind = 0, compile = 0, not_adoptable = 0, reads_changed = 0, bad = 0, injected = 0, detected = 0;
+	uint64_t refind_failed = 0, refind_kept = 0;
+	std::array<uint64_t, 13> reasons {}, member_reasons {}; // PeekAdopt's reason (member: chunk-member draws)
+};
+PeekAdoptStats             g_peek_adopt;
+inline thread_local uint32_t t_adopt_refinds = 0; // stages whose permutation Adopt looked up again
+bool PeekAdoptCheck() {
+	static const bool on = [] {
+		const char* env = std::getenv("KYTY_CHECK_PEEK");
+		return env != nullptr && env[0] == '2';
+	}();
+	return on;
+}
+uint64_t PeekAdoptFaultEvery() {
+	static const uint64_t every = [] {
+		const char* env = std::getenv("KYTY_CHECK_PEEK_FAULT");
+		return env != nullptr ? std::strtoull(env, nullptr, 10) : 0u;
+	}();
+	return every;
+}
 } // namespace
 
 struct ResolvedStages {
@@ -112,8 +138,16 @@ struct ResolvedStages {
 	bool                          adoptable  = false; // the execution thread may take the selection as a whole
 	Reads                         reads      = Reads::Unchecked;
 	ShaderRecompiler::IR::ReadLog log; // everything the operation's stages read, each read once
+	// Project 15 N4.1 (KYTY_CHECK_PEEK=2): PeekAdopt when the chunk opened (PipelineCache::PeekAdoptAhead).
+	bool                                                           ahead_valid = false, ahead_predicted = false, ahead_share = false;
+	bool                                                           ahead_programs_ok = false;
+	uint32_t                                                       ahead_distance    = 0;
+	std::array<const ShaderRecompiler::IR::CompiledShaderInfo*, 4> ahead_programs {};
+	std::array<ShaderProgram, 4>                                   ahead_handles {};
 
 	void Reset() {
+		ahead_valid       = false;
+		ahead_programs_ok = false;
 		count       = 0;
 		push_start  = 0;
 		adoptable   = false;
@@ -132,6 +166,96 @@ void DeleteResolvedStages(ResolvedStages* stages) {
 	return stages.count == 0;
 }
 
+void SetResolveCheck(bool on) {
+	g_resolve_check = on;
+}
+
+int ResolvedStagesCompare(const ResolvedStages& a, const ResolvedStages& b, const char** field) {
+	*field = nullptr;
+	if (a.count != b.count) {
+		*field = "count";
+		return 1;
+	}
+	for (uint32_t i = 0; i < a.count; i++) {
+		if (!a.stages[i].ok || !b.stages[i].ok) {
+			*field = "ok";
+			return 1;
+		}
+	}
+	// The same reads with the same bytes: the same inputs, so the results must be equal.
+	const auto& la = a.log;
+	const auto& lb = b.log;
+	if (la.entries.size() != lb.entries.size() || la.bytes != lb.bytes) return 2;
+	for (size_t i = 0; i < la.entries.size(); i++) {
+		const auto& x = la.entries[i];
+		const auto& y = lb.entries[i];
+		if (x.address != y.address || x.size != y.size || x.first != y.first || x.kind != y.kind || x.ok != y.ok) return 2;
+	}
+	const auto bad = [&](const char* name) {
+		*field = name;
+		return 4;
+	};
+	if (a.push_start != b.push_start) return bad("push_start");
+	if (a.adoptable != b.adoptable) return bad("adoptable");
+	for (uint32_t i = 0; i < a.count; i++) {
+		const auto& x = a.stages[i];
+		const auto& y = b.stages[i];
+		if (x.stage != y.stage) return bad("stage");
+		if (x.plan != y.plan || x.entry != y.entry) return bad("program");
+		if (x.shader_base != y.shader_base) return bad("shader_base");
+		if (x.user_data_count != y.user_data_count ||
+		    !std::equal(x.user_data.begin(), x.user_data.begin() + x.user_data_count, y.user_data.begin())) {
+			return bad("user_data");
+		}
+		// Only a compute stage sets them (a draw's stage keeps what the slot's last dispatch left; the draw never reads it).
+		if (x.stage == ShaderType::Compute && x.workgroup_counts != y.workgroup_counts) return bad("workgroup_counts");
+		if (x.null_share_kinds != y.null_share_kinds) return bad("null_share_kinds");
+		if (x.resources.flattened_srt != y.resources.flattened_srt) return bad("flat_srt");
+		if (x.resources.buffers != y.resources.buffers) return bad("buffers");
+		if (x.resources.images != y.resources.images) return bad("images");
+		if (const char* diff = ShaderRecompiler::IR::AheadResultDifference(x.resources, x.specialization, x.active_sources, y.resources,
+		                                                                   y.specialization, y.active_sources);
+		    diff != nullptr) {
+			return bad(diff);
+		}
+		if (x.permutation != nullptr && y.permutation != nullptr && x.permutation != y.permutation) return bad("permutation");
+	}
+	return 3;
+}
+
+void ResolvedStagesFault(ResolvedStages& stages, uint32_t fault) {
+	if (stages.count == 0) return;
+	auto& r = stages.stages[0];
+	switch (fault % 5u) {
+		case 0:
+			if (!r.resources.flattened_srt.empty()) {
+				r.resources.flattened_srt[0] ^= 1u;
+				return;
+			}
+			break;
+		case 1:
+			if (!r.resources.buffers.empty()) {
+				r.resources.buffers[0].dwords[0] ^= 1u;
+				return;
+			}
+			break;
+		case 2:
+			if (!r.resources.images.empty()) {
+				r.resources.images[0].dwords[0] ^= 1u;
+				return;
+			}
+			break;
+		case 3:
+			if (r.user_data_count != 0) {
+				r.user_data[0] ^= 1u;
+				return;
+			}
+			break;
+		default: break;
+	}
+	stages.push_start++; // the fallback error, every result has it
+}
+
 namespace {
 // Every read the resolve thread made for the operation reads the same through this thread's readers now (which download
 // GPU-dirty bytes and wait for pending readbacks, as the operation's own walk would): operations before this one and the
@@ -141,7 +265,92 @@ bool ResolvedReadsHold(ResolvedStages& results) {
 	if (results.reads == Reads::Unchecked) {
 		const DispatchSubTimer reads_timer(DispatchSub::AdoptReads); // KYTY_TRACE_DISPATCH_CENSUS
 		const ShaderRecompiler::IR::SrtRuntime runtime {.read_specialization_memory = ReadShaderGuestMemory};
-		results.reads = ShaderRecompiler::IR::ReadsUnchangedFast(results.log, runtime) ? Reads::Hold : Reads::Changed;
+		const ChunkLead::FloorTimer floor_adopt(ChunkLead::FpAdopt);   // KYTY_TRACE_PEEK_CENSUS (N3.0)
+		const uint64_t lead_t0 = ChunkLead::On() ? ChunkLead::Tsc() : 0; // KYTY_TRACE_CHUNK_LEAD (N2.0b): the check's cost
+		{
+			const Common::SlowFrame::Scope slow_frame_scope(Common::SlowFrame::ReadsCheck); // KYTY_TRACE_SLOW_FRAMES
+			// KYTY_TRACE_SLOW_ADOPT (diagnostic, 11.11): a check of 200 us or more prints its log size and how its entries went.
+			static const bool slow_adopt = std::getenv("KYTY_TRACE_SLOW_ADOPT") != nullptr;
+			ShaderRecompiler::IR::FastAdoptStats stats;
+			const auto t0 = slow_adopt ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+			results.reads = ShaderRecompiler::IR::ReadsUnchangedFast(results.log, runtime, slow_adopt ? &stats : nullptr)
+			                    ? Reads::Hold
+			                    : Reads::Changed;
+			if (slow_adopt) {
+				const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+				const auto us = ns / 1000;
+				// The aggregate (11.11, topic "reads from the card"): every 16384 checks, how the entries went.
+				static uint64_t a_calls = 0, a_entries = 0, a_fast = 0, a_runs = 0, a_slow = 0, a_ns = 0, a_slow_calls = 0,
+				                a_slow_ns = 0, a_changed = 0, a_empty = 0;
+				a_calls++;
+				a_entries += results.log.entries.size();
+				a_fast += stats.entries_fast;
+				a_runs += stats.runs;
+				a_slow += stats.entries_slow;
+				a_ns += static_cast<uint64_t>(ns);
+				if (stats.entries_slow != 0) {
+					a_slow_calls++;
+					a_slow_ns += static_cast<uint64_t>(ns);
+				}
+				if (results.reads != Reads::Hold) a_changed++;
+				// D1 estimate (11.11): the runs if the entries were sorted by address and merged where contiguous (same kind,
+				// adjacent or overlapping) - against today's runs in log order.
+				static uint64_t a_sorted_runs = 0, a_pages = 0;
+				{
+					thread_local std::vector<std::pair<uint64_t, uint64_t>> spans; // (address << 1 | kind, end)
+					spans.clear();
+					for (const auto& e: results.log.entries) {
+						if (e.size == 0) continue;
+						spans.emplace_back((e.address << 1u) | static_cast<uint64_t>(e.kind == ShaderRecompiler::IR::ReadLog::Kind::Ordinary),
+						                   e.address + e.size);
+					}
+					std::sort(spans.begin(), spans.end());
+					uint64_t runs = 0, end = 0, kind = 2, last_page = ~0ull;
+					for (const auto& [key, e_end]: spans) {
+						const uint64_t address = key >> 1u, k = key & 1u;
+						if (runs == 0 || k != kind || address > end) {
+							runs++;
+							end  = e_end;
+							kind = k;
+						} else {
+							end = std::max(end, e_end);
+						}
+						for (uint64_t page = address >> 12u; page <= ((e_end - 1u) >> 12u); page++) {
+							if (page != last_page) a_pages++;
+							last_page = page;
+						}
+					}
+					a_sorted_runs += runs;
+				}
+				if ((a_calls & 0x3fffu) == 0u) {
+					std::fprintf(stderr, "PERF adopt_reads_d1 sorted_runs/call=%.2f pages/call=%.2f\n",
+					             static_cast<double>(a_sorted_runs) / a_calls, static_cast<double>(a_pages) / a_calls);
+				}
+				if (results.log.entries.empty()) a_empty++;
+				if ((a_calls & 0x3fffu) == 0u) {
+					std::fprintf(stderr,
+					             "PERF adopt_reads calls=%llu empty=%llu entries/call=%.1f fast=%.1f runs=%.1f slow=%.2f ns/call=%.0f "
+					             "calls_with_slow=%llu (ns/call %.0f) changed=%llu\n",
+					             static_cast<unsigned long long>(a_calls), static_cast<unsigned long long>(a_empty),
+					             static_cast<double>(a_entries) / a_calls, static_cast<double>(a_fast) / a_calls,
+					             static_cast<double>(a_runs) / a_calls, static_cast<double>(a_slow) / a_calls,
+					             static_cast<double>(a_ns) / a_calls, static_cast<unsigned long long>(a_slow_calls),
+					             a_slow_calls != 0 ? static_cast<double>(a_slow_ns) / a_slow_calls : 0.0,
+					             static_cast<unsigned long long>(a_changed));
+				}
+				static std::atomic_uint printed {0};
+				if (us >= 200 && printed.fetch_add(1, std::memory_order_relaxed) < 400u) {
+					std::fprintf(stderr,
+					             "SLOW_ADOPT hash=%016llx us=%lld entries=%zu bytes=%zu fast=%llu runs=%llu slow=%llu result=%s\n",
+					             static_cast<unsigned long long>(PerfMaterializeHash()), static_cast<long long>(us),
+					             results.log.entries.size(), results.log.bytes.size(),
+					             static_cast<unsigned long long>(stats.entries_fast), static_cast<unsigned long long>(stats.runs),
+					             static_cast<unsigned long long>(stats.entries_slow),
+					             results.reads == Reads::Hold ? "hold" : "changed");
+				}
+			}
+		}
+		if (lead_t0 != 0) ChunkLead::NoteAdopt(ChunkLead::Tsc() - lead_t0, results.log.entries.size(), results.log.bytes.size());
 		if (results.reads == Reads::Changed) g_resolve_stats.stale.fetch_add(1, std::memory_order_relaxed);
 	}
 	return results.reads == Reads::Hold;
@@ -201,15 +410,23 @@ uint8_t RemapSourceAlphaFactor(uint8_t factor) {
 }
 
 vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front, bool cull_back) {
+	// Project 15 N7.1: in the plan's builder (t_describe_soft) an unsupported mode fails the key, never stops the emulator
+	// (today's path meets the same registers when the draw runs).
+	const auto fail = [] {
+		t_describe_failed = true;
+		return vk::PolygonMode::eFill;
+	};
 	// CxPrimitiveSetup::PolygonMode disables both per-face modes when it is zero.
 	if (mode.poly_mode == 0) {
 		return vk::PolygonMode::eFill;
 	}
+	if (t_describe_soft && mode.poly_mode != 1) return fail();
 	EXIT_NOT_IMPLEMENTED(mode.poly_mode != 1);
 	if (cull_front && cull_back) {
 		return vk::PolygonMode::eFill;
 	}
 	if (!cull_front && !cull_back && mode.polymode_front_ptype != mode.polymode_back_ptype) {
+		if (t_describe_soft) return fail();
 		EXIT("Pipeline: different polygon modes for two visible faces are unsupported\n");
 	}
 	// Vulkan has one polygon mode. A culled face does not constrain that mode.
@@ -218,7 +435,9 @@ vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front,
 		case 0: return vk::PolygonMode::ePoint;
 		case 1: return vk::PolygonMode::eLine;
 		case 2: return vk::PolygonMode::eFill;
-		default: EXIT("Pipeline: invalid polygon mode %u\n", polygon_mode);
+		default:
+			if (t_describe_soft) return fail();
+			EXIT("Pipeline: invalid polygon mode %u\n", polygon_mode);
 	}
 }
 
@@ -235,7 +454,7 @@ std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties)
 	// Default from Common::EnvDefaults; =0 turns it off.
 	const char* any_revision = Common::ShaderEnv::Read("KYTY_PIPELINE_CACHE_ANY_REVISION");
 	const bool  any          = any_revision != nullptr && any_revision[0] == '1';
-	return fmt::format("KytyPC1:{}:{:08x}:{:08x}:{:08x}:{}\n", any ? "any" : KYTY_GIT_REVISION,
+	return fmt::format("KytyPC1:{}:{:08x}:{:08x}:{:08x}:{}\n", any ? "any" : KYTY_SHADER_REVISION,
 	                   properties.vendorID, properties.deviceID, properties.driverVersion, uuid);
 }
 
@@ -445,17 +664,38 @@ struct PipelineCache::ProgramCache {
 			const auto matches = [&](const Permutation& candidate) {
 				return candidate.program.bindings.PushStartMatches(push_data_cursor) && candidate.specialization == specialization;
 			};
-			if (ahead_permutation < permutations.size() && matches(permutations[ahead_permutation])) {
-				return &permutations[ahead_permutation];
+			const size_t hint = ahead_permutation.value.load(std::memory_order_relaxed);
+			if (hint < permutations.size() && matches(permutations[hint])) {
+				return &permutations[hint];
 			}
 			for (size_t index = 0; index < permutations.size(); index++) {
 				if (!matches(permutations[index])) continue;
-				ahead_permutation = index;
+				ahead_permutation.value.store(index, std::memory_order_relaxed);
 				return &permutations[index];
 			}
 			return nullptr;
 		}
-		size_t ahead_permutation = SIZE_MAX;
+		// Project 15 S2d: FindPermutation<false>'s answer without its hint write (programs_mutex held shared).
+		[[nodiscard]] const Permutation* PeekPermutation(uint32_t push_data_cursor,
+		                                                 const ShaderRecompiler::IR::ResourceSpecialization& specialization) const {
+			for (const auto& candidate: permutations) {
+				if (candidate.program.bindings.PushStartMatches(push_data_cursor) && candidate.specialization == specialization) {
+					return &candidate;
+				}
+			}
+			return nullptr;
+		}
+		// Project 15 N2.1: a hint only (checked by `matches`), so resolving threads may race on it; atomic, relaxed.
+		struct RelaxedIndex {
+			std::atomic<size_t> value {SIZE_MAX};
+			RelaxedIndex() = default;
+			RelaxedIndex(const RelaxedIndex& other): value(other.value.load(std::memory_order_relaxed)) {}
+			RelaxedIndex& operator=(const RelaxedIndex& other) {
+				value.store(other.value.load(std::memory_order_relaxed), std::memory_order_relaxed);
+				return *this;
+			}
+		};
+		RelaxedIndex ahead_permutation;
 
 		std::unique_ptr<ShaderRecompiler::ShaderSource> call_source;
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
@@ -498,6 +738,7 @@ struct PipelineCache::ProgramCache {
 	                               uint32_t push_data_start_dword,
 	                               std::span<const uint32_t> function_code,
 	                               PrecompileReused* reused) {
+		ChunkCensus::t_shaders++; // KYTY_TRACE_CHUNK_CENSUS (hole)
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::ShadersCompiled,
 		                                         Common::DebugCounters::Counter::ShaderCompileNs,
 		                                         Common::DebugCounters::Peak::ShaderCompileNs);
@@ -824,6 +1065,7 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 		const double materialize_ms = MillisecondsSince(materialize_begin);
+		const Common::SlowFrame::Scope slow_frame_scope(Common::SlowFrame::Variant); // KYTY_TRACE_SLOW_FRAMES (wait, translation, compile, append)
 		if (std::FILE* f = Common::EnvRead::ShaderStagesFile()) { std::fprintf(f, "STAGE compile 0x%016llx\n", static_cast<unsigned long long>(options.shader_hash)); std::fclose(f); }
 		PipelineTrace::TracePermutation(options.shader_hash, LastSpecialization(entry->second.permutations),
 		                                entry->second.permutations.size(), entry->second.specialization);
@@ -986,6 +1228,13 @@ struct PipelineCache::ProgramCache {
 		} else {
 			stage = ShaderType::Compute;
 		}
+		std::optional<ChunkLead::PartTimer> key_timer(std::in_place, ChunkLead::RpKey); // KYTY_TRACE_CHUNK_LEAD (N2.0)
+		// Project 15 N2.1: the resolving thread's own key (several threads resolve).
+		thread_local ProgramKey ahead_key = [] {
+			ProgramKey key;
+			key.static_state.reserve(MaxStaticKeyWords);
+			return key;
+		}();
 		ahead_key.stage           = stage;
 		ahead_key.hash            = params.hash;
 		ahead_key.user_data_count = params.user_data_count;
@@ -996,6 +1245,7 @@ struct PipelineCache::ProgramCache {
 			std::shared_lock lock(programs_mutex);
 			if (const auto found = programs.find(ahead_key); found != programs.end()) entry = &found->second;
 		}
+		key_timer.reset();
 		if (entry == nullptr || entry->call_source || results.count >= results.stages.size()) {
 			g_resolve_stats.no_program.fetch_add(1, std::memory_order_relaxed);
 			results.adoptable = false;
@@ -1025,18 +1275,26 @@ struct PipelineCache::ProgramCache {
 			runtime.workgroup_counts = std::span<const uint32_t>(r.workgroup_counts.data(), 3);
 		}
 		auto refusal = ShaderRecompiler::IR::AheadRefusal::None;
-		r.ok = ShaderRecompiler::IR::MaterializeResourcesAhead(*r.plan, runtime, r.resources, r.specialization, results.log,
-		                                                       &refusal);
+		{
+			const ChunkLead::PartTimer mat_timer(ChunkLead::RpMaterialize); // KYTY_TRACE_CHUNK_LEAD (N2.0)
+			r.ok = ShaderRecompiler::IR::MaterializeResourcesAhead(*r.plan, runtime, r.resources, r.specialization, results.log,
+			                                                       &refusal);
+		}
 		if (!r.ok) {
 			g_resolve_stats.refused[static_cast<size_t>(refusal)].fetch_add(1, std::memory_order_relaxed);
 			results.adoptable = false;
 			return;
 		}
-		r.null_share_kinds = r.plan->scratch[ResolveScratchSlot].null_share_kinds;
-		StageF::BuildResolveRecord(renderer, r.resources, r.record); // FindBuffers' sources for this snapshot
+		r.null_share_kinds = r.plan->scratch[ShaderRecompiler::IR::t_ahead_scratch_slot].null_share_kinds; // N2.1: this thread's slot
+		if (g_resolve_check) r.active_sources = r.plan->scratch[ShaderRecompiler::IR::t_ahead_scratch_slot].active_sources;
+		{
+			const ChunkLead::PartTimer src_timer(ChunkLead::RpSources); // KYTY_TRACE_CHUNK_LEAD (N2.0)
+			StageF::BuildResolveRecord(renderer, r.resources, r.record); // FindBuffers' sources for this snapshot
+		}
 		g_resolve_stats.made.fetch_add(1, std::memory_order_relaxed);
 		Permutation* permutation = nullptr;
 		{
+			const ChunkLead::PartTimer perm_timer(ChunkLead::RpPermutation); // KYTY_TRACE_CHUNK_LEAD (N2.0)
 			std::shared_lock lock(programs_mutex);
 			permutation = entry->FindPermutationAhead(push_data_cursor, r.specialization);
 		}
@@ -1062,6 +1320,7 @@ struct PipelineCache::ProgramCache {
 			auto*      permutation = static_cast<Permutation*>(r.permutation);
 			const bool shared      = std::ranges::find(r.null_share_kinds, uint8_t {1}) != r.null_share_kinds.end();
 			if (permutation == nullptr || shared || !permutation->program.bindings.PushStartMatches(cursor)) {
+				t_adopt_refinds++; // KYTY_CHECK_PEEK=2 (S2d)
 				permutation = entry.FindPermutation<false>(cursor, r.specialization);
 				if (permutation == nullptr) return false;
 				r.out_stage->program = &permutation->program;
@@ -1077,10 +1336,48 @@ struct PipelineCache::ProgramCache {
 		return true;
 	}
 
+	// Project 15 S2d: Adopt's outcome without a write. True: every stage keeps the permutation the resolve found (the push
+	// cursor through them as Adopt walks it), so the commit's only write is the null share. False: Adopt looks a
+	// permutation up again (in order). The share's own write (ApplyNullFormattedShare) is not read here: it changes the
+	// specialization, and Adopt looks up again exactly when a stage shares, which the kinds say without it.
+	// The permutation Adopt takes for each stage, found ahead (S2d after n3-s2d-refind.md): the resolve's when Adopt keeps
+	// it, else the one FindPermutation<false> finds for the specialization after the null share (read under the share
+	// lock, nothing written) and the push cursor. False: a stage needs a compile (Adopt returns false). flags
+	// (diagnostic, per stage 3 bits): no permutation ahead, a null share, the push start differs.
+	struct AdoptPeek {
+		std::array<const Permutation*, 4> permutations {};
+		uint32_t                          kept = 0, found = 0, flags = 0;
+	};
+	[[nodiscard]] bool PeekAdopt(const ResolvedStages& results, AdoptPeek& out) {
+		out             = {};
+		uint32_t cursor = results.push_start;
+		for (uint32_t i = 0; i < results.count; i++) {
+			const auto& r           = results.stages[i];
+			const auto& entry       = *static_cast<const SourceEntry*>(r.entry);
+			const auto* permutation = static_cast<const Permutation*>(r.permutation);
+			const bool  shared      = std::ranges::find(r.null_share_kinds, uint8_t {1}) != r.null_share_kinds.end();
+			const bool  push_same   = permutation != nullptr && permutation->program.bindings.PushStartMatches(cursor);
+			out.flags |= ((permutation == nullptr ? 1u : 0u) | (shared ? 2u : 0u) | (permutation != nullptr && !push_same ? 4u : 0u))
+			             << (3u * std::min(i, 3u));
+			if (permutation == nullptr || shared || !push_same) {
+				auto specialization = r.specialization;
+				if (shared) ShaderRecompiler::IR::PeekNullFormattedShare(*r.plan, r.null_share_kinds, specialization);
+				std::shared_lock lock(programs_mutex);
+				permutation = entry.PeekPermutation(cursor, specialization);
+				if (permutation == nullptr) return false;
+				out.found++;
+			} else {
+				out.kept++;
+			}
+			out.permutations[std::min(i, 3u)] = permutation;
+			permutation->program.bindings.AdvancePushData(cursor);
+		}
+		return true;
+	}
+
 	ProgramCache(GraphicContext& graphics, ShaderRecompiler::IR::ImageHeapSource* image_heap)
 	    : device(graphics.device), graphics(graphics), image_heap(image_heap), profile(ShaderCompileProfile(graphics)) {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
-		ahead_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {
 		for (const auto& [key, entry]: programs) {
@@ -1093,7 +1390,6 @@ struct PipelineCache::ProgramCache {
 
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
 	ProgramKey                                                  lookup_key;
-	ProgramKey                                                  ahead_key; // the resolve thread's
 	vk::Device                                                  device;
 	GraphicContext&                                             graphics;
 	// Upstream's image heap source (27dc7c281): always null here (RenderContext m_image_heap, SESJA-SYNC1).
@@ -1251,7 +1547,31 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
 
 // The renderer is complete once the GPU thread asks for a pipeline (the bindless table is built after this cache).
 void PipelineCache::StartBackgroundCompiles() {
-	if (m_precompiler != nullptr) m_precompiler->Start();
+	if (m_precompiler == nullptr) return;
+	m_precompiler->Start();
+	// KYTY_SHADER_PRECOMPILE_WAIT (default 1, 11.11): the first time, the game waits here until the precompile of the
+	// recorded shaders is done (the window title shows its percent), so gameplay never starts while the workers still
+	// translate in the background (a cold start after a translator change took ~30 s of CPU and shader misses from the
+	// first minute of play; warm, the wait is a few seconds). At most 180 s.
+	static bool waited = false;
+	if (waited) return;
+	waited                  = true;
+	static const bool wait  = [] {
+		const char* value = std::getenv("KYTY_SHADER_PRECOMPILE_WAIT");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (!wait) return;
+	const auto begin = std::chrono::steady_clock::now();
+	while (m_precompiler->Busy() && std::chrono::steady_clock::now() - begin < std::chrono::seconds(180)) {
+		const auto progress = GetPrecompileProgress();
+		const int  percent  = progress.queued != 0 ? static_cast<int>(std::min<uint64_t>(99u, uint64_t {progress.finished} * 100u / progress.queued)) : 0;
+		g_precompile_wait_percent.store(percent, std::memory_order_relaxed);
+		std::this_thread::sleep_for(std::chrono::milliseconds(100));
+	}
+	g_precompile_wait_percent.store(-1, std::memory_order_relaxed);
+	std::fprintf(stderr, "SHADER_PRECOMPILE_WAIT ms=%lld busy=%d\n",
+	             static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count()),
+	             m_precompiler->Busy() ? 1 : 0);
 }
 
 void PipelineCache::StopBackgroundCompiles() {
@@ -1383,6 +1703,7 @@ PipelineCache::~PipelineCache() {
 	// KYTY_PERF_TABLE_ASYNC: its workers first (they use the precompiler, the driver cache and the programs' modules);
 	// the pipelines they made that no draw took yet are destroyed with the others.
 	m_table_workers.reset();
+	const std::unique_lock pipelines_lock(m_pipelines_mutex);
 	for (auto& [key, job]: m_table_pending) {
 		if (job->done.load(std::memory_order_acquire) && !job->failed && job->pipeline != nullptr) {
 			m_graphics_pipelines.emplace(key, std::move(job->pipeline));
@@ -1922,10 +2243,10 @@ ShaderProgram PipelineCache::GetComputeProgramTwin(const HW::ComputeShaderInfo& 
 
 // Every 64k stages, on the resolve thread.
 static void ReportResolveStats(uint32_t count) {
-	static uint64_t stages = 0;
-	const uint64_t  before = stages;
-	stages += count + 1u;
-	if ((before >> 16u) == (stages >> 16u) || !Common::EnvRead::PerfLines()) return;
+	static std::atomic<uint64_t> stages {0}; // project 15 N2.1: several resolving threads
+	const uint64_t before = stages.fetch_add(count + 1u, std::memory_order_relaxed);
+	const uint64_t after  = before + count + 1u;
+	if ((before >> 16u) == (after >> 16u) || !Common::EnvRead::PerfLines()) return;
 	using Ir          = ShaderRecompiler::IR::AheadRefusal;
 	auto&       s     = g_resolve_stats;
 	const auto  total = [](const std::atomic<uint64_t>& a) -> unsigned long long { return a.load(std::memory_order_relaxed); };
@@ -2019,6 +2340,7 @@ void PipelineCache::ResolveGraphicsPrograms(RenderContext& renderer, const HW::V
 	ShaderParams                pixel_params;
 	uint32_t                    push_data_cursor = 0;
 	{
+		const ChunkLead::PartTimer   inputs_timer(ChunkLead::RpInputs); // KYTY_TRACE_CHUNK_LEAD (N2.0)
 		const ShaderGuestReaderScope reader(&ReadProgramInputAhead, &results);
 		GraphicsProgramInputs(m_graphics, vertex_regs, pixel_regs, sh, context, user_config, target_export_mapping, pixel_active,
 		                      vertex_info, pixel_info, indirect_draw, vertex_params, pixel_params, &push_data_cursor);
@@ -2040,12 +2362,177 @@ void PipelineCache::ResolveGraphicsPrograms(RenderContext& renderer, const HW::V
 }
 
 bool PipelineCache::AdoptResolvedPrograms(ResolvedStages& results) {
+	if (PeekAdoptCheck()) return AdoptResolvedProgramsChecked(results);
 	if (!results.adoptable || !ResolvedReadsHold(results)) {
 		g_resolve_stats.not_adopted.fetch_add(1, std::memory_order_relaxed);
 		return false;
 	}
 	const bool adopted = m_program_cache->Adopt(results);
 	(adopted ? g_resolve_stats.adopted : g_resolve_stats.not_adopted).fetch_add(1, std::memory_order_relaxed);
+	return adopted;
+}
+
+// KYTY_CHECK_PEEK=2 (S2d, diagnostic): PeekAdopt first, then today's adoption; a predicted keep must be an adoption that
+// looked nothing up again. KYTY_CHECK_PEEK_FAULT=N: every N-th keep is reported as a look-up and must be caught.
+bool PipelineCache::PeekAdoptAhead(ResolvedStages& results, uint32_t distance) {
+	ProgramCache::AdoptPeek peek;
+	const bool              predicted = m_program_cache->PeekAdopt(results, peek);
+	results.ahead_valid       = true;
+	results.ahead_predicted   = predicted;
+	results.ahead_distance    = distance;
+	results.ahead_share       = false;
+	results.ahead_programs_ok = false;
+	for (uint32_t i = 0; i < std::min(results.count, 4u); i++) {
+		const auto* permutation    = predicted ? peek.permutations[i] : nullptr;
+		results.ahead_programs[i]  = permutation != nullptr ? &permutation->program : nullptr;
+		results.ahead_handles[i]   = permutation != nullptr ? permutation->handle : ShaderProgram {};
+		if (((peek.flags >> (3u * i + 1u)) & 1u) != 0) results.ahead_share = true;
+	}
+	return predicted;
+}
+
+void PipelineCache::InstallAhead(ResolvedStages& results, AheadSaved& saved) {
+	saved.count = std::min(results.count, 4u);
+	for (uint32_t i = 0; i < saved.count; i++) {
+		auto& r = results.stages[i];
+		if (r.out_stage == nullptr || r.out_program == nullptr) continue;
+		saved.program[i]     = r.out_stage->program;
+		saved.handle[i]      = *r.out_program;
+		r.out_stage->program = results.ahead_programs[i];
+		*r.out_program       = results.ahead_handles[i];
+	}
+}
+
+void PipelineCache::RestoreAhead(ResolvedStages& results, const AheadSaved& saved) {
+	for (uint32_t i = 0; i < saved.count; i++) {
+		auto& r = results.stages[i];
+		if (r.out_stage == nullptr || r.out_program == nullptr) continue;
+		r.out_stage->program = saved.program[i];
+		*r.out_program       = saved.handle[i];
+	}
+}
+
+bool PipelineCache::StagesAdoptable(const ResolvedStages& results) {
+	return results.adoptable && results.count != 0;
+}
+
+bool PipelineCache::AheadProgramsOk(const ResolvedStages& results) {
+	return results.ahead_programs_ok;
+}
+
+uint32_t PipelineCache::StageCount(const ResolvedStages& results) {
+	return std::min(results.count, 4u);
+}
+
+const ShaderRecompiler::IR::CompiledShaderInfo* PipelineCache::AheadProgram(const ResolvedStages& results, uint32_t i) {
+	return i < 4u ? results.ahead_programs[i] : nullptr;
+}
+
+const StageF::ResolveRecord* PipelineCache::StageRecord(const ResolvedStages& results, uint32_t i) {
+	return i < 4u ? results.stages[i].record.get() : nullptr;
+}
+
+const ShaderRecompiler::IR::CompiledShaderInfo* PipelineCache::AdoptedProgram(const ResolvedStages& results, uint32_t i) {
+	return i < 4u && results.stages[i].out_stage != nullptr ? results.stages[i].out_stage->program : nullptr;
+}
+
+const ShaderRecompiler::IR::ResourceSnapshot* PipelineCache::StageResources(const ResolvedStages& results, uint32_t i) {
+	return i < 4u ? &results.stages[i].resources : nullptr;
+}
+
+bool PipelineCache::AdoptResolvedProgramsChecked(ResolvedStages& results) {
+	auto& st = g_peek_adopt;
+	st.calls++;
+	if (!results.adoptable) {
+		st.not_adoptable++;
+		g_resolve_stats.not_adopted.fetch_add(1, std::memory_order_relaxed);
+		return false;
+	}
+	ProgramCache::AdoptPeek peek;
+	++t_translator;
+	const bool predicted = m_program_cache->PeekAdopt(results, peek);
+	--t_translator;
+	if (!ResolvedReadsHold(results)) {
+		st.reads_changed++;
+		g_resolve_stats.not_adopted.fetch_add(1, std::memory_order_relaxed);
+		return false;
+	}
+	(predicted ? (peek.found == 0 ? st.keep : st.refind) : st.compile)++;
+	for (uint32_t i = 0; i < std::min(results.count, 4u); i++) {
+		for (uint32_t bit = 0; bit < 3u; bit++) {
+			if ((peek.flags >> (3u * i + bit) & 1u) == 0) continue;
+			st.reasons[1u + 3u * i + bit]++;
+			if (t_peek_member == 1) st.member_reasons[1u + 3u * i + bit]++;
+		}
+	}
+	st.reasons[0] += peek.flags == 0 ? 1u : 0u;
+	if (t_peek_member == 1) st.member_reasons[0] += peek.flags == 0 ? 1u : 0u;
+	const bool     fault    = predicted && PeekAdoptFaultEvery() != 0 && (st.keep + st.refind) % PeekAdoptFaultEvery() == 0;
+	const uint32_t refinds0 = t_adopt_refinds;
+	const bool     adopted  = m_program_cache->Adopt(results);
+	if (adopted && predicted) t_op_programs = true; // the operation's plan (translatorGuard.h)
+	if (adopted != predicted) {
+		st.bad++; // a compile predicted where Adopt found one, or the other way
+	} else if (adopted) {
+		bool same = true;
+		for (uint32_t i = 0; i < std::min(results.count, 4u); i++) {
+			const auto* expected = peek.permutations[i];
+			if (fault && i == 0) {
+				expected = nullptr;
+				st.injected++;
+			}
+			same = same && expected != nullptr && results.stages[i].out_stage->program == &expected->program;
+		}
+		if (!same) (fault ? st.detected : st.bad)++;
+	}
+	if (t_adopt_refinds == refinds0 && peek.found != 0) st.refind_kept++; // (the peek looked up, Adopt did not)
+	if (results.ahead_valid) {
+		// N4.1: the prediction made when the chunk opened, against what Adopt took.
+		auto&          a      = g_ahead;
+		const uint32_t bucket = AheadBucket(results.ahead_distance);
+		results.ahead_valid   = false;
+		if (!results.ahead_predicted) {
+			if (predicted) a.p_lost++;
+		} else if (adopted) {
+			a.p_compared++;
+			a.p_by_distance[bucket]++;
+			bool same = true;
+			for (uint32_t i = 0; i < std::min(results.count, 4u); i++) {
+				same = same && results.stages[i].out_stage->program == results.ahead_programs[i];
+			}
+			results.ahead_programs_ok = same;
+			const bool ahead_fault    = PeekAdoptFaultEvery() != 0 && a.p_compared % PeekAdoptFaultEvery() == 0;
+			if (ahead_fault) a.p_injected++;
+			if (!same || ahead_fault) {
+				if (ahead_fault) {
+					a.p_detected++;
+				} else if (results.ahead_share) {
+					a.p_share_diff++;
+				} else {
+					a.p_bad++;
+				}
+			}
+		}
+	}
+	(adopted ? g_resolve_stats.adopted : g_resolve_stats.not_adopted).fetch_add(1, std::memory_order_relaxed);
+	if ((st.calls & ((1u << 18u) - 1u)) == 0) {
+		std::fprintf(stderr,
+		             "PERF peek_adopt calls=%llu keep=%llu predicted=%llu not_adoptable=%llu reads_changed=%llu compile=%llu bad=%llu "
+		             "fault[injected|detected]=%llu|%llu\n",
+		             static_cast<unsigned long long>(st.calls), static_cast<unsigned long long>(st.keep),
+		             static_cast<unsigned long long>(st.refind), static_cast<unsigned long long>(st.not_adoptable),
+		             static_cast<unsigned long long>(st.reads_changed), static_cast<unsigned long long>(st.compile),
+		             static_cast<unsigned long long>(st.bad), static_cast<unsigned long long>(st.injected),
+		             static_cast<unsigned long long>(st.detected));
+		const auto join = [](const auto& a) {
+			std::string out;
+			for (size_t i = 0; i < a.size(); i++) out += std::string(i == 0 ? "" : "|") + std::to_string(a[i]);
+			return out;
+		};
+		std::fprintf(stderr,
+		             "PERF peek_adopt_flags[none_set|s0:none,share,push|s1:..|s2:..|s3:..]=%s member=%s found_kept=%llu\n",
+		             join(st.reasons).c_str(), join(st.member_reasons).c_str(), static_cast<unsigned long long>(st.refind_kept));
+	}
 	return adopted;
 }
 
@@ -2058,17 +2545,66 @@ PipelineCache::GraphicsPipelineKey PipelineCache::MakeGraphicsPipelineKey(
     std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
     bool primitive_restart_enable, const GraphicsPrograms& programs) {
+	return MakeGraphicsPipelineKeyFrom(colors, depth, vertex_info, command.GetRegisters(), command.GetUserConfig(), ps_input_info,
+	                                   topology, primitive_restart_enable, programs, false);
+}
+
+PipelineCache::Pipeline* PipelineCache::TakePlannedPipeline(Pipeline* planned) {
+	PipelineHousekeeping();
+	if (planned == nullptr || planned->pipeline == nullptr) return nullptr;
+	planned->last_used = static_cast<uint32_t>(DebugPresentCount().load());
+	return planned;
+}
+
+std::pair<PipelineCache::Pipeline*, PipelineCache::PipelineFind> PipelineCache::FindGraphicsPipeline(
+    const GraphicsPipelineKey& key, bool read_object) const {
+	const std::shared_lock pipelines_lock(m_pipelines_mutex); // N5.1: a resolve helper may ask
+	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
+		auto* found = iter->second.get();
+		if (!read_object) return {found, PipelineFind::Found}; // (the sweep writes the object without the lock)
+		return {found, found->pipeline != nullptr ? PipelineFind::Found : PipelineFind::Evicted};
+	}
+	if (auto pending = m_table_pending.find(key); pending != m_table_pending.end()) {
+		if (!read_object) return {nullptr, PipelineFind::Pending};
+		const auto& job = *pending->second;
+		return {nullptr, job.done.load(std::memory_order_acquire) && !job.failed ? PipelineFind::PendingDone : PipelineFind::Pending};
+	}
+	return {nullptr, PipelineFind::Missing};
+}
+
+// N5.1 (translatorGuard.h): soft fails of the key for the plan's builder.
+#define KEY_EXIT_IF(x)                                                                                                  \
+	do {                                                                                                                \
+		if (t_describe_soft && (x)) {                                                                                   \
+			t_describe_failed = true;                                                                                   \
+			return GraphicsPipelineKey {};                                                                              \
+		}                                                                                                               \
+		EXIT_IF(x);                                                                                                     \
+	} while (false)
+#define KEY_EXIT(...)                                                                                                   \
+	do {                                                                                                                \
+		if (t_describe_soft) {                                                                                          \
+			t_describe_failed = true;                                                                                   \
+			return GraphicsPipelineKey {};                                                                              \
+		}                                                                                                               \
+		EXIT(__VA_ARGS__);                                                                                              \
+	} while (false)
+
+PipelineCache::GraphicsPipelineKey PipelineCache::MakeGraphicsPipelineKeyFrom(
+    std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
+    std::span<const ShaderVertexInputInfo> vertex_info, const HW::Context& ctx, const HW::UserConfig& user_config,
+    const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
+    bool primitive_restart_enable, const GraphicsPrograms& programs, bool described) {
 	const auto& vs_input_info  = vertex_info.front();
 	const auto& vertex_program = programs.vertex[0];
 	const auto& pixel_program  = programs.pixel;
 
-	EXIT_IF(colors.size() > RENDER_COLOR_ATTACHMENTS_MAX);
-	EXIT_IF(!vertex_program);
+	KEY_EXIT_IF(colors.size() > RENDER_COLOR_ATTACHMENTS_MAX);
+	KEY_EXIT_IF(!vertex_program);
 	const bool ps_active = ps_input_info != nullptr;
-	EXIT_IF(ps_active && !pixel_program);
+	KEY_EXIT_IF(ps_active && !pixel_program);
 	const auto color_count = static_cast<uint32_t>(colors.size());
 
-	auto&             ctx = command.GetRegisters();
 
 	const HW::ModeControl& mc = ctx.GetModeControl();
 
@@ -2085,9 +2621,9 @@ PipelineCache::GraphicsPipelineKey PipelineCache::MakeGraphicsPipelineKey(
 	uint32_t attachment_samples = 0;
 	for (uint32_t i = 0; i < color_count; i++) {
 		const auto slot = colors[i].target_slot;
-		EXIT_IF(slot >= RENDER_COLOR_ATTACHMENTS_MAX);
+		KEY_EXIT_IF(slot >= RENDER_COLOR_ATTACHMENTS_MAX);
 		rendering.color_count = std::max(rendering.color_count, slot + 1);
-		EXIT_IF(!colors[i].image_id || colors[i].desc.view_info.format == vk::Format::eUndefined);
+		KEY_EXIT_IF((!described && !colors[i].image_id) || colors[i].desc.view_info.format == vk::Format::eUndefined);
 		static_params.color_mask[slot] = colors[i].export_mapping.ApplyMask(
 		    render_target_mask_slot(ctx.GetRenderTargetMask(), colors[i].target_slot));
 		// Upstream b4406b046: a packed 11-11-10 UNorm export writes one 32-bit channel (not with
@@ -2100,7 +2636,7 @@ PipelineCache::GraphicsPipelineKey PipelineCache::MakeGraphicsPipelineKey(
 		if (attachment_samples == 0) {
 			attachment_samples = colors[i].desc.info.samples;
 		} else if (attachment_samples != colors[i].desc.info.samples) {
-			EXIT("mixed color attachment sample counts are unsupported: %u and %u\n",
+			KEY_EXIT("mixed color attachment sample counts are unsupported: %u and %u\n",
 			     attachment_samples, colors[i].desc.info.samples);
 		}
 		const auto& rt                        = ctx.GetRenderTarget(colors[i].target_slot);
@@ -2152,7 +2688,7 @@ PipelineCache::GraphicsPipelineKey PipelineCache::MakeGraphicsPipelineKey(
 		}
 	}
 	const bool with_depth =
-	    depth.desc.view_info.format != vk::Format::eUndefined && static_cast<bool>(depth.image_id);
+	    depth.desc.view_info.format != vk::Format::eUndefined && (described || static_cast<bool>(depth.image_id));
 	if (with_depth) {
 		const auto aspects       = ImageViewOps::DepthAspectMask(depth.desc.view_info.format);
 		rendering.depth_format   = aspects & vk::ImageAspectFlagBits::eDepth
@@ -2164,17 +2700,17 @@ PipelineCache::GraphicsPipelineKey PipelineCache::MakeGraphicsPipelineKey(
 		if (attachment_samples == 0) {
 			attachment_samples = depth.desc.info.samples;
 		} else if (attachment_samples != depth.desc.info.samples) {
-			EXIT("mixed color/depth sample counts are unsupported: %u and %u\n", attachment_samples,
+			KEY_EXIT("mixed color/depth sample counts are unsupported: %u and %u\n", attachment_samples,
 			     depth.desc.info.samples);
 		}
 	}
 	if (color_count == 0 && !with_depth) {
 		attachment_samples = render_sample_count(ctx.GetAaConfig().msaa_num_samples);
-		EXIT_IF(!static_cast<bool>(
+		KEY_EXIT_IF(!static_cast<bool>(
 		    m_graphics.GetPhysicalDeviceProperties().limits.framebufferNoAttachmentsSampleCounts &
 		    vulkan_sample_count(attachment_samples)));
 	}
-	EXIT_IF(attachment_samples == 0 ||
+	KEY_EXIT_IF(attachment_samples == 0 ||
 	        vulkan_sample_count(attachment_samples) == vk::SampleCountFlagBits {});
 
 	if (ps_active && depth.depth_test_enable && ps_input_info->ps_execute_on_noop) {
@@ -2193,10 +2729,10 @@ PipelineCache::GraphicsPipelineKey PipelineCache::MakeGraphicsPipelineKey(
 	static_params.sample_shading_enable =
 	    ps_active && attachment_samples > 1 && ps_input_info->ps_sample_shading;
 	if (static_params.sample_shading_enable && !m_graphics.sample_rate_shading_enabled) {
-		EXIT("Pipeline: sample-rate shading is required but unsupported by the host\n");
+		KEY_EXIT("Pipeline: sample-rate shading is required but unsupported by the host\n");
 	}
 	static_params.alpha_to_coverage_enable = ps_active && ctx.GetShaderRegisters().AlphaToMask();
-	const bool rect_list = Prospero::IsRectList(command.GetUserConfig().GetPrimType());
+	const bool rect_list = Prospero::IsRectList(user_config.GetPrimType());
 	static_params.cull_back  = !rect_list && mc.cull_back;
 	static_params.cull_front = !rect_list && mc.cull_front;
 	static_params.face       = mc.face;
@@ -2205,7 +2741,7 @@ PipelineCache::GraphicsPipelineKey PipelineCache::MakeGraphicsPipelineKey(
 	    ResolvePolygonMode(mc, static_params.cull_front, static_params.cull_back);
 
 	if (vs_input_info.stage.program->stage != ShaderType::Mesh) {
-		EXIT_IF(vs_input_info.buffers_num < 0 ||
+		KEY_EXIT_IF(vs_input_info.buffers_num < 0 ||
 		        vs_input_info.buffers_num > ShaderVertexInputInfo::RES_MAX ||
 		        vs_input_info.resources_num < 0 ||
 		        vs_input_info.resources_num > ShaderVertexInputInfo::RES_MAX);
@@ -2218,7 +2754,7 @@ PipelineCache::GraphicsPipelineKey PipelineCache::MakeGraphicsPipelineKey(
 		}
 		for (int attribute = 0; attribute < vs_input_info.resources_num; attribute++) {
 			const auto binding = vs_input_info.resources_dst[attribute].buffer_index;
-			EXIT_IF(binding < 0 || binding >= vs_input_info.buffers_num);
+			KEY_EXIT_IF(binding < 0 || binding >= vs_input_info.buffers_num);
 			key.vertex_input.attributes[attribute] = {
 			    .offset = static_cast<uint32_t>(vs_input_info.resources[attribute].Base48() -
 			                                    vs_input_info.buffers[binding].addr),
@@ -2295,6 +2831,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	}
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
 	{
+		ChunkCensus::t_pipelines++; // KYTY_TRACE_CHUNK_CENSUS (hole)
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
@@ -2312,7 +2849,9 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	}
 
 	cached->last_used     = static_cast<uint32_t>(DebugPresentCount().load());
+	std::unique_lock pipelines_lock(m_pipelines_mutex);
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
+	pipelines_lock.unlock();
 	EXIT_IF(!inserted);
 	// (Upstream 959bee479 checkpoints the driver cache here; ours saves it with SaveIfDue, m_pipelines_since_save.)
 
@@ -2403,8 +2942,10 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipelineAsync(
 		stats.worker_ms += job.ms;
 		auto finished       = std::move(job.pipeline);
 		finished->last_used = static_cast<uint32_t>(DebugPresentCount().load());
+		std::unique_lock pipelines_lock(m_pipelines_mutex);
 		m_table_pending.erase(pending);
 		auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(finished));
+		pipelines_lock.unlock();
 		EXIT_IF(!inserted);
 		stats.draws++;
 		return iter->second.get();
@@ -2443,7 +2984,10 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipelineAsync(
 		job->precompile.static_params = key.static_params;
 		job->precompile.revision      = ShaderPrecompiler::Revision();
 	}
-	m_table_pending.emplace(std::move(key), job);
+	{
+		const std::unique_lock pipelines_lock(m_pipelines_mutex);
+		m_table_pending.emplace(std::move(key), job);
+	}
 	stats.queued++;
 	m_table_workers->Push([this, job] {
 		if (job->precompile_record) (void)m_precompiler->BeforeCompile(job->precompile.Key());
@@ -2501,6 +3045,7 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	auto cached = std::make_unique<Pipeline>();
 	{
+		ChunkCensus::t_pipelines++; // KYTY_TRACE_CHUNK_CENSUS (hole)
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);

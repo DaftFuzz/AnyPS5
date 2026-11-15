@@ -240,6 +240,12 @@ void DefineBvhIntersect(EmitterState& s) {
 	const auto u = TypeU32(s), f = TypeF32(s), b = TypeBool(s), wide = TypeU64(s);
 	const auto vec4 = TypeU32Vector(s, 4), vec3 = TypeF32Vector(s, 3);
 	const auto signature = s.builder.Type(spv::OpTypeFunction, vec4, vec4, wide, f, vec3, vec3, vec3);
+	// The last page this invocation looked up (guest page, host address of its first byte), kept across calls: a node in
+	// the same 16 KiB page has the same page-table entry, so its pointer is the base plus its offset in the page. Only
+	// found pages are kept (a missing page is looked up again: it marks its fault each time, as without the memo).
+	const auto private_wide = TypePointer(s, spv::StorageClassPrivate, wide);
+	const auto memo_page    = s.builder.DefineGlobalVariable(private_wide, spv::StorageClassPrivate, ConstantU64(s, ~uint64_t {0}));
+	const auto memo_base    = s.builder.DefineGlobalVariable(private_wide, spv::StorageClassPrivate, ConstantU64(s, 0));
 	s.bvh_intersect_function = s.builder.AllocateId();
 	s.builder.AddName(s.bvh_intersect_function, "bvh_intersect");
 	s.builder.AddFunction(spv::OpFunction, vec4, s.bvh_intersect_function,
@@ -306,9 +312,34 @@ void DefineBvhIntersect(EmitterState& s) {
 		invalid_words[i] = Select(s, u, triangle, triangle_invalid[i], box_invalid[i]);
 	const auto invalid = Vector(s, vec4, invalid_words);
 	const auto result = EmitValueOrDefaultIfCondition(s, valid, vec4, invalid, [&] {
-		const auto first = GetBdaPointer(s, address);
+		const auto page_offset = Binary(s, spv::OpBitwiseAnd, wide, address, ConstantU64(s, BdaPageBytes - 1u));
+		const auto page        = Binary(s, spv::OpShiftRightLogical, wide, address, ConstantU32(s, 14));
+		// Live A/B per call of 91451da6 (8.11): -8.9% in cutscene part 1, -1.1% / -4.1% in part 2.
+		const auto hit         = Binary(s, spv::OpIEqual, b, page, Unary(s, spv::OpLoad, wide, memo_page));
+		const auto first = EmitValueOrDefaultIfCondition(
+		    s, Unary(s, spv::OpLogicalNot, b, hit), wide,
+		    Binary(s, spv::OpIAdd, wide, Unary(s, spv::OpLoad, wide, memo_base), page_offset), [&] {
+			    const auto found = GetBdaPointer(s, address);
+			    EmitIfCondition(s, Binary(s, spv::OpINotEqual, b, found, ConstantU64(s, 0)), [&] {
+				    s.builder.AddFunction(spv::OpStore, memo_page, page);
+				    s.builder.AddFunction(spv::OpStore, memo_base, Binary(s, spv::OpISub, wide, found, page_offset));
+			    });
+			    return found;
+		    });
+		// The node's second 64 bytes: `address` is 64-aligned (base << 8 plus index << 6), so unless it is the last 64
+		// bytes of its 16 KiB page, address + 64 lies in the same page and the page table gives first + 64 (one entry; the
+		// remap of high addresses and the page bound are per page). An unmapped first page keeps the lookup. The
+		// cutscene's BVH shader 91451da6 spent ~10% of its samples in this second lookup (Nsight, 8.11);
+		// live A/B per call: -8.1% (part 2), -10.7% (part 1).
+		const auto same_page = Binary(
+		    s, spv::OpLogicalAnd, b,
+		    Binary(s, spv::OpULessThan, b, Binary(s, spv::OpBitwiseAnd, wide, address, ConstantU64(s, BdaPageBytes - 1u)),
+		           ConstantU64(s, BdaPageBytes - 64u)),
+		    Binary(s, spv::OpINotEqual, b, first, ConstantU64(s, 0)));
 		const auto second  = EmitValueOrDefaultIfCondition(s, full, wide, ConstantU64(s, 0), [&] {
-			return GetBdaPointer(s, Binary(s, spv::OpIAdd, wide, address, ConstantU64(s, 64)));
+			return EmitValueOrDefaultIfCondition(
+			    s, Unary(s, spv::OpLogicalNot, b, same_page), wide, Binary(s, spv::OpIAdd, wide, first, ConstantU64(s, 64)),
+			    [&] { return GetBdaPointer(s, Binary(s, spv::OpIAdd, wide, address, ConstantU64(s, 64))); });
 		});
 		const auto present = Binary(
 		    s, spv::OpLogicalAnd, b, Binary(s, spv::OpINotEqual, b, first, ConstantU64(s, 0)),

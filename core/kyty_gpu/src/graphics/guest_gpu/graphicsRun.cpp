@@ -1,5 +1,10 @@
+#include "common/slowFrame.h" // KYTY_TRACE_SLOW_FRAMES (diagnostic)
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/guest_gpu/stallWatch.h"
+#include "graphics/guest_gpu/chunkCensus.h"
+#include "graphics/guest_gpu/chunkLead.h"
 #include "graphics/guest_gpu/drawStateObserver.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/cleanDraws.h"
 
 #include "common/assert.h"
@@ -27,6 +32,7 @@
 
 #include <chrono>
 #include "graphics/host_gpu/regionManager.h"
+#include "graphics/host_gpu/translatorGuard.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -39,6 +45,8 @@
 #include "graphics/presentation/window.h"
 #include "graphics/shader/shader.h"
 #include "graphics/guest_gpu/command_processor/passCensus.h"
+#include "graphics/host_gpu/renderer/drawCoverage.h"
+#include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "kernel/memory.h"
 #include "libs/agc.h"
 #include "libs/errno.h"
@@ -612,6 +620,8 @@ static bool GraphicsRunDebugDumpEnabled() {
 	       Config::GetPrintfDirection() != Config::LogDirection::Silent;
 }
 
+static bool ResolveCheckOn(); // project 15 N2.2 (below, with the resolve thread)
+
 GuestGpu::GuestGpu(RenderContext& renderer)
     : m_renderer(renderer), m_operations(OperationQueueSize), m_resolved(ResolvedQueueSize),
       m_neutral_state {&m_neutral_context, &m_neutral_user_config, &m_neutral_shaders} {
@@ -626,7 +636,11 @@ GuestGpu::GuestGpu(RenderContext& renderer)
 	m_gfx_cp->Reset();
 	m_executor = std::jthread([this] { ExecutionThread(); });
 	m_resolver = std::jthread([this] { ResolveThread(); });
+	RenderExecutor::SetResolveCheckMode(ResolveCheckOn()); // project 15 N2.2: the helper resolves
+	m_resolve_helper = std::jthread([this] { ResolveHelperThread(0); });
+	m_resolve_helper2 = std::jthread([this] { ResolveHelperThread(1); }); // project 15 N5.2: the second helper
 	m_thread   = std::jthread(ThreadRun, this);
+	StallWatch::StartIfEnabled(); // KYTY_DIAG_STALL_WATCH (diagnostic)
 }
 
 GuestGpu::~GuestGpu() {
@@ -794,14 +808,18 @@ CommandProcessor& GuestGpu::GetProcessor(uint32_t queue_id) {
 	return *processor;
 }
 
-void GuestGpu::WaitForSnapshot(uint64_t sequence) {
+bool GuestGpu::WaitForSnapshot(uint64_t sequence) {
 	if (sequence <= m_executed.Load()) {
-		return;
+		return false;
 	}
 	if (g_gpu_stage_stats) g_stage_stats.snapshot_waits.fetch_add(1, std::memory_order_relaxed);
 	const auto start = g_gpu_stage_stats ? StageNowNs() : 0;
+	const bool lead  = ChunkLead::On(); // KYTY_TRACE_CHUNK_LEAD: the command processor's state
+	if (lead) ChunkLead::g_cp_state.store(ChunkLead::CpSnapshot, std::memory_order_relaxed);
 	m_executed.WaitFor(sequence);
+	if (lead) ChunkLead::g_cp_state.store(ChunkLead::CpWorking, std::memory_order_relaxed);
 	if (g_gpu_stage_stats) g_stage_stats.slot_waits_ns.fetch_add(StageNowNs() - start, std::memory_order_relaxed);
+	return true;
 }
 
 // Based on TheCruZ/KytyPS5-GTA 12ec19890 (graphicsRun.cpp), GPL-2.0.
@@ -809,7 +827,10 @@ void GuestGpu::EmitOperation(GpuOperation&& operation) {
 	if (g_gpu_stage_stats) {
 		if (!m_operations.TryPush(operation)) {
 			const auto start = StageNowNs();
+			const bool lead  = ChunkLead::On(); // KYTY_TRACE_CHUNK_LEAD
+			if (lead) ChunkLead::g_cp_state.store(ChunkLead::CpRingFull, std::memory_order_relaxed);
 			m_operations.Push(std::move(operation));
+			if (lead) ChunkLead::g_cp_state.store(ChunkLead::CpWorking, std::memory_order_relaxed);
 			g_stage_stats.ring_full.fetch_add(1, std::memory_order_relaxed);
 			g_stage_stats.ring_full_ns.fetch_add(StageNowNs() - start, std::memory_order_relaxed);
 		}
@@ -837,7 +858,10 @@ void GuestGpu::WaitForExecution(GpuDrain reason) {
 		return;
 	}
 	const auto start = StageNowNs();
+	const bool lead  = ChunkLead::On() && reason != GpuDrain::Idle; // KYTY_TRACE_CHUNK_LEAD (idle: the no-work state)
+	if (lead) ChunkLead::g_cp_state.store(ChunkLead::CpDrain, std::memory_order_relaxed);
 	m_executed.WaitFor(m_emitted);
+	if (lead) ChunkLead::g_cp_state.store(ChunkLead::CpWorking, std::memory_order_relaxed);
 	const auto index = static_cast<size_t>(reason);
 	g_stage_stats.drains[index].fetch_add(1, std::memory_order_relaxed);
 	g_stage_stats.drain_ns[index].fetch_add(StageNowNs() - start, std::memory_order_relaxed);
@@ -847,6 +871,7 @@ void GuestGpu::BecomeRendererOwner() {
 	g_gpu_thread      = true;
 	g_gpu_state       = this;
 	PerfIsGpuThread() = true;
+	Common::SlowFrame::t_exec = true; // KYTY_TRACE_SLOW_FRAMES
 	PerfSamplerStartForCurrentThread();
 	Common::StartupTrace::NoteGpuThread(); // KYTY_TRACE_STARTUP: its CPU time per second
 }
@@ -878,7 +903,14 @@ bool GuestGpu::WaitForOperations() {
 			return true;
 		}
 		if (m_pending_commands.load(std::memory_order_acquire) != 0) {
-			RunCommands();
+			const Common::SlowFrame::Scope slow_commands(Common::SlowFrame::Commands); // KYTY_TRACE_SLOW_FRAMES
+			if (ChunkLead::PeekCensusOn()) { // (way B measurement: the commands served while idle)
+				const uint64_t t0 = ChunkLead::Tsc();
+				RunCommands();
+				ChunkLead::t_idle_commands += ChunkLead::Tsc() - t0;
+			} else {
+				RunCommands();
+			}
 			continue;
 		}
 		if (m_execution_stop.load(std::memory_order_acquire)) {
@@ -921,14 +953,43 @@ void GuestGpu::ExecutionThread() {
 			perf_process.reset();
 			in_batch = 0;
 			const auto idle_start = g_gpu_stage_stats ? StageNowNs() : 0;
-			if (!WaitForOperations()) {
+			// KYTY_TRACE_CHUNK_LEAD: why the execution thread has nothing (sampled when the wait begins).
+			int        idle_cause = 0;
+			uint64_t   commands0  = 0;
+			if (ChunkLead::On()) {
+				const auto cp = ChunkLead::g_cp_state.load(std::memory_order_relaxed);
+				idle_cause    = ChunkLead::g_resolving.load(std::memory_order_relaxed) || m_operations.SizeApprox() != 0 ? 0
+				                : cp == ChunkLead::CpDrain                                                                ? 1
+				                : cp == ChunkLead::CpBlocked                                                              ? 3
+				                : cp == ChunkLead::CpNoWork                                                               ? 4
+				                                                                                                          : 2;
+				commands0     = g_stage_stats.commands.load(std::memory_order_relaxed);
+			}
+			// KYTY_TRACE_PEEK_CENSUS (way B measurement): the idle time by cause
+			const bool     census    = ChunkLead::PeekCensusOn();
+			const int      census_cause = census && m_operations.SizeApprox() == 0 ? 1 : 0;
+			const uint64_t census_t0 = census ? ChunkLead::Tsc() : 0;
+			bool have_operations = false;
+			{
+				const Common::SlowFrame::Scope slow_idle(Common::SlowFrame::ExecIdle); // KYTY_TRACE_SLOW_FRAMES
+				StallWatch::g_exec_idle_since.store(std::chrono::steady_clock::now().time_since_epoch().count(),
+				                                    std::memory_order_release); // KYTY_DIAG_STALL_WATCH_IDLE_MS
+				have_operations = WaitForOperations();
+				StallWatch::g_exec_idle_since.store(0, std::memory_order_release);
+			}
+			if (!have_operations) {
 				break;
 			}
+			if (census) ChunkLead::NoteExecIdle(census_cause, ChunkLead::Tsc() - census_t0);
 			if (g_gpu_stage_stats) {
+				const auto idle_ns = StageNowNs() - idle_start;
 				g_stage_stats.execution_idle.fetch_add(1, std::memory_order_relaxed);
-				g_stage_stats.execution_idle_ns.fetch_add(StageNowNs() - idle_start, std::memory_order_relaxed);
+				g_stage_stats.execution_idle_ns.fetch_add(idle_ns, std::memory_order_relaxed);
+				if (ChunkLead::On()) {
+					ChunkLead::NoteIdle(idle_ns, idle_cause, g_stage_stats.commands.load(std::memory_order_relaxed) != commands0);
+				}
 				// KYTY_TRACE_FRAME_TIMELINE (needs KYTY_TRACE_PERF for the idle clock): idle stretches of 200 us or more.
-				if (const uint64_t idle_ns = StageNowNs() - idle_start; idle_ns >= 200000u && FrameTimeline::Active()) {
+				if (idle_ns >= 200000u && FrameTimeline::Active()) {
 					FrameTimeline::Event("idle dur_us=%llu", static_cast<unsigned long long>(idle_ns / 1000u));
 				}
 			}
@@ -938,17 +999,330 @@ void GuestGpu::ExecutionThread() {
 			perf_process.emplace(PerfKind::Process);
 			live_busy.emplace();
 		}
-		operation->processor->Execute(*operation);
+		if (ChunkCensus::CheckOn()) {
+			// KYTY_CHECK_CHUNKS=2 (project 15, the oracle): whether this operation is a chunk member.
+			const auto kind = operation->kind;
+			const int  k    = (kind == GpuOperationKind::DrawIndex || kind == GpuOperationKind::DrawAuto) ? 1
+			                  : kind == GpuOperationKind::DispatchDirect                                 ? 2
+			                  : (kind == GpuOperationKind::DrawIndirect || kind == GpuOperationKind::DispatchIndirect) ? 3
+			                                                                                            : 0;
+			ChunkCensus::t_member = ChunkCensus::IsMember(operation->processor == m_gfx_cp.get(), operation->pass_id, k);
+		}
+		if (ChunkLead::On()) {
+			// KYTY_TRACE_CHUNK_LEAD (project 15 N1): the lead of the chunks (members as in the oracle).
+			const auto kind   = operation->kind;
+			const bool member = operation->processor == m_gfx_cp.get() &&
+			                    (kind == GpuOperationKind::DrawIndex || kind == GpuOperationKind::DrawAuto ||
+			                     kind == GpuOperationKind::DispatchDirect);
+			const auto resolved = m_resolved.SizeApprox();
+			ChunkLead::NoteOperation(member ? ChunkLead::TargetPass(operation->pass_id) : -1, operation->sequence,
+			                         m_operations.SizeApprox() + resolved, resolved, operation->emit_tsc);
+		}
+		if (operation->resolved != nullptr) {
+			// Project 15 N2.2: a helper may be resolving it; its wait is outside the work scopes.
+			struct Scopes {
+				std::optional<PerfScope>*                perf;
+				std::optional<Common::LiveAb::BusyScope>* live;
+			} scopes {&perf_process, &live_busy};
+			const uint64_t claim_t0 = ChunkLead::PeekCensusOn() ? ChunkLead::Tsc() : 0; // (way B measurement)
+			const Common::SlowFrame::Scope slow_claim(Common::SlowFrame::Claim); // KYTY_TRACE_SLOW_FRAMES
+			ClaimResolved(
+			    *operation,
+			    [](void* context, bool waiting) {
+				    auto* s = static_cast<Scopes*>(context);
+				    if (waiting) {
+					    s->live->reset();
+					    s->perf->reset();
+				    } else {
+					    s->perf->emplace(PerfKind::Process);
+					    s->live->emplace();
+				    }
+			    },
+			    &scopes);
+			if (claim_t0 != 0) ChunkLead::NoteExecClaim(ChunkLead::Tsc() - claim_t0);
+		}
+		// KYTY_TRACE_CHUNK_PLAN (project 15 N4.0, diagnostic): how many chunk-member draws with a ready slot follow in the
+		// queue when the execution thread opens a chunk, and what ends it. Nothing changes.
+		static const bool plan_census = std::getenv("KYTY_TRACE_CHUNK_PLAN") != nullptr;
+		// KYTY_CHECK_PEEK=2 (project 15 N4.1): the opening also peeks every draw of the chunk ahead (PeekAhead).
+		static const bool peek_ahead = [] {
+			const char* env    = std::getenv("KYTY_CHECK_PEEK");
+			const char* oracle = std::getenv("KYTY_CHECK_CHUNKS");
+			// N5.3: the helpers build the plans; only under the oracle does the opening build them (its first preparation).
+			(void)env;
+			return oracle != nullptr && oracle[0] == '2';
+		}();
+		if (plan_census || peek_ahead) {
+			struct PlanCensus {
+				uint32_t                remaining = 0;
+				std::array<uint64_t, 5> chunks {}, draws {}, end {};
+				uint64_t                member_draws = 0, own_not_ready = 0, others = 0;
+			};
+			static PlanCensus pc;
+			const auto        is_member = [&](const GpuOperation& op) {
+                const auto kind = op.kind;
+                return op.processor == m_gfx_cp.get() && (kind == GpuOperationKind::DrawIndex || kind == GpuOperationKind::DrawAuto) &&
+                       ChunkLead::TargetPass(op.pass_id) >= 0;
+			};
+			const auto ready = [](const GpuOperation& op) {
+				return op.resolved != nullptr &&
+				       RenderExecutor::TryClaimResolvedDraw(op.resolved, false) == RenderExecutor::ResolvedClaim::Ready;
+			};
+			if (!is_member(*operation)) {
+				pc.remaining = 0;
+				pc.others++;
+			} else {
+				pc.member_draws++;
+				if (pc.remaining > 0) {
+					pc.remaining--;
+				} else if (!ready(*operation)) {
+					pc.own_not_ready++;
+				} else {
+					// end: 0 another operation, 1 a slot not resolved yet, 2 an empty slot, 3 the limit 128, 4 the queue's end
+					uint32_t k = 1, end = 3;
+					for (; k < 128u; k++) {
+						const auto* next = m_resolved.PeekAt(k - 1u);
+						if (next == nullptr) {
+							end = 4;
+							break;
+						}
+						if (!is_member(*next)) {
+							end = 0;
+							break;
+						}
+						if (next->resolved == nullptr) {
+							end = 2;
+							break;
+						}
+						const auto claim = RenderExecutor::TryClaimResolvedDraw(next->resolved, false);
+						if (claim != RenderExecutor::ResolvedClaim::Ready) {
+							end = claim == RenderExecutor::ResolvedClaim::Empty ? 2u : 1u;
+							break;
+						}
+					}
+					if (peek_ahead) {
+						auto&      executor = m_renderer.GetRenderExecutor();
+						const auto peek_one = [&](const GpuOperation& op, uint32_t distance) {
+							const bool indexed = op.kind == GpuOperationKind::DrawIndex;
+							if (indexed) {
+								const auto& args = op.draw_index;
+								executor.PeekAhead(op.resolved, *op.state.context, *op.state.user_config, *op.state.shaders, true,
+								                   args.index_count, 1u /* instances: set when executed (ResolveNumInstances); not in the key */, args.index_type_and_size,
+								                   args.render_target_slice_offset, args.indirect.address, distance,
+								                   reinterpret_cast<uint64_t>(args.index_addr));
+							} else {
+								const auto& args = op.draw_auto;
+								executor.PeekAhead(op.resolved, *op.state.context, *op.state.user_config, *op.state.shaders, false,
+								                   args.vertex_count, 1u, 0, args.render_target_slice_offset,
+								                   args.indirect.address, distance);
+							}
+						};
+						g_ahead.opened++;
+						{
+							// KYTY_TRACE_PEEK_CENSUS: the plans' build, counted to the opening draw (a member)
+							const bool floor_was  = ChunkLead::t_floor_on;
+							ChunkLead::t_floor_on = ChunkLead::PeekCensusOn();
+							struct FloorRestore {
+								bool was;
+								~FloorRestore() { ChunkLead::t_floor_on = was; }
+							} const floor_restore {floor_was};
+							const ChunkLead::FloorTimer build_timer(ChunkLead::FpBuild);
+							peek_one(*operation, 0);
+							for (uint32_t i = 1; i < k; i++) peek_one(*m_resolved.PeekAt(i - 1u), i);
+						}
+						if ((g_ahead.opened & ((1u << 15u) - 1u)) == 0) {
+							const auto& a    = g_ahead;
+							const auto  join = [](const auto& v) {
+                                std::string out;
+                                for (size_t i = 0; i < v.size(); i++) out += std::string(i == 0 ? "" : "|") + std::to_string(v[i]);
+                                return out;
+							};
+							std::fprintf(stderr,
+							             "PERF peek_ahead opened=%llu planned=%llu gated[-|slot|shaders|adoptable|counts|color_op|topology|mesh|indirect_early|indirect_refused]=%s "
+							             "compile=%llu peeked=%s front=%s programs[compared|bad|share_diff|lost]=%llu|%llu|%llu|%llu "
+							             "by_distance=%s fault=%llu|%llu key[compared|bad|unchecked|find_diff]=%llu|%llu|%llu|%llu fault=%llu|%llu "
+							             "images[stages|compared|bad|moved|stale|lost]=%llu|%llu|%llu|%llu|%llu|%llu compared_by_distance=%s "
+							             "moved_by_distance=%s fault=%llu|%llu\n",
+							             static_cast<unsigned long long>(a.opened), static_cast<unsigned long long>(a.planned),
+							             join(a.gated).c_str(), static_cast<unsigned long long>(a.compile), join(a.peeked).c_str(),
+							             join(a.front).c_str(), static_cast<unsigned long long>(a.p_compared),
+							             static_cast<unsigned long long>(a.p_bad), static_cast<unsigned long long>(a.p_share_diff),
+							             static_cast<unsigned long long>(a.p_lost), join(a.p_by_distance).c_str(),
+							             static_cast<unsigned long long>(a.p_injected), static_cast<unsigned long long>(a.p_detected),
+							             static_cast<unsigned long long>(a.k_compared), static_cast<unsigned long long>(a.k_bad),
+							             static_cast<unsigned long long>(a.k_unchecked), static_cast<unsigned long long>(a.k_find_diff),
+							             static_cast<unsigned long long>(a.k_injected), static_cast<unsigned long long>(a.k_detected),
+							             static_cast<unsigned long long>(a.i_stages), static_cast<unsigned long long>(a.i_compared),
+							             static_cast<unsigned long long>(a.i_bad), static_cast<unsigned long long>(a.i_moved),
+							             static_cast<unsigned long long>(a.i_stale), static_cast<unsigned long long>(a.i_lost),
+							             join(a.i_compared_by_distance).c_str(), join(a.i_moved_by_distance).c_str(),
+							             static_cast<unsigned long long>(a.i_injected), static_cast<unsigned long long>(a.i_detected));
+							std::fprintf(stderr,
+							             "PERF plan_oracle plan_draws=%llu no_plan=%llu rejected=%llu pipeline_bad=%llu set_hint=%llu "
+							             "set_hint_missed=%llu images_moved_any=%s images_stale_any=%s used_draws=%llu used_pipeline=%llu "
+							             "buffers[answered|today]=%llu|%llu describe_failed=%llu lookup_busy=%llu helper_writes=%llu\n",
+							             static_cast<unsigned long long>(a.plan_draws), static_cast<unsigned long long>(a.no_plan),
+							             static_cast<unsigned long long>(a.rejected), static_cast<unsigned long long>(a.pipeline_bad),
+							             static_cast<unsigned long long>(a.set_hint), static_cast<unsigned long long>(a.set_hint_missed),
+							             join(a.i_moved_any).c_str(), join(a.i_stale_any).c_str(), static_cast<unsigned long long>(a.used_draws),
+							             static_cast<unsigned long long>(a.used_pipeline), static_cast<unsigned long long>(a.buffers_answered),
+							             static_cast<unsigned long long>(a.buffers_today), static_cast<unsigned long long>(a.describe_failed),
+							             static_cast<unsigned long long>(a.lookup_busy), [] {
+								             uint64_t n = 0;
+								             for (const auto& w: g_helper_translator_writes) n += w.load(std::memory_order_relaxed);
+								             return static_cast<unsigned long long>(n);
+							             }());
+						}
+					}
+					const uint32_t bucket = k == 1u ? 0u : k < 16u ? 1u : k < 64u ? 2u : k < 128u ? 3u : 4u;
+					pc.chunks[bucket]++;
+					pc.draws[bucket] += k;
+					pc.end[end]++;
+					pc.remaining = k - 1u;
+					uint64_t chunks = 0;
+					for (const auto n: pc.chunks) chunks += n;
+					if (plan_census && (chunks & ((1u << 16u) - 1u)) == 0) {
+						const auto join = [](const auto& a) {
+							std::string out;
+							for (size_t i = 0; i < a.size(); i++) out += std::string(i == 0 ? "" : "|") + std::to_string(a[i]);
+							return out;
+						};
+						std::fprintf(stderr,
+						             "PERF chunk_plan chunks[1|2-15|16-63|64-127|128]=%s draws=%s end[other|unresolved|empty|limit|queue_end]=%s "
+						             "member_draws=%llu own_not_ready=%llu others=%llu\n",
+						             join(pc.chunks).c_str(), join(pc.draws).c_str(), join(pc.end).c_str(),
+						             static_cast<unsigned long long>(pc.member_draws), static_cast<unsigned long long>(pc.own_not_ready),
+						             static_cast<unsigned long long>(pc.others));
+					}
+				}
+			}
+		}
+		// KYTY_CHECK_PEEK (project 15 N3 S2a): the peek's split by chunk-member draw.
+		static const bool peek_split = std::getenv("KYTY_CHECK_PEEK") != nullptr;
+		if (peek_split) {
+			const auto kind = operation->kind;
+			PeekOperationBegin(operation->processor == m_gfx_cp.get() &&
+			                   (kind == GpuOperationKind::DrawIndex || kind == GpuOperationKind::DrawAuto) &&
+			                   ChunkLead::TargetPass(operation->pass_id) >= 0);
+		}
+		// KYTY_TRACE_PEEK_CENSUS (project 15 N3.0; 10.11 way B: every operation): the execution thread's time by part, per
+		// bucket - the three passes' draws, the other graphics draws and GPU indirect packets, dispatches, other operations.
+		int                                 floor_pass = -1;
+		std::optional<ChunkLead::FloorTimer> floor_total;
+		if (ChunkLead::PeekCensusOn()) {
+			const auto kind = operation->kind;
+			if (operation->processor == m_gfx_cp.get() && (kind == GpuOperationKind::DrawIndex || kind == GpuOperationKind::DrawAuto ||
+			                                               kind == GpuOperationKind::DrawIndirect)) {
+				const int pass = kind == GpuOperationKind::DrawIndirect ? -1 : ChunkLead::TargetPass(operation->pass_id);
+				floor_pass     = pass >= 0 ? pass : ChunkLead::BucketOtherDraws;
+			} else if (kind == GpuOperationKind::DispatchDirect || kind == GpuOperationKind::DispatchIndirect) {
+				floor_pass = ChunkLead::BucketDispatches;
+			} else {
+				floor_pass = ChunkLead::BucketOther;
+			}
+			ChunkLead::t_floor_on   = true;
+			ChunkLead::t_floor_wait = PassCensus::t_wait_ns;
+			floor_total.emplace(ChunkLead::FpTotal);
+		}
+		// Way B W0 Table B: the in-order work counters before a draw (the coverage of a helper's block)
+		struct CoverSnap {
+			uint64_t used, pipeline, today, set_missed, slow, work, images, barriers, begins, scans;
+		};
+		const auto cover_snap = [] {
+			return CoverSnap {g_ahead.used_draws,           g_ahead.used_pipeline,       g_ahead.buffers_today,
+			                  g_ahead.set_hint_missed,      t_peek_slow,                 BufferCache::t_obtain_work,
+			                  ChunkCensus::t_image_creates, DrawCoverage::t_barriers,    DrawCoverage::t_render_begins,
+			                  DrawCoverage::t_scans};
+		};
+		const bool      cover_on = floor_pass >= 0 && floor_pass <= ChunkLead::BucketOtherDraws;
+		const CoverSnap cover0   = cover_on ? cover_snap() : CoverSnap {};
+		ChunkLead::t_floor_bucket = cover_on ? floor_pass : -1;
+		if (PassCensus::Enabled()) {
+			// KYTY_TRACE_PASS_CENSUS (PASS_EXEC): execution time per marker pass, less the card waits inside.
+			const auto kind  = operation->kind;
+			const int  k     = (kind == GpuOperationKind::DrawIndex || kind == GpuOperationKind::DrawAuto ||
+			                    kind == GpuOperationKind::DrawIndirect)
+			                       ? 1
+			                       : (kind == GpuOperationKind::DispatchDirect || kind == GpuOperationKind::DispatchIndirect) ? 2 : 0;
+			const auto pass  = operation->pass_id;
+			const auto wait0 = PassCensus::t_wait_ns;
+			const bool processor_is_gfx = operation->processor == m_gfx_cp.get();
+			const auto dl0 = ChunkCensus::t_downloads, im0 = ChunkCensus::t_image_creates;
+			const auto pi0 = ChunkCensus::t_pipelines, sh0 = ChunkCensus::t_shaders;
+			const auto t0    = std::chrono::steady_clock::now();
+			operation->processor->Execute(*operation);
+			const auto ns = static_cast<uint64_t>(
+			    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+			PassCensus::NoteExecute(pass, k, ns, PassCensus::t_wait_ns - wait0, processor_is_gfx);
+			if (ChunkCensus::Enabled()) {
+				// KYTY_TRACE_CHUNK_CENSUS (S1a): how the parallel translation would group this operation.
+				ChunkCensus::OpInfo info;
+				info.gfx_queue      = processor_is_gfx;
+				info.pass           = pass;
+				info.kind           = kind == GpuOperationKind::DrawIndirect ? 3 : k;
+				info.ns             = ns > PassCensus::t_wait_ns - wait0 ? ns - (PassCensus::t_wait_ns - wait0) : 0u;
+				info.gpu_waits      = PassCensus::t_wait_ns - wait0;
+				info.download_bytes = ChunkCensus::t_downloads - dl0;
+				info.image_creates  = ChunkCensus::t_image_creates - im0;
+				info.pipelines      = ChunkCensus::t_pipelines - pi0;
+				info.shaders        = ChunkCensus::t_shaders - sh0;
+				ChunkCensus::Note(info);
+			}
+		} else {
+			operation->processor->Execute(*operation);
+		}
+		if (floor_total) {
+			floor_total.reset();
+			ChunkLead::t_floor_wait = PassCensus::t_wait_ns - ChunkLead::t_floor_wait; // the card waits inside the operation
+			if (ChunkLead::t_floor_wait != 0) ChunkLead::NoteCardWait(operation->pass_id, ChunkLead::t_floor_wait);
+			if (cover_on) {
+				const CoverSnap c1     = cover_snap();
+				const int       reason = c1.used == cover0.used                                         ? 1
+				                         : c1.pipeline == cover0.pipeline                               ? 2
+				                         : c1.today != cover0.today                                     ? 3
+				                         : c1.set_missed != cover0.set_missed || c1.slow != cover0.slow ? 4
+				                         : c1.barriers != cover0.barriers                               ? 5
+				                         : c1.begins != cover0.begins                                   ? 6
+				                         : c1.work != cover0.work || c1.images != cover0.images         ? 7
+				                         : c1.scans != cover0.scans                                     ? 8
+				                                                                                        : 0;
+				// the same without the buffer condition (B3), to see the conditions behind it
+				const int reason2 = reason != 3 ? reason
+				                    : c1.set_missed != cover0.set_missed || c1.slow != cover0.slow ? 4
+				                    : c1.barriers != cover0.barriers                               ? 5
+				                    : c1.begins != cover0.begins                                   ? 6
+				                    : c1.work != cover0.work || c1.images != cover0.images         ? 7
+				                    : c1.scans != cover0.scans                                     ? 8
+				                                                                                   : 0;
+				ChunkLead::NoteCover(floor_pass, reason, reason2);
+				ChunkLead::t_floor_bucket = -1;
+			}
+			ChunkLead::NoteFloor(floor_pass);
+			ChunkLead::t_floor_on = false;
+		}
+		if (peek_split) PeekOperationEnd();
 		{
 			// KYTY_TEST_PAD_RECORD / KYTY_TEST_PAD_REPLAY: the gameplay-start anchor (debugSample.h GameplayStartNs).
 			static uint32_t last_present = 0, draws_in_frame = 0, frames_in_row = 0;
 			const auto      kind         = operation->kind;
 			if (kind == GpuOperationKind::DrawIndex || kind == GpuOperationKind::DrawAuto || kind == GpuOperationKind::DrawIndirect) {
 				draws_in_frame++;
+				Common::SlowFrame::CountOne(Common::SlowFrame::Draws); // KYTY_TRACE_SLOW_FRAMES
+				Common::LiveAb::g_phase_draws.fetch_add(1, std::memory_order_relaxed);
+			} else if (kind == GpuOperationKind::DispatchDirect || kind == GpuOperationKind::DispatchIndirect) {
+				Common::SlowFrame::CountOne(Common::SlowFrame::Dispatches); // KYTY_TRACE_SLOW_FRAMES
+				Common::LiveAb::g_phase_dispatches.fetch_add(1, std::memory_order_relaxed);
 			}
+			// KYTY_TEST_GAMEPLAY_DRAWS (default 3000, 11.11): draws per frame that count as gameplay; the open world near
+			// the inn has ~2 200, so its anchor came only when the walk reached a busier view. Recording and replay must
+			// use the same value.
+			static const uint32_t gameplay_draws = [] {
+				const char* value = std::getenv("KYTY_TEST_GAMEPLAY_DRAWS");
+				return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 3000u;
+			}();
 			const uint32_t present = DebugPresentCount().load(std::memory_order_relaxed);
 			if (present != last_present) {
-				frames_in_row  = draws_in_frame > 3000u ? frames_in_row + 1u : 0u;
+				frames_in_row  = draws_in_frame > gameplay_draws ? frames_in_row + 1u : 0u;
 				draws_in_frame = 0;
 				last_present   = present;
 				if (frames_in_row == 8u && GameplayStartNs().load(std::memory_order_relaxed) == 0) {
@@ -962,7 +1336,14 @@ void GuestGpu::ExecutionThread() {
 		operation.reset();
 		m_executed.Publish(sequence);
 		if (m_pending_commands.load(std::memory_order_acquire) != 0) {
-			RunCommands();
+			const Common::SlowFrame::Scope slow_commands(Common::SlowFrame::Commands); // KYTY_TRACE_SLOW_FRAMES
+			if (ChunkLead::PeekCensusOn()) { // (way B measurement: the commands served between operations)
+				const uint64_t t0 = ChunkLead::Tsc(), w0 = PassCensus::t_wait_ns;
+				RunCommands();
+				ChunkLead::NoteExecCommands(ChunkLead::Tsc() - t0, PassCensus::t_wait_ns - w0);
+			} else {
+				RunCommands();
+			}
 		}
 		if (++unnotified >= NotifyInterval) {
 			m_executed.Notify();
@@ -983,11 +1364,58 @@ void GuestGpu::ExecutionThread() {
 
 static const char* IndirectDrawLayout(const IndirectDrawRegisters& registers, ShaderIndirectDrawInfo& sgprs);
 
+// A GPU indirect packet's arguments (without the SGPR layout): CommandProcessor::DrawIndirectGpu and, for its plan (project
+// 15 N7.2), the resolve dispatcher - one builder, so the two cannot differ.
+static DrawIndirectGpuArgs MakeDrawIndirectGpuArgs(const GpuOperation& operation) {
+	const auto& indirect = operation.draw_indirect;
+	const bool  indexed  = indirect.indexed;
+	return DrawIndirectGpuArgs {
+	    .args_addr           = indirect.args_base + indirect.data_offset,
+	    .count_addr          = reinterpret_cast<uint64_t>(indirect.count_addr),
+	    .max_count           = indirect.max_count,
+	    .stride              = indirect.stride,
+	    .index_base_addr     = indexed ? indirect.index_base : 0,
+	    .index_buffer_size   = indexed ? indirect.index_buffer_size : 0,
+	    .index_type_and_size = indirect.index_type,
+	    .indexed             = indexed,
+	};
+}
+
+// Based on TheCruZ/KytyPS5-GTA daaf45201 (graphicsRun.cpp), GPL-2.0.
+// Project 15 N2.2 (design: the analysis session's n2-2-doprecyzowanie.md; the only path since 10.11, live A/B -0.04% se
+// 1.08, the execution thread's waits as before): a helper thread resolves the draws and dispatches, the resolve thread
+// hands it tasks in stream order. KYTY_CHECK_RESOLVE=2 (diagnostic) - the resolve thread resolves each one itself too
+// (the reference, used) and the helper's result is compared before the operation executes; KYTY_CHECK_RESOLVE_FAULT=N -
+// every N-th helper result gets an error.
+static bool ResolveCheckOn() {
+	static const bool on = [] {
+		const char* env = std::getenv("KYTY_CHECK_RESOLVE");
+		const bool  o   = env != nullptr && env[0] == '2';
+		if (o) std::fprintf(stderr, "CHECK_RESOLVE=2: the resolve thread and the helper resolve every operation; compared\n");
+		return o;
+	}();
+	return on;
+}
+static uint32_t ResolveFaultEvery() {
+	static const uint32_t every = [] {
+		const char* env = std::getenv("KYTY_CHECK_RESOLVE_FAULT");
+		return env != nullptr ? static_cast<uint32_t>(std::strtoul(env, nullptr, 10)) : 0u;
+	}();
+	return every;
+}
+
 // Based on TheCruZ/KytyPS5-GTA daaf45201 (graphicsRun.cpp), GPL-2.0.
 void GuestGpu::ResolveThread() {
 	KYTY_PROFILER_THREAD("Thread_GpuResolve");
-	Config::ConfigureGpuStageThread(Config::GpuStageThread::Resolve);
-	auto& executor = m_renderer.GetRenderExecutor();
+	// The command processor's SMT sibling: the operations it writes are in that core's caches; the helper resolves.
+	Config::ConfigureGpuStageThread(Config::GpuStageThread::ResolveDispatcher);
+	if (ChunkLead::On()) ChunkLead::ResolveThreadStart(false, "resolve"); // KYTY_TRACE_CHUNK_LEAD (the sampler: the helper's)
+	auto&          executor   = m_renderer.GetRenderExecutor();
+	const bool     check      = ResolveCheckOn();
+	const uint32_t fault_each = check ? ResolveFaultEvery() : 0u;
+	uint64_t       members    = 0;
+	auto&          hs         = m_helper_stats;
+	auto           report_at  = std::chrono::steady_clock::now();
 	for (;;) {
 		auto operation = m_operations.TryPop();
 		if (!operation) {
@@ -999,28 +1427,94 @@ void GuestGpu::ResolveThread() {
 			if (g_gpu_stage_stats) g_stage_stats.resolve_idle_ns.fetch_add(StageNowNs() - idle_start, std::memory_order_relaxed);
 		}
 		// The register snapshots stay valid until the operation executed.
-		const auto& state = operation->state;
-		switch (operation->kind) {
-			case GpuOperationKind::DrawIndex:
-			case GpuOperationKind::DrawAuto:
-				operation->resolved = executor.ResolveDrawAhead(*state.context, *state.user_config, *state.shaders, {});
-				break;
-			case GpuOperationKind::DrawIndirect: {
-				// The layout a GPU indirect draw gets (none: the packet expands on the CPU, with patched registers).
-				ShaderIndirectDrawInfo indirect_draw;
-				if (IndirectDrawLayout(operation->draw_indirect.registers, indirect_draw) != nullptr) indirect_draw = {};
-				operation->resolved = executor.ResolveDrawAhead(*state.context, *state.user_config, *state.shaders, indirect_draw);
-				break;
+		const auto& state    = operation->state;
+		const auto  kind     = operation->kind;
+		const bool  dispatch = kind == GpuOperationKind::DispatchDirect || kind == GpuOperationKind::DispatchIndirect;
+		const bool  draw     = kind == GpuOperationKind::DrawIndex || kind == GpuOperationKind::DrawAuto || kind == GpuOperationKind::DrawIndirect;
+		ShaderIndirectDrawInfo indirect_draw;
+		if (kind == GpuOperationKind::DrawIndirect) {
+			// The layout a GPU indirect draw gets (none: the packet expands on the CPU, with patched registers).
+			if (IndirectDrawLayout(operation->draw_indirect.registers, indirect_draw) != nullptr) indirect_draw = {};
+		}
+		const bool lead = ChunkLead::On(); // KYTY_TRACE_CHUNK_LEAD: the resolve thread's work
+		if (draw || dispatch) {
+			RenderExecutor::ResolveTask task;
+			task.context       = state.context;
+			task.user_config   = state.user_config;
+			task.shaders       = state.shaders;
+			task.indirect_draw = indirect_draw;
+			task.dispatch      = dispatch;
+			task.pass_id       = operation->pass_id;
+			if (draw && (kind == GpuOperationKind::DrawIndex || kind == GpuOperationKind::DrawAuto)) {
+				// N5.1/N7.1: a direct draw of the graphics queue gets a plan (built on the helper, N5.3) - every one, not only
+				// the three passes' (10.11: no pass ids needed, so no dependence on the game's marker strings).
+				task.member = operation->processor == m_gfx_cp.get();
+				if (kind == GpuOperationKind::DrawIndex) {
+					const auto& args   = operation->draw_index;
+					task.indexed       = true;
+					task.draw_count    = args.index_count;
+					task.index_type    = args.index_type_and_size;
+					task.slice_offset  = args.render_target_slice_offset;
+					task.draw_indirect = args.indirect.address;
+					task.index_address = reinterpret_cast<uint64_t>(args.index_addr);
+				} else {
+					const auto& args   = operation->draw_auto;
+					task.draw_count    = args.vertex_count;
+					task.slice_offset  = args.render_target_slice_offset;
+					task.draw_indirect = args.indirect.address;
+				}
 			}
-			case GpuOperationKind::DispatchDirect:
-			case GpuOperationKind::DispatchIndirect: {
-				const auto& dispatch = operation->dispatch;
-				operation->resolved  = executor.ResolveDispatchAhead(
-				    *state.shaders, dispatch.thread_group_x, dispatch.thread_group_y, dispatch.thread_group_z, dispatch.mode,
-				    operation->kind == GpuOperationKind::DispatchIndirect, operation->processor->IsAsyncComputeQueue());
-				break;
+			if (kind == GpuOperationKind::DrawIndirect && indirect_draw.enabled && operation->processor == m_gfx_cp.get()) {
+				// N7.2: a GPU indirect packet gets a plan too (its arguments; the helper runs the early checks)
+				task.member                      = true;
+				task.gpu_indirect                = true;
+				task.indexed                     = operation->draw_indirect.indexed;
+				task.draw_count                  = 1;
+				task.index_type                  = operation->draw_indirect.index_type;
+				task.indirect_args               = MakeDrawIndirectGpuArgs(*operation);
+				task.indirect_args.indirect_draw = indirect_draw;
 			}
-			default: break;
+			if (dispatch) {
+				const auto& d      = operation->dispatch;
+				task.groups_x      = d.thread_group_x;
+				task.groups_y      = d.thread_group_y;
+				task.groups_z      = d.thread_group_z;
+				task.mode          = d.mode;
+				task.indirect      = kind == GpuOperationKind::DispatchIndirect;
+				task.async_compute = operation->processor->IsAsyncComputeQueue();
+			}
+			auto& slot = executor.TakeResolvedSlot();
+			if (check) {
+				// The reference: this thread resolves it as the helper will (the same function), the helper's result is
+				// compared with it before the operation executes; the operation uses the reference.
+				if (lead) {
+					ChunkLead::g_resolving.fetch_add(1, std::memory_order_relaxed);
+					std::fill(std::begin(ChunkLead::t_parts), std::end(ChunkLead::t_parts), uint64_t {0});
+					ChunkLead::t_part_buffers = 0;
+					ChunkLead::ResolveOperationStart();
+				}
+				const uint64_t lead_t0 = lead ? ChunkLead::Tsc() : 0;
+				task.slot             = &slot;
+				const bool ok         = executor.ResolveTaskInto(slot, task);
+				if (lead) {
+					ChunkLead::NoteResolve(operation->pass_id, dispatch, ChunkLead::Tsc() - lead_t0, ok);
+					ChunkLead::g_resolving.fetch_sub(1, std::memory_order_relaxed);
+				}
+				auto& helper_slot = executor.TakeResolvedSlot();
+				RenderExecutor::SetResolvedCheckSlot(&slot, &helper_slot);
+				task.slot  = &helper_slot;
+				task.fault = fault_each != 0 && ++members % fault_each == 0 ? static_cast<uint32_t>(members / fault_each) : 0u;
+			} else {
+				task.slot = &slot;
+			}
+			// N5.2: with two helpers the tasks go in turns of 8 (warm caches); slots are independent, the execution thread
+			// takes them in order by their phase.
+			task.seq    = m_tasks_pushed; // N5.3: the lead is this minus the operations the execution thread began
+			auto& queue = (m_deal_turn++ & 8u) != 0 ? m_tasks2 : m_tasks;
+			if (!queue.TryPush(task)) EXIT("resolve helper: the task queue is full\n"); // a task holds a slot: never full
+			m_tasks_pushed++;
+			hs.tasks.fetch_add(1, std::memory_order_relaxed);
+			operation->resolved = &slot;
 		}
 		if (g_gpu_stage_stats) {
 			if (!m_resolved.TryPush(*operation)) {
@@ -1033,6 +1527,240 @@ void GuestGpu::ResolveThread() {
 			m_resolved.Push(std::move(*operation));
 		}
 		RingExecution();
+		if (g_gpu_stage_stats) {
+			// PERF resolve_helper every ~5 s (N2.2): the helper's tasks, the execution thread's claims and waits.
+			const auto now = std::chrono::steady_clock::now();
+			if (now - report_at >= std::chrono::seconds(5)) {
+				report_at      = now;
+				const auto get = [](const std::atomic<uint64_t>& a) { return static_cast<unsigned long long>(a.load(std::memory_order_relaxed)); };
+				std::fprintf(stderr,
+				             "PERF resolve_helper tasks=%llu done=%llu empty=%llu stolen=%llu skipped=%llu claim[ready|running|stolen]=%llu|%llu|%llu "
+				             "wait=%llu/%.1fms wait_cmd_ms=%.1f wait_max_us=%.1f wait_commands=%llu check[both_empty|refused|reads_differ|compared|bad]=%llu|%llu|%llu|%llu|%llu "
+				             "fault[injected|compared|detected]=%llu|%llu|%llu plans[built|short]=%llu|%llu\n",
+				             get(hs.tasks), get(hs.done), get(hs.empty), get(hs.stolen), get(hs.skipped), get(hs.ready), get(hs.running),
+				             get(hs.pending), get(hs.waits), static_cast<double>(get(hs.wait_ns)) / 1e6, static_cast<double>(get(hs.wait_cmd_ns)) / 1e6,
+				             static_cast<double>(get(hs.wait_max_ns)) / 1e3, get(hs.wait_commands), get(hs.both_empty),
+				             get(hs.refused), get(hs.reads_differ), get(hs.compared), get(hs.bad), get(hs.injected), get(hs.injected_compared),
+				             get(hs.detected), get(hs.plans), get(hs.plans_short));
+				{
+					// N5.3: the plans the helpers built, as the execution thread checked and used them (read racily: a report)
+					const auto& a       = g_ahead;
+					uint64_t    writes  = 0;
+					for (const auto& w: g_helper_translator_writes) writes += w.load(std::memory_order_relaxed);
+					const auto  u       = [](uint64_t v) { return static_cast<unsigned long long>(v); };
+					std::fprintf(stderr,
+					             "PERF helper_plans programs[compared|bad|share_diff|lost]=%llu|%llu|%llu|%llu fault=%llu|%llu "
+					             "key[compared|bad|unchecked|find_diff]=%llu|%llu|%llu|%llu fault=%llu|%llu used_draws=%llu used_pipeline=%llu "
+					             "buffers[answered|today]=%llu|%llu helper_writes=%llu\n",
+					             u(a.p_compared), u(a.p_bad), u(a.p_share_diff), u(a.p_lost), u(a.p_injected), u(a.p_detected),
+					             u(a.k_compared), u(a.k_bad), u(a.k_unchecked), u(a.k_find_diff), u(a.k_injected), u(a.k_detected),
+					             u(a.used_draws), u(a.used_pipeline), u(a.buffers_answered), u(a.buffers_today), u(writes));
+					// N7.1: the helpers' plan outcomes (why a draw got none), as each helper last published them
+					uint64_t o[HelperPlanSnap::Count] {};
+					for (const auto& h: g_helper_plan_snap) {
+						for (size_t i = 0; i < HelperPlanSnap::Count; i++) o[i] += h.v[i].load(std::memory_order_relaxed);
+					}
+					std::fprintf(stderr,
+					             "PERF helper_plan_outcome planned=%llu made=%llu compile=%llu describe_failed=%llu lookup_busy=%llu "
+					             "gated[slot|shaders|adopt|counts|colorop|topology|mesh|indirect_early|indirect_refused]="
+					             "%llu|%llu|%llu|%llu|%llu|%llu|%llu|%llu|%llu packets=%llu\n",
+					             u(o[0]), u(o[1]), u(o[2]), u(o[3]), u(o[4]), u(o[5]), u(o[6]), u(o[7]), u(o[8]), u(o[9]), u(o[10]), u(o[11]),
+					             u(o[12]), u(o[13]), u(o[14]));
+				}
+				std::string hist;
+				for (size_t i = 0; i < hs.hist_n.size(); i++) {
+					char buf[48];
+					std::snprintf(buf, sizeof(buf), "%s%llu/%.1f", i == 0 ? "" : " ", get(hs.hist_n[i]), static_cast<double>(get(hs.hist_ns[i])) / 1e6);
+					hist += buf;
+				}
+				std::fprintf(stderr, "PERF resolve_wait_hist count/ms[<5us <20 <100 <500 <2000 >=2000]=[%s]\n", hist.c_str());
+			}
+		}
+	}
+}
+
+// Project 15 N2.2: the resolve helper. It resolves the tasks in order into their slots; a task whose slot the execution
+// thread stole is skipped (its slot freed). It never waits for the resolve or execution thread.
+void GuestGpu::ResolveHelperThread(uint32_t index) {
+	KYTY_PROFILER_THREAD("Thread_GpuResolveHelper");
+	// a scratch slot of its own (>= 3: ShaderIR.h RecordsNullShare); the second helper (N5.2) the next one
+	ShaderRecompiler::IR::t_ahead_scratch_slot = 3 + index;
+	Config::ConfigureGpuStageThread(index == 0 ? Config::GpuStageThread::ResolveHelper : Config::GpuStageThread::ResolveHelper2);
+	const bool lead = ChunkLead::On();
+	if (lead) ChunkLead::ResolveThreadStart(index == 0, index == 0 ? "helper" : "helper2");
+	auto& executor = m_renderer.GetRenderExecutor();
+	auto& hs       = m_helper_stats;
+	auto& tasks    = index == 0 ? m_tasks : m_tasks2;
+	// N5.3: the helpers build plans (not under the oracle, whose execution thread builds them), for member draws with a
+	// lead of at least 32 operations - never making anyone wait.
+	static const bool helper_plans = [] {
+		const char* oracle = std::getenv("KYTY_CHECK_CHUNKS");
+		return !(oracle != nullptr && oracle[0] == '2');
+	}();
+	constexpr uint64_t PlanMargin = 32;
+	while (auto task = tasks.Pop()) {
+		if (helper_plans && task->member && !task->dispatch) {
+			const uint64_t claimed = m_tasks_claimed.load(std::memory_order_relaxed);
+			const uint64_t lead    = task->seq > claimed ? task->seq - claimed : 0u;
+			task->lead             = static_cast<uint32_t>(std::min<uint64_t>(lead, UINT32_MAX));
+			task->build_plan       = lead >= PlanMargin;
+			(task->build_plan ? hs.plans : hs.plans_short).fetch_add(1, std::memory_order_relaxed);
+		}
+		if (!RenderExecutor::BeginResolveTask(task->slot)) {
+			hs.skipped.fetch_add(1, std::memory_order_relaxed);
+			m_tasks_finished.fetch_add(1, std::memory_order_release);
+			continue;
+		}
+		if (lead) {
+			ChunkLead::g_resolving.fetch_add(1, std::memory_order_relaxed);
+			std::fill(std::begin(ChunkLead::t_parts), std::end(ChunkLead::t_parts), uint64_t {0});
+			ChunkLead::t_part_buffers = 0;
+			ChunkLead::ResolveOperationStart();
+		}
+		const uint64_t lead_t0 = lead ? ChunkLead::Tsc() : 0;
+		const bool     ok      = executor.ResolveTaskInto(*task->slot, *task);
+		if (lead) {
+			ChunkLead::NoteResolve(task->pass_id, task->dispatch, ChunkLead::Tsc() - lead_t0, ok);
+			ChunkLead::g_resolving.fetch_sub(1, std::memory_order_relaxed);
+		}
+		hs.done.fetch_add(1, std::memory_order_relaxed);
+		if (!ok) hs.empty.fetch_add(1, std::memory_order_relaxed);
+		m_tasks_finished.fetch_add(1, std::memory_order_release);
+	}
+}
+
+// Project 15 N2.2: the execution thread, before the operation executes (no lock held, the registers not yet swapped):
+// with KYTY_CHECK_RESOLVE=2 the helper's result is compared with the reference first; then the resolution is claimed - a
+// running one waited for (serving the other threads' commands meanwhile), a pending one stolen (the operation then
+// selects itself, as without a resolution).
+// Project 15 N6 (KYTY_TRACE_HELPER_WAITS=1, diagnostic): the execution thread's long waits for a helper (>= 0.5 ms) and its
+// steals, by pass and operation kind, with what the helpers had queued and whether the slot had begun. Execution thread.
+namespace {
+struct HelperWaitKey {
+	uint16_t pass = 0;
+	uint8_t  kind = 0;
+	bool operator<(const HelperWaitKey& o) const { return pass != o.pass ? pass < o.pass : kind < o.kind; }
+};
+struct HelperWaitStat {
+	uint64_t waits = 0, steals = 0, running = 0, queued = 0;
+	double   wait_ms = 0;
+};
+bool HelperWaitsOn() {
+	static const bool on = std::getenv("KYTY_TRACE_HELPER_WAITS") != nullptr;
+	return on;
+}
+std::map<HelperWaitKey, HelperWaitStat> g_helper_waits;
+uint64_t                                g_helper_wait_events = 0;
+void HelperWaitsReport() {
+	if ((++g_helper_wait_events & 511u) != 0) return;
+	std::vector<std::pair<HelperWaitKey, HelperWaitStat>> rows(g_helper_waits.begin(), g_helper_waits.end());
+	std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.second.wait_ms > b.second.wait_ms; });
+	const uint32_t frame = DebugPresentCount().load(std::memory_order_relaxed);
+	std::string    text;
+	for (size_t i = 0; i < rows.size() && i < 8; i++) {
+		const auto& [k, s] = rows[i];
+		char buf[256];
+		std::snprintf(buf, sizeof(buf), " | \"%s\" kind=%u waits=%llu ms=%.1f steals=%llu queued=%.1f",
+		              PassCensus::PassName(k.pass).c_str(), k.kind, static_cast<unsigned long long>(s.waits), s.wait_ms,
+		              static_cast<unsigned long long>(s.steals),
+		              s.waits != 0 ? static_cast<double>(s.queued) / s.waits : 0.0);
+		text += buf;
+	}
+	std::fprintf(stderr, "PERF helper_waits frame=%u%s\n", frame, text.c_str());
+}
+} // namespace
+
+void GuestGpu::ClaimResolved(GpuOperation& operation, void (*busy)(void* context, bool waiting), void* busy_context) {
+	auto* const slot = operation.resolved;
+	m_tasks_claimed.fetch_add(1, std::memory_order_relaxed); // N5.3: the helpers' lead
+	auto&       hs   = m_helper_stats;
+	const auto  wait_for = [&](RenderExecutor::ResolvedDraw* r, bool steal) {
+		auto       claim     = RenderExecutor::TryClaimResolvedDraw(r, steal);
+		if (claim != RenderExecutor::ResolvedClaim::Running) return claim;
+		hs.running.fetch_add(1, std::memory_order_relaxed);
+		busy(busy_context, true); // the wait is not work (as the idle wait of an empty queue)
+		const auto start       = std::chrono::steady_clock::now();
+		bool       commands    = false;
+		uint64_t   commands_ns = 0;
+		for (Common::SpinWait spin;;) {
+			claim = RenderExecutor::TryClaimResolvedDraw(r, steal);
+			if (claim != RenderExecutor::ResolvedClaim::Running) break;
+			if (m_pending_commands.load(std::memory_order_acquire) != 0) {
+				const auto c0 = std::chrono::steady_clock::now();
+				RunCommands();
+				commands_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - c0).count());
+				commands = true;
+				continue;
+			}
+			if (!spin.Spin()) std::this_thread::yield();
+		}
+		busy(busy_context, false);
+		const auto all = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+		const auto ns  = all > commands_ns ? all - commands_ns : 0u; // the wait for the helper alone
+		if (HelperWaitsOn() && ns >= 500000u) { // N6: a long wait
+			auto& s = g_helper_waits[{operation.pass_id, static_cast<uint8_t>(operation.kind)}];
+			s.waits++;
+			s.wait_ms += static_cast<double>(ns) / 1e6;
+			s.queued += m_tasks.SizeApprox() + m_tasks2.SizeApprox();
+			HelperWaitsReport();
+		}
+		hs.waits.fetch_add(1, std::memory_order_relaxed);
+		hs.wait_ns.fetch_add(ns, std::memory_order_relaxed);
+		hs.wait_cmd_ns.fetch_add(commands_ns, std::memory_order_relaxed);
+		if (commands) hs.wait_commands.fetch_add(1, std::memory_order_relaxed);
+		for (uint64_t max = hs.wait_max_ns.load(std::memory_order_relaxed); ns > max && !hs.wait_max_ns.compare_exchange_weak(max, ns);) {
+		}
+		if (all > 1000000u) {
+			std::fprintf(stderr, "RESOLVE_HELPER wait %.3f ms commands %.3f ms (sequence %llu)\n", static_cast<double>(all) / 1e6,
+			             static_cast<double>(commands_ns) / 1e6, static_cast<unsigned long long>(operation.sequence));
+		}
+		const size_t bucket = ns < 5000u ? 0 : ns < 20000u ? 1 : ns < 100000u ? 2 : ns < 500000u ? 3 : ns < 2000000u ? 4 : 5;
+		hs.hist_n[bucket].fetch_add(1, std::memory_order_relaxed);
+		hs.hist_ns[bucket].fetch_add(ns, std::memory_order_relaxed);
+		if (ChunkLead::On()) ChunkLead::NoteIdle(all, 0, commands); // counted as the "resolve" idle cause (commands apart)
+		return claim;
+	};
+	if (auto* const helper = RenderExecutor::ResolvedCheckSlot(slot); helper != nullptr) {
+		(void)wait_for(helper, false);
+		const char* field = nullptr;
+		const int   klass = RenderExecutor::CompareResolved(*slot, *helper, &field);
+		const bool  fault = RenderExecutor::ResolvedFault(helper) != 0;
+		static std::atomic<uint32_t> logged {0};
+		if (fault) {
+			hs.injected.fetch_add(1, std::memory_order_relaxed);
+			if (klass >= 3) hs.injected_compared.fetch_add(1, std::memory_order_relaxed);
+			if (klass == 4) hs.detected.fetch_add(1, std::memory_order_relaxed);
+		} else {
+			std::atomic<uint64_t>* counters[5] = {&hs.both_empty, &hs.refused, &hs.reads_differ, &hs.compared, &hs.bad};
+			counters[klass]->fetch_add(1, std::memory_order_relaxed);
+			if (klass == 4) counters[3]->fetch_add(1, std::memory_order_relaxed);
+			if (klass == 4 && logged.fetch_add(1, std::memory_order_relaxed) < 40u) {
+				std::fprintf(stderr, "CHECK_RESOLVE mismatch field=%s kind=%u pass=[%s] sequence=%llu\n", field != nullptr ? field : "?",
+				             static_cast<uint32_t>(operation.kind), PassCensus::PassName(operation.pass_id).c_str(),
+				             static_cast<unsigned long long>(operation.sequence));
+			}
+		}
+		RenderExecutor::SetResolvedCheckSlot(slot, nullptr);
+		RenderExecutor::ReleaseResolvedDraw(helper);
+	}
+	const auto claim = wait_for(slot, true);
+	switch (claim) {
+		case RenderExecutor::ResolvedClaim::Ready: hs.ready.fetch_add(1, std::memory_order_relaxed); break;
+		case RenderExecutor::ResolvedClaim::Empty:
+			hs.ready.fetch_add(1, std::memory_order_relaxed);
+			RenderExecutor::ReleaseResolvedDraw(slot);
+			operation.resolved = nullptr;
+			break;
+		case RenderExecutor::ResolvedClaim::Stolen:
+			hs.pending.fetch_add(1, std::memory_order_relaxed);
+			hs.stolen.fetch_add(1, std::memory_order_relaxed);
+			if (HelperWaitsOn()) { // N6: a steal
+				g_helper_waits[{operation.pass_id, static_cast<uint8_t>(operation.kind)}].steals++;
+				HelperWaitsReport();
+			}
+			operation.resolved = nullptr; // the helper frees the slot when it takes the task
+			break;
+		default: break;
 	}
 }
 
@@ -1041,6 +1769,14 @@ void GuestGpu::StopExecution() {
 	m_operations.Stop();
 	if (m_resolver.joinable()) {
 		m_resolver.join();
+	}
+	m_tasks.Stop(); // project 15 N2.2: after the resolve thread, the only producer of tasks
+	m_tasks2.Stop();
+	if (m_resolve_helper.joinable()) {
+		m_resolve_helper.join();
+	}
+	if (m_resolve_helper2.joinable()) {
+		m_resolve_helper2.join();
 	}
 	m_execution_stop.store(true, std::memory_order_seq_cst);
 	RingExecution();
@@ -1330,6 +2066,7 @@ GpuOperation CommandProcessor::MakeOperation(GpuOperationKind kind) {
 	auto* const stream      = StreamGpu();
 	operation.sequence      = stream != nullptr ? stream->TakeSequence() : 0;
 	operation.num_instances = m_num_instances;
+	operation.pass_id       = PassCensus::CurrentPassId(this); // KYTY_TRACE_PASS_CENSUS (PASS_EXEC)
 	// Only draws, dispatches and state callbacks read registers.
 	if (kind != GpuOperationKind::Callback) {
 		operation.state = SnapshotState(operation.sequence);
@@ -1346,7 +2083,20 @@ T* CommandProcessor::Snapshot(SnapshotRing<T>& ring, const T& live, bool& dirty,
 			ring.last_use = std::make_unique<uint64_t[]>(SnapshotRing<T>::Size);
 		}
 		auto& slot = ring.slots[ring.next];
-		if (auto* const stream = StreamGpu(); stream != nullptr) stream->WaitForSnapshot(ring.last_use[ring.next]);
+		if (ChunkLead::On()) {
+			// KYTY_TRACE_CHUNK_LEAD: the snapshot slots taken and waited for, per register kind and queue.
+			constexpr int kind = std::is_same_v<T, HW::Context> ? 0 : std::is_same_v<T, HW::UserConfig> ? 1 : 2;
+			const bool    compute = IsAsyncComputeQueue();
+			ChunkLead::NoteSnapshotTaken(compute, kind);
+			const auto t0 = std::chrono::steady_clock::now();
+			if (auto* const stream = StreamGpu(); stream != nullptr && stream->WaitForSnapshot(ring.last_use[ring.next])) {
+				ChunkLead::NoteSnapshotWait(compute, kind, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+				                                               std::chrono::steady_clock::now() - t0)
+				                                               .count()));
+			}
+		} else if (auto* const stream = StreamGpu(); stream != nullptr) {
+			stream->WaitForSnapshot(ring.last_use[ring.next]);
+		}
 		std::memcpy(static_cast<void*>(&slot.value), &live, sizeof(T));
 		if (g_gpu_stage_stats) g_stage_stats.copied_bytes.fetch_add(sizeof(T), std::memory_order_relaxed);
 		ring.current = ring.next;
@@ -1366,6 +2116,7 @@ GpuRegisterState CommandProcessor::SnapshotState(uint64_t sequence) {
 uint64_t CommandProcessor::Emit(GpuOperation&& operation) {
 	const auto sequence = operation.sequence;
 	if (g_cp_thread) {
+		if (ChunkLead::On()) operation.emit_tsc = ChunkLead::Tsc(); // KYTY_TRACE_CHUNK_LEAD
 		g_stream_gpu->EmitOperation(std::move(operation));
 	} else {
 		Execute(operation);
@@ -1417,6 +2168,7 @@ void CommandProcessor::PublishDirtyRegions() {
 
 void CommandProcessor::Execute(GpuOperation& operation) {
 	EXIT_IF(operation.processor != this);
+	GpuTimer::t_guest_queue = static_cast<uint32_t>(m_interrupt_event_id); // KYTY_TRACE_GPU_TIMELINE
 	if (g_gpu_stage_stats) {
 		g_stage_stats.operations.fetch_add(1, std::memory_order_relaxed);
 		const auto kind = operation.kind;
@@ -1592,10 +2344,33 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	};
 	read();
 	if (!covered && m_renderer.GetBufferCache().InDirectRange(reinterpret_cast<uint64_t>(addr), sizeof(T))) {
-		RunOnExecution(GpuDrain::DirectWrites, [this, addr] {
-			m_renderer.GetBufferCache().WaitDirectGpuWrites(reinterpret_cast<uint64_t>(addr), sizeof(T));
-		});
-		read();
+		// Only a word that passes the test as read is drained for (walk 9.11: +1.4%). One that fails is not: the stream
+		// suspends as after a failed test and reads the word again when it resumes (a write the drain would have waited for
+		// can only make a later read pass). KYTY_DIAG_REGMEM_DRAIN_CHECK=1 (diagnostic): the execution thread, at the place
+		// of the skipped drain, waits for the GPU's writes of the word and counts the skipped drains after which it would
+		// have passed (the stream passes later instead; 0 of 92 160 in the walk).
+		static const bool drain_check = std::getenv("KYTY_DIAG_REGMEM_DRAIN_CHECK") != nullptr;
+		if (TestWaitRegMemValue(value, ref, mask, func)) {
+			RunOnExecution(GpuDrain::DirectWrites, [this, addr] {
+				m_renderer.GetBufferCache().WaitDirectGpuWrites(reinterpret_cast<uint64_t>(addr), sizeof(T));
+			});
+			read();
+		} else if (drain_check) {
+			const uint64_t wref = ref, wmask = mask;
+			EmitCallback([this, addr, wref, wmask, func] {
+				m_renderer.GetBufferCache().WaitDirectGpuWrites(reinterpret_cast<uint64_t>(addr), sizeof(T));
+				T now {};
+				CopyFromGuest(&now, addr, sizeof(T));
+				static std::atomic<uint64_t> skipped {0}, later {0};
+				const bool pass = TestWaitRegMemValue(now, wref, wmask, func);
+				if (pass) later.fetch_add(1, std::memory_order_relaxed);
+				const auto n = skipped.fetch_add(1, std::memory_order_relaxed) + 1u;
+				if ((n & 0x3ffu) == 0u) {
+					std::fprintf(stderr, "PERF regmem_drain_check skipped=%llu would_pass=%llu\n", static_cast<unsigned long long>(n),
+					             static_cast<unsigned long long>(later.load()));
+				}
+			});
+		}
 	}
 	const bool passed = TestWaitRegMemValue(value, ref, mask, func);
 	if (SyncTimeline::Enabled()) {
@@ -1803,6 +2578,20 @@ void GuestGpu::Enqueue(Submission submission) {
 	EXIT_IF(submission.queue_id >= QueueCount);
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
+	// The game frame whose data-ring half each submission writes (DropDeadRingBytes). Frame F ends with its
+	// SuspendPoint, then the context kicks and the graphics submission of frame F;
+	// everything after that graphics submission is frame F+1. Counted under the queue lock, so a kick another thread
+	// enqueues right after the SuspendPoint sees the new count. The execution thread runs the compute queues out of
+	// order with the graphics queue, so a frame boundary in its ticks would not separate the game's frames.
+	if (submission.type == SubmissionType::SuspendPoint) {
+		submission.ring_frame = m_ring_sp_count;
+		m_ring_sp_count++;
+		m_ring_after_sp = true;
+	} else {
+		submission.ring_frame = m_ring_after_sp ? m_ring_sp_count - 1u : m_ring_sp_count;
+		if (m_ring_after_sp && submission.type == SubmissionType::Graphics) m_ring_after_sp = false;
+	}
+	RingGameWriteFrame(m_ring_after_sp ? m_ring_sp_count - 1u : m_ring_sp_count);
 	m_queues[submission.queue_id].push_back(std::move(submission));
 	m_submission_count++;
 	m_work_epoch.fetch_add(1, std::memory_order_release);
@@ -1901,6 +2690,7 @@ void GuestGpu::ThreadRun(void* data) {
 			no_work = gpu->m_submission_count == 0 && !gpu->m_stopping;
 		}
 		if (no_work) {
+			if (ChunkLead::On()) ChunkLead::g_cp_state.store(ChunkLead::CpNoWork, std::memory_order_relaxed); // KYTY_TRACE_CHUNK_LEAD
 			gpu->WaitForExecution(GpuDrain::Idle);
 			uint64_t epoch = 0;
 			{
@@ -1952,6 +2742,7 @@ void GuestGpu::ThreadRun(void* data) {
 				}
 				if (selected_queue < 0) {
 					gpu->m_processing = false;
+					if (ChunkLead::On()) ChunkLead::g_cp_state.store(ChunkLead::CpBlocked, std::memory_order_relaxed); // KYTY_TRACE_CHUNK_LEAD
 					const auto blocked_start = std::chrono::steady_clock::now();
 					// A wake that came before this wait must not be lost (GuestGpu::Wake; only KYTY_UPSTREAM_FLIP_SUSPEND
 					// wakes the thread this way, so by default the flag is never set).
@@ -1978,6 +2769,7 @@ void GuestGpu::ThreadRun(void* data) {
 				auto& queue = gpu->m_queues[static_cast<uint32_t>(selected_queue)];
 				submission  = std::move(queue.front());
 				queue.pop_front();
+				if (ChunkLead::On()) ChunkLead::g_cp_state.store(ChunkLead::CpWorking, std::memory_order_relaxed); // KYTY_TRACE_CHUNK_LEAD
 				gpu->m_submission_count--;
 				gpu->m_next_queue = (static_cast<uint32_t>(selected_queue) + 1) % QueueCount;
 				gpu->m_processing = true;
@@ -2051,6 +2843,11 @@ bool GuestGpu::Process(Submission& submission) {
 		cp.SetSubmitId(++m_submit_id);
 		cp.ResetDeCe();
 		cp.SetFlip({});
+	}
+	// The execution thread notes the GPU writes of this slice under its game frame (one stream for all queues).
+	if (submission.ring_frame != m_ring_announced) {
+		m_ring_announced = submission.ring_frame;
+		cp.EmitCallback([frame = submission.ring_frame] { RingExecDataFrame(frame); });
 	}
 
 	cp.BufferInit();
@@ -2703,16 +3500,7 @@ bool CommandProcessor::DrawIndirectGpu(const GpuOperation& operation) {
 		NoteGpuIndirectFallback(reason, indexed, max_count_or_count, count_address);
 		return false;
 	};
-	DrawIndirectGpuArgs args {
-	    .args_addr           = indirect.args_base + indirect.data_offset,
-	    .count_addr          = count_address,
-	    .max_count           = max_count_or_count,
-	    .stride              = stride_in_bytes,
-	    .index_base_addr     = indexed ? indirect.index_base : 0,
-	    .index_buffer_size   = indexed ? indirect.index_buffer_size : 0,
-	    .index_type_and_size = indirect.index_type,
-	    .indexed             = indexed,
-	};
+	DrawIndirectGpuArgs args = MakeDrawIndirectGpuArgs(operation);
 	if (const char* reason = IndirectDrawLayout(registers, args.indirect_draw); reason != nullptr) {
 		return fallback(reason);
 	}
@@ -3092,6 +3880,8 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
                                         void* dst_gpu_addr, T value, uint32_t interrupt_selector,
                                         uint32_t interrupt_context_id) {
 	static_assert(sizeof(T) == sizeof(uint32_t) || sizeof(T) == sizeof(uint64_t));
+	// KYTY_TRACE_CS_WRITER_ADDR: an end-of-pipe label write (src = the guest queue id, src_sel = the EOP event type).
+	TraceCpWriter("eop", reinterpret_cast<uint64_t>(dst_gpu_addr), sizeof(T), static_cast<uint64_t>(m_interrupt_event_id), eop_event_type);
 
 	if (GraphicsRunDebugDumpEnabled()) {
 		const auto bits      = static_cast<unsigned>(sizeof(T) * 8u);
@@ -3601,5 +4391,9 @@ bool GuestGpu::IsGpuThread() noexcept {
 	return g_gpu_thread;
 }
 
+uint32_t GuestGpu::PendingWriteKind(uint64_t /*address*/) {
+	// The deferred-label map this read is gone (the write journal replaced it); the report says 0 (unknown).
+	return 0u;
+}
 
 } // namespace Libs::Graphics

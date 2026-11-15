@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/queueLockSite.h"
+#include "graphics/host_gpu/graphicContext.h" // TexMoveCheck (texture relocation's stale-view guard)
 
 #include "common/threads.h"
 #include "common/assert.h"
@@ -278,7 +279,14 @@ private:
 		for (;;) {
 			const uint64_t available = m_write.load(std::memory_order_acquire);
 			if (position != available) {
-				position = Replay(position, available);
+				if (RecordBusyOn()) { // KYTY_TRACE_RECORD_BUSY (project 15 way B W0): the time spent replaying
+					const auto t0 = Clock::now();
+					position      = Replay(position, available);
+					m_replay_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t0).count()),
+					                      std::memory_order_relaxed);
+				} else {
+					position = Replay(position, available);
+				}
 				continue;
 			}
 			if (m_stop.load(std::memory_order_acquire)) {
@@ -476,6 +484,12 @@ private:
 	// Statistics.
 	std::atomic<uint64_t> m_wakes {0};
 	std::atomic<uint64_t> m_wait_us {0};
+	std::atomic<uint64_t> m_replay_ns {0}; // KYTY_TRACE_RECORD_BUSY
+	uint64_t              m_last_replay_ns = 0;
+	static bool           RecordBusyOn() {
+        static const bool on = std::getenv("KYTY_TRACE_RECORD_BUSY") != nullptr;
+        return on;
+	}
 	std::atomic<uint64_t> m_max_ring {0};
 	std::array<std::atomic<uint64_t>, static_cast<size_t>(Reason::Count)> m_drains {};
 	std::vector<FallbackEntry>                                            m_fallbacks;
@@ -528,6 +542,12 @@ void Recorder::Report(bool is_final) {
 	             drains[6] - m_last_drains[6], drains[7] - m_last_drains[7],
 	             static_cast<double>(wait - m_last_wait) / 1000.0, wakes - m_last_wakes,
 	             m_max_ring.exchange(0, std::memory_order_relaxed), cmds);
+	if (RecordBusyOn()) {
+		const uint64_t replay = m_replay_ns.load(std::memory_order_relaxed);
+		std::fprintf(stderr, "RECORD_BUSY s=%.1f replay_ms=%.1f busy=%.1f%%\n", seconds, static_cast<double>(replay - m_last_replay_ns) / 1e6,
+		             seconds > 0 ? 100.0 * static_cast<double>(replay - m_last_replay_ns) / 1e9 / seconds : 0.0);
+		m_last_replay_ns = replay;
+	}
 	m_last_cmds   = cmds;
 	m_last_bytes  = bytes;
 	m_last_wakes  = wakes;
@@ -1609,6 +1629,14 @@ bool RecordedByWorker(vk::CommandBuffer buffer) noexcept {
 bool QueueDescriptorWrites(VkDevice device, uint32_t count, const VkWriteDescriptorSet* writes) {
 	if (count == 0 || writes == nullptr || !AsyncSubmit()) {
 		return false;
+	}
+	// Texture relocation's stale-view guard: queued writes (the bindless slots) pass by the dispatcher's wrappers.
+	if (g_texmove_watch.load(std::memory_order_relaxed)) {
+		for (uint32_t i = 0; i < count; ++i) {
+			if (writes[i].pImageInfo == nullptr) continue;
+			for (uint32_t j = 0; j < writes[i].descriptorCount; ++j)
+				TexMoveCheck(writes[i].pImageInfo[j].imageView, "queued_descriptor_write");
+		}
 	}
 	auto&           q = g_write_queue;
 	std::lock_guard lock(q.mutex);

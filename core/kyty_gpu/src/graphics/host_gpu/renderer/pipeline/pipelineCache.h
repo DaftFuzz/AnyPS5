@@ -10,6 +10,7 @@
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderCompiler.h"
 
+#include <shared_mutex>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -38,6 +39,13 @@ struct ResolvedStages;
 [[nodiscard]] ResolvedStages* NewResolvedStages();
 void                          DeleteResolvedStages(ResolvedStages* stages);
 [[nodiscard]] bool            ResolvedStagesEmpty(const ResolvedStages& stages) noexcept;
+// KYTY_CHECK_RESOLVE=2 (project 15 N2.2): SetResolveCheck(true) once at start keeps each stage's active sources for the
+// comparison; ResolvedStagesCompare compares two resolutions of one operation: 1 refused (stage count, or a stage not
+// ok), 2 reads differ (the read logs), 3 equal, 4 different (`field` names the first difference). ResolvedStagesFault
+// puts KYTY_CHECK_RESOLVE_FAULT's error `fault` into a result that is only compared.
+void               SetResolveCheck(bool on);
+[[nodiscard]] int  ResolvedStagesCompare(const ResolvedStages& a, const ResolvedStages& b, const char** field);
+void               ResolvedStagesFault(ResolvedStages& stages, uint32_t fault);
 inline thread_local ResolvedStages* t_resolved_stages = nullptr;
 // KYTY_TRACE_DISPATCH_CENSUS: how ProgramCache::Get<Compute> got the last compute stage's resources on this thread
 // (2 materialized, 3 the resolve thread's result, 4 compiled: a program miss). Not touched when the selection is adopted.
@@ -220,6 +228,25 @@ public:
 	// The execution thread: the whole selection stands in for GetGraphicsPrograms or GetComputeProgram (true), when
 	// the resolve thread found every stage and everything it read reads the same now.
 	[[nodiscard]] bool AdoptResolvedPrograms(ResolvedStages& results);
+	[[nodiscard]] bool AdoptResolvedProgramsChecked(ResolvedStages& results); // KYTY_CHECK_PEEK=2 (project 15 S2d)
+	// Project 15 N4.1 (KYTY_CHECK_PEEK=2): PeekAdopt for an operation ahead (the slot keeps the prediction, checked when it
+	// is adopted); InstallAhead puts the predicted programs into the slot's state for the other peeks (saved), RestoreAhead
+	// puts back what was there.
+	struct AheadSaved {
+		std::array<const ShaderRecompiler::IR::CompiledShaderInfo*, 4> program {};
+		std::array<ShaderProgram, 4>                                   handle {};
+		uint32_t                                                       count = 0;
+	};
+	[[nodiscard]] bool PeekAdoptAhead(ResolvedStages& results, uint32_t distance);
+	static void        InstallAhead(ResolvedStages& results, AheadSaved& saved);
+	static void        RestoreAhead(ResolvedStages& results, const AheadSaved& saved);
+	[[nodiscard]] static bool     StagesAdoptable(const ResolvedStages& results);
+	[[nodiscard]] static bool     AheadProgramsOk(const ResolvedStages& results);
+	[[nodiscard]] static uint32_t StageCount(const ResolvedStages& results);
+	[[nodiscard]] static const ShaderRecompiler::IR::CompiledShaderInfo* AheadProgram(const ResolvedStages& results, uint32_t i);
+	[[nodiscard]] static const ShaderRecompiler::IR::ResourceSnapshot*   StageResources(const ResolvedStages& results, uint32_t i);
+	[[nodiscard]] static const ShaderRecompiler::IR::CompiledShaderInfo* AdoptedProgram(const ResolvedStages& results, uint32_t i);
+	[[nodiscard]] static const StageF::ResolveRecord*                    StageRecord(const ResolvedStages& results, uint32_t i);
 
 	Pipeline& GetGraphicsPipeline(std::span<const RenderColorInfo>       colors,
 	                              const RenderDepthInfo&                 depth,
@@ -254,6 +281,7 @@ private:
 	struct TableCompileJob;
 	class TableCompileWorkers;
 
+public:
 	struct GraphicsPipelineKey {
 		PipelineRenderingState   rendering;
 		std::array<uint64_t, 3>  vertex_shader_ids {};
@@ -268,6 +296,7 @@ private:
 		}
 	};
 
+private:
 	struct PipelineKeyHash {
 		static void Mix(std::size_t& hash, std::size_t value) {
 			hash ^= value + static_cast<std::size_t>(0x9e3779b97f4a7c15ull) + (hash << 6u) +
@@ -285,6 +314,28 @@ private:
 	                                            std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
 	                                            const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
 	                                            bool primitive_restart_enable, const GraphicsPrograms& programs);
+
+public:
+	// Project 15 S2c: the same key from the operation's registers. described: the targets come from their description
+	// (DescribeRenderColorTarget / DescribeRenderDepthTarget, no image id): every color given is present, the depth is
+	// present when its format is defined.
+	[[nodiscard]] GraphicsPipelineKey MakeGraphicsPipelineKeyFrom(std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
+	                                                              std::span<const ShaderVertexInputInfo> vertex_info,
+	                                                              const HW::Context& ctx, const HW::UserConfig& user_config,
+	                                                              const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
+	                                                              bool primitive_restart_enable, const GraphicsPrograms& programs,
+	                                                              bool described);
+	// Project 15 S2c: the pipeline of a key without a write. Found: in the map with its objects (the pointer stays valid:
+	// entries are never removed); the other classes go in order (today's GetGraphicsPipeline[Async]).
+	enum class PipelineFind : uint8_t { Found, Evicted, PendingDone, Pending, Missing, Count };
+	[[nodiscard]] std::pair<Pipeline*, PipelineFind> FindGraphicsPipeline(const GraphicsPipelineKey& key, bool read_object = true) const;
+	// (read_object false, N5.1: a resolve helper - the entry only, Found when it is in the map; the commit checks the object)
+	// N4.3: a plan's pipeline taken as GetGraphicsPipeline[Async] takes a found one (housekeeping, last_used); null when its
+	// objects were given back (today's lookup recreates them).
+	[[nodiscard]] Pipeline* TakePlannedPipeline(Pipeline* planned);
+	[[nodiscard]] size_t GraphicsPipelineCount() const { return m_graphics_pipelines.size() + m_table_pending.size(); }
+
+private:
 
 	GraphicContext&               m_graphics;
 	std::unique_ptr<ProgramCache> m_program_cache;
@@ -308,6 +359,9 @@ private:
 	std::shared_ptr<PrecompileWarmList> m_warm;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
+	// N5.1: every change of m_graphics_pipelines and m_table_pending (the execution thread) holds it exclusively; a resolve
+	// helper's FindGraphicsPipeline holds it shared. The execution thread's own reads need no lock (it is the only writer).
+	mutable std::shared_mutex m_pipelines_mutex;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 	// KYTY_PERF_TABLE_ASYNC: the workers (started at the first queued creation) and the creations queued, running,
 	// finished but not taken yet, or refused (kept: their draws stay on today's path).

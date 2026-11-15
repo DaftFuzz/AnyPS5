@@ -1,5 +1,7 @@
+#include "common/slowFrame.h" // KYTY_TRACE_SLOW_FRAMES (diagnostic)
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/gpuTimer.h"
+#include "graphics/host_gpu/renderer/drawCoverage.h" // KYTY_TRACE_TARGET_REPEAT
 #include "graphics/host_gpu/renderer/debugSample.h"
 #include "graphics/host_gpu/gpuCheckpoints.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
@@ -13,6 +15,9 @@
 #include "common/envRead.h"
 #include "common/file.h"
 #include "common/liveAb.h"
+#include "graphics/guest_gpu/chunkCensus.h"
+#include "graphics/guest_gpu/chunkLead.h"
+#include "graphics/guest_gpu/command_processor/passCensus.h"
 #include "common/logging/log.h"
 #include "common/onceValue.h"
 #include "common/profiler.h"
@@ -856,10 +861,79 @@ private:
 };
 } // namespace
 
+// KYTY_TRACE_TARGET_REPEAT=1 (diagnostic, 11.11, fork comparison: chenxiao takes the targets only when they changed):
+// per draw, the time of AcquireRenderTargets and whether its result repeats the previous draw's (same attachments,
+// views and layouts, no clear, no layout barrier). Every 5 s: PERF target_repeat (frames, draws, repeats, ms per frame
+// in all calls and in the repeating ones, barriers).
+namespace TargetRepeat {
+static bool On() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_TRACE_TARGET_REPEAT");
+		return value != nullptr && value[0] == '1';
+	}();
+	return on;
+}
+// The target search before the draw (PrepareDrawRenderState): its time and whether the target memo answered.
+static uint64_t g_search_draws = 0, g_search_hits = 0, g_search_ns = 0, g_search_hit_ns = 0;
+static void NoteSearch(uint64_t ns, bool hit) {
+	g_search_draws++;
+	g_search_ns += ns;
+	if (hit) {
+		g_search_hits++;
+		g_search_hit_ns += ns;
+	}
+}
+static void Note(const RenderState& state, uint64_t ns, uint64_t barriers) {
+	static RenderState prev {};
+	static bool        have_prev = false;
+	static uint64_t    draws = 0, repeats = 0, ns_all = 0, ns_repeat = 0, barrier_draws = 0;
+	static uint32_t    window_frame = DebugPresentCount().load();
+	static auto        window_start = std::chrono::steady_clock::now();
+	bool clears = state.depth_stencil_attachment.depth_clear || state.depth_stencil_attachment.stencil_clear ||
+	              state.depth_stencil_attachment.is_clear;
+	for (uint32_t i = 0; i < state.num_color_attachments; i++) clears = clears || state.color_attachments[i].is_clear;
+	const bool repeat = have_prev && !clears && barriers == 0 && state == prev;
+	draws++;
+	ns_all += ns;
+	if (repeat) {
+		repeats++;
+		ns_repeat += ns;
+	}
+	if (barriers != 0) barrier_draws++;
+	prev      = state;
+	have_prev = true;
+	const auto now = std::chrono::steady_clock::now();
+	if (now - window_start < std::chrono::seconds(5)) return;
+	const uint32_t frame  = DebugPresentCount().load();
+	const double   frames = frame > window_frame ? static_cast<double>(frame - window_frame) : 1.0;
+	std::fprintf(stderr,
+	             "PERF target_repeat frames=%.0f draws/frame=%.0f repeat=%.1f%% ms/frame all=%.2f repeat=%.2f "
+	             "ns/draw repeat=%.0f other=%.0f barrier_draws/frame=%.0f\n",
+	             frames, draws / frames, draws != 0 ? 100.0 * repeats / draws : 0.0, ns_all / 1e6 / frames,
+	             ns_repeat / 1e6 / frames, repeats != 0 ? static_cast<double>(ns_repeat) / repeats : 0.0,
+	             draws > repeats ? static_cast<double>(ns_all - ns_repeat) / (draws - repeats) : 0.0, barrier_draws / frames);
+	std::fprintf(stderr,
+	             "PERF target_search frames=%.0f searches/frame=%.0f memo_hit=%.1f%% ms/frame all=%.2f in_hits=%.2f\n", frames,
+	             g_search_draws / frames, g_search_draws != 0 ? 100.0 * g_search_hits / g_search_draws : 0.0,
+	             g_search_ns / 1e6 / frames, g_search_hit_ns / 1e6 / frames);
+	static const char* const phase_names[3] = {"other", "targets", "commit"};
+	for (int p = 0; p < 3; p++) {
+		std::fprintf(stderr, "PERF target_transit phase=%s calls/frame=%.0f barriers/frame=%.0f ms/frame=%.2f\n", phase_names[p],
+		             TargetTrace::t_calls[p] / frames, TargetTrace::t_barriers[p] / frames, TargetTrace::t_ns[p] / 1e6 / frames);
+		TargetTrace::t_calls[p] = TargetTrace::t_barriers[p] = TargetTrace::t_ns[p] = 0;
+	}
+	g_search_draws = g_search_hits = g_search_ns = g_search_hit_ns = 0;
+	draws = repeats = ns_all = ns_repeat = barrier_draws = 0;
+	window_frame = frame;
+	window_start = now;
+}
+} // namespace TargetRepeat
+
 RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
                                                  uint32_t color_count, RenderDepthInfo& depth,
                                                  vk::ImageAspectFlags& feedback_aspects,
                                                  std::span<PreparedBindings* const> stages) {
+	const Common::SlowFrame::Scope slow_frame_scope(Common::SlowFrame::Targets); // KYTY_TRACE_SLOW_FRAMES
 	KYTY_PROFILER_BLOCK("Draw::AcquireRenderTargets");
 	EXIT_IF(colors == nullptr || color_count > RENDER_COLOR_ATTACHMENTS_MAX);
 	feedback_aspects = {};
@@ -1112,17 +1186,13 @@ struct VertexBufferRange {
 };
 
 // Fills `prepared` in place: it is three RES_MAX arrays, which a returned copy moved per draw.
-static void AcquireVertexBuffers(CommandBuffer& buffer, const ShaderVertexInputInfo& vs_input_info,
-                                 PreparedVertexBuffers& prepared) {
-	KYTY_PROFILER_BLOCK("Draw::AcquireVertexBuffers");
-	EXIT_IF(vs_input_info.buffers_num < 0 ||
-	        vs_input_info.buffers_num > ShaderVertexInputInfo::RES_MAX);
-
-	// Collect the non-empty guest vertex ranges. The arrays are not zeroed (~4.4 KB per draw): every entry read below is
-	// written earlier in this call (sizes[i] for each i < buffers_num, the ranges below their counts, all fields of each).
-	std::array<uint64_t, ShaderVertexInputInfo::RES_MAX>          sizes;
+// The non-empty guest vertex ranges of a draw, sorted and merged where they overlap or touch (AcquireVertexBuffers; the
+// plan's builder, project 15 N4.2b). An invalid range: EXIT, or (exit_on_bad false) UINT32_MAX.
+static uint32_t MergedVertexRanges(const ShaderVertexInputInfo& vs_input_info, std::array<uint64_t, ShaderVertexInputInfo::RES_MAX>& sizes,
+                                   std::array<VertexBufferRange, ShaderVertexInputInfo::RES_MAX>& merged_ranges, bool exit_on_bad) {
+	// The arrays are not zeroed (~4.4 KB per draw): every entry read below is written earlier in this call (sizes[i] for
+	// each i < buffers_num, the ranges below their counts, all fields of each).
 	std::array<VertexBufferRange, ShaderVertexInputInfo::RES_MAX> ranges;
-	std::array<VertexBufferRange, ShaderVertexInputInfo::RES_MAX> merged_ranges;
 	uint32_t range_count = 0;
 	for (int i = 0; i < vs_input_info.buffers_num; i++) {
 		const auto& vertex = vs_input_info.buffers[i];
@@ -1132,6 +1202,7 @@ static void AcquireVertexBuffers(CommandBuffer& buffer, const ShaderVertexInputI
 			continue;
 		}
 		if (vertex.addr == 0 || size > UINT64_MAX - vertex.addr) {
+			if (!exit_on_bad) return UINT32_MAX;
 			EXIT("invalid vertex buffer range: addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 			     vertex.addr, size);
 		}
@@ -1155,6 +1226,17 @@ static void AcquireVertexBuffers(CommandBuffer& buffer, const ShaderVertexInputI
 		}
 		merged_ranges[merged_count++] = {range.base_address, range.requested_end, 0, nullptr, 0};
 	}
+	return merged_count;
+}
+
+static void AcquireVertexBuffers(CommandBuffer& buffer, const ShaderVertexInputInfo& vs_input_info,
+                                 PreparedVertexBuffers& prepared) {
+	KYTY_PROFILER_BLOCK("Draw::AcquireVertexBuffers");
+	EXIT_IF(vs_input_info.buffers_num < 0 ||
+	        vs_input_info.buffers_num > ShaderVertexInputInfo::RES_MAX);
+	std::array<uint64_t, ShaderVertexInputInfo::RES_MAX>          sizes;
+	std::array<VertexBufferRange, ShaderVertexInputInfo::RES_MAX> merged_ranges;
+	const uint32_t merged_count = MergedVertexRanges(vs_input_info, sizes, merged_ranges, true);
 
 	auto& cache = buffer.GetContext().GetBufferCache();
 	for (uint32_t i = 0; i < merged_count; i++) {
@@ -1256,15 +1338,22 @@ static bool GetDrawTopology(const HW::UserConfig& ucfg, vk::PrimitiveTopology& t
 // 8-bit path widens it to 0xffff. Custom: a reset value the host cannot take.
 enum class PrimitiveRestartKind { Unsupported, Off, Native, Custom };
 
+static PrimitiveRestartKind ClassifyPrimitiveRestartRegs(const HW::UserConfig& ucfg, const HW::Context& ctx, uint32_t element_size);
+
 static PrimitiveRestartKind ClassifyPrimitiveRestart(const CommandBuffer& buffer, uint32_t element_size) {
-	const auto control = buffer.GetUserConfig().GetPrimitiveResetControl();
+	return ClassifyPrimitiveRestartRegs(buffer.GetUserConfig(), buffer.GetRegisters(), element_size);
+}
+
+// Project 15 N4.1: the same from the registers alone.
+static PrimitiveRestartKind ClassifyPrimitiveRestartRegs(const HW::UserConfig& ucfg, const HW::Context& ctx, uint32_t element_size) {
+	const auto control = ucfg.GetPrimitiveResetControl();
 	if ((control & ~0x3u) != 0) {
 		return PrimitiveRestartKind::Unsupported;
 	}
 	if ((control & 0x1u) == 0) {
 		return PrimitiveRestartKind::Off;
 	}
-	switch (buffer.GetUserConfig().GetPrimType()) {
+	switch (ucfg.GetPrimType()) {
 		case Prospero::PrimitiveType::kLineStrip:
 		case Prospero::PrimitiveType::kTriFan:
 		case Prospero::PrimitiveType::kTriStrip: break;
@@ -1272,7 +1361,7 @@ static PrimitiveRestartKind ClassifyPrimitiveRestart(const CommandBuffer& buffer
 	}
 
 	const auto index_mask  = UINT32_MAX >> ((4 - element_size) * 8);
-	const auto reset_index = buffer.GetRegisters().GetPrimitiveResetIndex();
+	const auto reset_index = ctx.GetPrimitiveResetIndex();
 	if ((control & 0x2u) != 0 && (reset_index & ~index_mask) != 0) {
 		return PrimitiveRestartKind::Off;
 	}
@@ -1302,13 +1391,104 @@ static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
 	return false;
 }
 
-// GPU indirect draws: ResolvePrimitiveRestart without the index scan (the index count of
-// the draw is in GPU memory). False: a custom restart index the CPU path would have to check.
-static bool ResolvePrimitiveRestartWithoutScan(const CommandBuffer& buffer, uint32_t element_size,
-                                               bool& restart) {
-	const auto kind = ClassifyPrimitiveRestart(buffer, element_size);
-	restart         = kind == PrimitiveRestartKind::Native;
-	return kind == PrimitiveRestartKind::Off || kind == PrimitiveRestartKind::Native;
+// Project 15 N7.2: a GPU indirect packet's checks that need only the registers and the packet (none of the draw's
+// programs): the execution thread's DrawIndirectGpu and a helper's plan (`ahead`: the ranges clamped without a write).
+// One function, so the two cannot differ.
+struct IndirectEarly {
+	DrawIndirectSource    indirect {};
+	DrawIndexBufferSource index_source {};
+	bool                  primitive_restart = false;
+	bool                  no_draw           = false; // max_count == 0
+};
+template <typename Graphics>
+static const char* IndirectEarlyChecks(const Graphics& graphics, const HW::UserConfig& ucfg, const HW::Context& regs,
+                                       const DrawIndirectGpuArgs& args, bool ahead, IndirectEarly& out) {
+	// Argument records larger than this, or index ranges, stay on the CPU path (cache buffers).
+	constexpr uint64_t MaxArgumentBytes = 4ull << 20u;
+	constexpr uint64_t MaxIndexBytes    = 64ull << 20u;
+	const auto         clamp            = [ahead](uint64_t address, uint64_t size) {
+        if (!ahead) return Libs::LibKernel::Memory::ClampRangeSize(address, size);
+        uint64_t generation = 0;
+        return Libs::LibKernel::Memory::ClampRangeSizeAhead(address, size, &generation);
+	};
+	out = {};
+	if (!graphics.gpu_indirect_draw_enabled) {
+		return "host device features";
+	}
+	switch (ucfg.GetPrimType()) {
+		case Prospero::PrimitiveType::kPointList:
+		case Prospero::PrimitiveType::kLineList:
+		case Prospero::PrimitiveType::kLineStrip:
+		case Prospero::PrimitiveType::kTriList:
+		case Prospero::PrimitiveType::kTriFan:
+		case Prospero::PrimitiveType::kTriStrip:
+		case Prospero::PrimitiveType::kPolygon: break;
+		default: return "primitive type";
+	}
+	// Merged (NGG GS) stages draw through the mesh path, which sizes its workgroups from the counts.
+	if ((regs.GetShaderStages() & 0x20u) != 0) {
+		return "mesh vertex stage";
+	}
+	const uint32_t record_size = args.indexed ? 20u : 16u;
+	static_assert(sizeof(vk::DrawIndexedIndirectCommand) == 20u && sizeof(vk::DrawIndirectCommand) == 16u);
+	if (args.max_count == 0) {
+		out.no_draw = true;
+		return nullptr;
+	}
+	if ((args.args_addr & 3u) != 0 || (args.count_addr & 3u) != 0) {
+		return "unaligned arguments";
+	}
+	if ((args.count_addr != 0 || args.max_count > 1u) && ((args.stride & 3u) != 0 || args.stride < record_size)) {
+		return "argument stride";
+	}
+	if (args.max_count > graphics.GetPhysicalDeviceProperties().limits.maxDrawIndirectCount) {
+		return "draw count limit";
+	}
+	out.indirect = DrawIndirectSource {
+	    .args_addr  = args.args_addr,
+	    .args_size  = uint64_t {args.stride} * (args.max_count - 1u) + record_size,
+	    .count_addr = args.count_addr,
+	    .max_count  = args.max_count,
+	    .stride     = args.stride,
+	};
+	if (out.indirect.args_size > MaxArgumentBytes || clamp(out.indirect.args_addr, out.indirect.args_size) != out.indirect.args_size) {
+		return "argument range";
+	}
+	if (args.indexed) {
+		auto& index_source = out.index_source;
+		switch (static_cast<Prospero::IndexType>(args.index_type_and_size)) {
+			case Prospero::IndexType::kIndex16:
+				index_source.type               = vk::IndexType::eUint16;
+				index_source.guest_element_size = 2;
+				break;
+			case Prospero::IndexType::kIndex32:
+				index_source.type               = vk::IndexType::eUint32;
+				index_source.guest_element_size = 4;
+				break;
+			default: return "index type"; // 8-bit indices are widened on the CPU
+		}
+		if (args.index_base_addr == 0 || (args.index_base_addr & (index_source.guest_element_size - 1u)) != 0) {
+			return "index base address";
+		}
+		// Without INDEX_BUFFER_SIZE the bound range would be unknown.
+		if (args.index_buffer_size == 0) {
+			return "index buffer size";
+		}
+		index_source.address = args.index_base_addr;
+		index_source.size    = uint64_t {args.index_buffer_size} * index_source.guest_element_size;
+		if (index_source.size > MaxIndexBytes) {
+			return "index range";
+		}
+		// ResolvePrimitiveRestart without the index scan (the index count is in GPU memory): a custom restart index the
+		// CPU path would have to check.
+		const auto kind = ClassifyPrimitiveRestartRegs(ucfg, regs, index_source.guest_element_size);
+		if (kind != PrimitiveRestartKind::Off && kind != PrimitiveRestartKind::Native) {
+			return "primitive restart index";
+		}
+		out.primitive_restart = kind == PrimitiveRestartKind::Native;
+		index_source.size     = clamp(index_source.address, index_source.size);
+	}
+	return nullptr;
 }
 
 // The export mapping of each color target the draw writes (RefreshShaders).
@@ -1564,11 +1744,233 @@ void Report(TargetMemo& m) {
 	             static_cast<unsigned long long>(m.draws), static_cast<unsigned long long>(m.equal),
 	             static_cast<unsigned long long>(m.hits), static_cast<unsigned long long>(m.stored));
 }
+// T1b: the mode (KYTY_PERF_TARGET_MEMO live A/B test switch; KYTY_CHECK_TARGET_MEMO=2 the check), its counters.
+// T1b is the only path since 10.11 (live A/B +1.17/-2.32/-1.12%, the target state 3.19 -> 2.05
+// ms/frame): 1, or 2 with KYTY_CHECK_TARGET_MEMO=2 (diagnostic).
+uint32_t TargetMemoMode() {
+	static const uint32_t mode = [] {
+		const char* check = std::getenv("KYTY_CHECK_TARGET_MEMO");
+		if (check != nullptr && check[0] == '2') {
+			std::fprintf(stderr, "CHECK_TARGET_MEMO=2: every target memo hit is checked against the full search\n");
+			return 2u;
+		}
+		return 1u;
+	}();
+	return mode;
+}
+struct T1bStats {
+	uint64_t abandoned = 0, compared = 0, bad = 0, injected = 0, detected = 0, not_repeatable = 0, moved = 0;
+	uint64_t hits_seen = 0, forced = 0, second_did = 0, missed = 0;
+	bool      forced_pending = false;
+	TargetKey forced_key {};
+	uint32_t logged    = 0;
+	std::chrono::steady_clock::time_point window = std::chrono::steady_clock::now();
+};
+inline T1bStats g_t1b;
+bool SameColorTarget(const RenderColorInfo& a, const RenderColorInfo& b) {
+	return a.image_id == b.image_id && a.target_slot == b.target_slot && a.guest_mip_level == b.guest_mip_level &&
+	       a.guest_array_layer == b.guest_array_layer && a.desc.info.data == b.desc.info.data &&
+	       a.desc.info.pixel_format == b.desc.info.pixel_format && a.desc.info.extent == b.desc.info.extent &&
+	       a.desc.info.metadata.kind == b.desc.info.metadata.kind && a.desc.view_info.base_level == b.desc.view_info.base_level &&
+	       a.desc.view_info.base_layer == b.desc.view_info.base_layer && a.desc.view_info.layer_count == b.desc.view_info.layer_count &&
+	       a.desc.type == b.desc.type && std::memcmp(&a.export_mapping, &b.export_mapping, sizeof(a.export_mapping)) == 0;
+}
+bool SameDepthTarget(const RenderDepthInfo& a, const RenderDepthInfo& b) {
+	return a.image_id == b.image_id && a.desc.info.data == b.desc.info.data && a.desc.info.pixel_format == b.desc.info.pixel_format &&
+	       a.desc.info.extent == b.desc.info.extent && a.depth_clear_enable == b.depth_clear_enable &&
+	       a.load_clear_aspects == b.load_clear_aspects && a.depth_clear_value == b.depth_clear_value &&
+	       a.depth_test_enable == b.depth_test_enable && a.depth_write_enable == b.depth_write_enable &&
+	       a.depth_compare_op == b.depth_compare_op && a.depth_bounds_test_enable == b.depth_bounds_test_enable &&
+	       a.stencil_clear_enable == b.stencil_clear_enable && a.stencil_clear_value == b.stencil_clear_value &&
+	       a.stencil_test_enable == b.stencil_test_enable && a.stencil_front == b.stencil_front && a.stencil_back == b.stencil_back;
+}
+void T1bCheck(const DrawRenderState& state, const std::array<RenderColorInfo, RENDER_COLOR_ATTACHMENTS_MAX>& colors, uint32_t count,
+              const RenderDepthInfo& depth, bool repeatable, bool registry_same) {
+	auto& s = g_t1b;
+	s.compared++;
+	// Every 997th comparison: a copy of the search's result gets a wrong image (the first colour target's, else the depth
+	// target's); counted only when there was one to change (review: the comparison itself must find it).
+	auto           colors_cmp = colors;
+	RenderDepthInfo depth_cmp = depth;
+	bool           fault      = false;
+	if (s.compared % 997u == 0u) {
+		if (count != 0) {
+			colors_cmp[0].image_id.index ^= 1u;
+			fault = true;
+		} else if (depth_cmp.image_id) {
+			depth_cmp.image_id.index ^= 1u;
+			fault = true;
+		}
+		if (fault) s.injected++;
+	}
+	bool same = count == state.color_count && SameDepthTarget(depth_cmp, state.depth_info);
+	for (uint32_t i = 0; same && i < count; i++) same = SameColorTarget(colors_cmp[i], state.color_info[i]);
+	if (fault && same) s.missed++;
+	if (!same) {
+		if (fault) {
+			s.detected++;
+		} else {
+			s.bad++;
+			if (s.logged++ < 16u) {
+				std::fprintf(stderr, "CHECK_TARGET_MEMO bad colors=%u/%u depth_id=%u/%u\n", count, state.color_count,
+				             static_cast<uint32_t>(depth.image_id.index), static_cast<uint32_t>(state.depth_info.image_id.index));
+			}
+		}
+	}
+	if (!repeatable) s.not_repeatable++;
+	if (!registry_same) s.moved++;
+	const auto now = std::chrono::steady_clock::now();
+	if (now - s.window < std::chrono::seconds(5)) return;
+	std::fprintf(stderr,
+	             "PERF check_target_memo compared=%llu bad=%llu not_repeatable=%llu registry_moved=%llu abandoned=%llu "
+	             "fault[injected|detected|missed]=%llu|%llu|%llu forced_abandons=%llu second_materialization_changed=%llu\n",
+	             static_cast<unsigned long long>(s.compared), static_cast<unsigned long long>(s.bad),
+	             static_cast<unsigned long long>(s.not_repeatable), static_cast<unsigned long long>(s.moved),
+	             static_cast<unsigned long long>(s.abandoned), static_cast<unsigned long long>(s.injected),
+	             static_cast<unsigned long long>(s.detected), static_cast<unsigned long long>(s.missed),
+	             static_cast<unsigned long long>(s.forced), static_cast<unsigned long long>(s.second_did));
+	s.window = now;
+}
+
+// T1b diagnostic (KYTY_TRACE_PEEK_CENSUS): per draw bucket (0 Deferred, 1 shadows, 2 PS Lights, 3 other draws), why the
+// memo did not hit: 0 hit, 1 memo invalid, 2 kept by the old rule, then the first key group differing from the memo's key
+// (3 colors, 4 depth, 5 control, 6 stencil, 7 clears, 8 masks, 9 registry, 10 gc tick, 11 command tick, 12 meta).
+struct MissStats {
+	std::array<std::array<uint64_t, 13>, 4> why {};
+	std::chrono::steady_clock::time_point  window = std::chrono::steady_clock::now();
+};
+inline MissStats g_miss;
+template <typename A>
+bool Differs(const A& a, const A& b) {
+	return std::memcmp(static_cast<const void*>(&a), static_cast<const void*>(&b), sizeof(A)) != 0;
+}
+void NoteMiss(int bucket, bool hit, const TargetMemo& memo, const TargetKey& k) {
+	auto& s = g_miss;
+	if (bucket < 0 || bucket > 3) return;
+	int why = 0;
+	if (!hit) {
+		const auto& m = memo.key;
+		why = !memo.valid                                                              ? 1
+		      : Differs(k.rt, m.rt)                                                    ? 3
+		      : Differs(k.depth, m.depth)                                              ? 4
+		      : Differs(k.rc, m.rc) || Differs(k.dc, m.dc)                             ? 5
+		      : Differs(k.sc, m.sc) || Differs(k.sm, m.sm)                             ? 6
+		      : k.depth_clear != m.depth_clear || k.stencil_clear != m.stencil_clear   ? 7
+		      : k.rt_mask != m.rt_mask || k.mrt_mask != m.mrt_mask || k.slice_offset != m.slice_offset ? 8
+		      : k.registry != m.registry                                               ? 9
+		      : k.gc_tick != m.gc_tick                                                 ? 10
+		      : k.tick != m.tick                                                       ? 11
+		      : k.meta_ops != m.meta_ops                                               ? 12
+		                                                                               : 2;
+	}
+	s.why[static_cast<size_t>(bucket)][static_cast<size_t>(why)]++;
+	const auto now = std::chrono::steady_clock::now();
+	if (now - s.window < std::chrono::seconds(5)) return;
+	static const char* const names[4] = {"Deferred", "shadows", "PS Lights", "other draws"};
+	for (size_t b = 0; b < 4; b++) {
+		uint64_t n = 0;
+		for (const auto v: s.why[b]) n += v;
+		if (n == 0) continue;
+		std::string text;
+		for (size_t i = 0; i < 13; i++) {
+			char buf[32];
+			std::snprintf(buf, sizeof(buf), "%s%.1f", i == 0 ? "" : "|", 100.0 * static_cast<double>(s.why[b][i]) / static_cast<double>(n));
+			text += buf;
+		}
+		std::fprintf(stderr,
+		             "PERF t1b_miss group=%s draws=%llu %%[hit|invalid|old_rule|colors|depth|control|stencil|clears|masks|registry|gc_tick|"
+		             "tick|meta]=%s\n",
+		             names[b], static_cast<unsigned long long>(n), text.c_str());
+	}
+	s        = {};
+	s.window = now;
+}
+
+// T1a (KYTY_TRACE_PEEK_CENSUS): per searched draw, whether every search was repeatable, the first reason otherwise.
+struct T1aStats {
+	uint64_t                 searched = 0, repeatable = 0, moved = 0;
+	std::array<uint64_t, 7>  first {};
+	std::chrono::steady_clock::time_point window = std::chrono::steady_clock::now();
+};
+inline T1aStats g_t1a;
+void NoteT1a(bool repeatable, int first, bool moved) {
+	auto& s = g_t1a;
+	s.searched++;
+	if (repeatable && !moved) s.repeatable++;
+	if (moved) s.moved++;
+	if (first >= 0 && first < 7) s.first[static_cast<size_t>(first)]++;
+	const auto now = std::chrono::steady_clock::now();
+	if (now - s.window < std::chrono::seconds(5)) return;
+	const auto pc = [&](uint64_t v) { return 100.0 * static_cast<double>(v) / static_cast<double>(s.searched); };
+	std::fprintf(stderr,
+	             "PERF t1a searched=%llu all_repeatable=%.1f%% registry_or_meta_moved=%.1f%% first_reason%%[null|not_target|not_same_backing|"
+	             "alias|freed|inserted|view]=%.1f|%.1f|%.1f|%.1f|%.1f|%.1f|%.1f\n",
+	             static_cast<unsigned long long>(s.searched), pc(s.repeatable), pc(s.moved), pc(s.first[0]), pc(s.first[1]),
+	             pc(s.first[2]), pc(s.first[3]), pc(s.first[4]), pc(s.first[5]), pc(s.first[6]));
+	s        = {};
+	s.window = now;
+}
 } // namespace C1
+
+// Project 15 S2c (KYTY_CHECK_PEEK=2, diagnostic): the draw's targets described from the registers, its pipeline key
+// from them and the pipeline found without a write, against today's (execution thread).
+namespace PeekTargets {
+struct Stats {
+	uint64_t draws = 0, targets_bad = 0, key_bad = 0, compared = 0, bad = 0, created = 0, injected = 0, detected = 0;
+	std::array<uint64_t, static_cast<size_t>(PipelineCache::PipelineFind::Count)> find {}, member_find {};
+	uint32_t logged = 0;
+};
+Stats g_stats;
+struct Scratch {
+	bool            valid = false;
+	uint32_t        count = 0;
+	RenderColorInfo colors[RENDER_COLOR_ATTACHMENTS_MAX];
+	RenderDepthInfo depth;
+};
+Scratch g_scratch;
+bool    Check() {
+	static const bool on = [] {
+		const char* env = std::getenv("KYTY_CHECK_PEEK");
+		return env != nullptr && env[0] == '2';
+	}();
+	return on;
+}
+uint64_t FaultEvery() {
+	static const uint64_t every = [] {
+		const char* env = std::getenv("KYTY_CHECK_PEEK_FAULT");
+		return env != nullptr ? std::strtoull(env, nullptr, 10) : 0u;
+	}();
+	return every;
+}
+void Report() {
+	auto& st = g_stats;
+	if ((st.draws & ((1u << 18u) - 1u)) != 0) return;
+	const auto join = [](const auto& a) {
+		std::string out;
+		for (size_t i = 0; i < a.size(); i++) out += std::string(i == 0 ? "" : "|") + std::to_string(a[i]);
+		return out;
+	};
+	std::fprintf(stderr,
+	             "PERF peek_pipeline draws=%llu targets_bad=%llu key_bad=%llu find[found|evicted|pending_done|pending|missing]=%s "
+	             "member=%s compared=%llu bad=%llu created=%llu fault[injected|detected]=%llu|%llu\n",
+	             static_cast<unsigned long long>(st.draws), static_cast<unsigned long long>(st.targets_bad),
+	             static_cast<unsigned long long>(st.key_bad), join(st.find).c_str(), join(st.member_find).c_str(),
+	             static_cast<unsigned long long>(st.compared), static_cast<unsigned long long>(st.bad),
+	             static_cast<unsigned long long>(st.created), static_cast<unsigned long long>(st.injected),
+	             static_cast<unsigned long long>(st.detected));
+}
+// The key fields of a described target against today's resolved one.
+bool SameColor(const RenderColorInfo& a, const RenderColorInfo& b) {
+	return a.target_slot == b.target_slot && a.desc.view_info.format == b.desc.view_info.format &&
+	       a.desc.info.samples == b.desc.info.samples && a.desc.info.guest_format == b.desc.info.guest_format &&
+	       std::memcmp(&a.export_mapping, &b.export_mapping, sizeof(a.export_mapping)) == 0;
+}
+} // namespace PeekTargets
 
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             uint32_t            render_target_slice_offset,
 	                                        DrawRenderState& state) {
+	const ChunkLead::FloorTimer floor_targets(ChunkLead::FpTargets); // KYTY_TRACE_PEEK_CENSUS (N3.0)
 	const auto& shader_regs       = buffer.GetRegisters().GetShaderRegisters();
 	const auto  color_output_mask = DrawColorOutputMask(buffer.GetRegisters());
 	state.ps_active = buffer.GetShaders().GetPs().ps_regs.data_addr != 0 &&
@@ -1595,6 +1997,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		LogDrawPhase(draw.Name(), "ResolveRenderColorTarget");
 	}
 	std::optional<DispatchSubTimer> census_targets(std::in_place, DispatchSub::DrawTargets); // KYTY_TRACE_DRAW_CENSUS
+	const auto tr_search_start = TargetRepeat::On() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 	const bool c0_targets       = CleanDraws::On(); // KYTY_TRACE_CLEAN_DRAWS: the target search's time (step K1)
 	const auto c0_targets_start = c0_targets ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 	// The previous draw's targets when its search would find them again.
@@ -1602,20 +2005,91 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	auto&         memo = C1::g_targets;
 	C1::FillKey(target_key, buffer.GetRegisters(), mrt_mask, render_target_slice_offset,
 	            m_context.GetTextureCache().GcTick(), m_context.GetCommandScheduler().CurrentTick());
-	const bool target_equal = memo.valid && C1::SameBytes(target_key, memo.key);
+	const uint32_t t1b          = C1::TargetMemoMode(); // T1b: 1 repeatable searches kept, 2 also checked
+	const bool     target_equal = memo.valid && C1::SameBytes(target_key, memo.key);
 	memo.draws++;
 	memo.equal += target_equal ? 1u : 0u;
+	if (ChunkLead::PeekCensusOn() && t1b != 0) C1::NoteMiss(ChunkLead::t_floor_bucket, target_equal, memo, target_key); // (T1b diag)
+	bool           hit = false;
 	if (target_equal) {
+		const ChunkLead::FloorTimer floor_hit(ChunkLead::FpTargetHit); // KYTY_TRACE_PEEK_CENSUS (T1a)
 		state.color_count = memo.color_count;
 		for (uint32_t i = 0; i < memo.color_count; i++) state.color_info[i] = memo.colors[i];
 		state.depth_info = memo.depth;
-		for (uint32_t i = 0; i < memo.color_count; i++) BindRenderTarget(state.color_info[i].image_id);
-		if (state.depth_info.image_id) BindRenderTarget(state.depth_info.image_id);
-		memo.hits++;
-		if (c0_targets) CleanDraws::t_front_parts.target_hit = true; // KYTY_TRACE_CLEAN_DRAWS
-		C1::Report(memo);
-	} else {
-		const uint64_t full_searches = TextureCache::FullSearches();
+		hit              = true;
+		if (t1b != 0) {
+			// T1b: the colour clears materialized as the search would (the same call), then the key rechecked: a
+			// materialization that cleared, submitted or registered ends the hit and the draw searches.
+			auto&      cache    = m_context.GetTextureCache();
+			const auto registry = [&] { return DrawRepeat::g_image_registry_epoch.load(std::memory_order_acquire) == target_key.registry; };
+			for (uint32_t i = 0; i < state.color_count && hit; i++) {
+				const auto kind = state.color_info[i].desc.info.metadata.kind;
+				if (kind == ImageMetadataKind::Dcc || kind == ImageMetadataKind::Cmask) {
+					// (review: the registry before each target's image is used - a materialization that registered ends it)
+					if (!registry()) {
+						hit = false;
+						break;
+					}
+					cache.MaterializeTargetClear(state.color_info[i].image_id, state.color_info[i].desc);
+				}
+			}
+			hit = hit && cache.GcTick() == target_key.gc_tick && m_context.GetCommandScheduler().CurrentTick() == target_key.tick &&
+			      registry() && CleanDraws::g_meta_ops.load(std::memory_order_relaxed) == target_key.meta_ops;
+			// KYTY_CHECK_TARGET_MEMO=2: every 101st hit abandoned on purpose (the abandon path exercised; the full search's
+			// second materialization must change nothing of the key)
+			const bool forced = hit && t1b == 2 && (++C1::g_t1b.hits_seen % 101u) == 0u;
+			if (forced) {
+				hit = false;
+				C1::g_t1b.forced++;
+				C1::g_t1b.forced_key = target_key;
+				C1::g_t1b.forced_pending = true;
+			}
+			if (!hit) {
+				memo.valid = false;
+				C1::g_t1b.abandoned++;
+				state.color_count = 0;
+				state.depth_info  = {};
+				for (auto& info: state.color_info) info = {};
+			}
+		}
+		if (hit && t1b != 0) {
+			// T1b: the targets touched as their searches would (the access tick and the LRU, ReplayImage): an image the memo
+			// keeps finding must not look unused to the collector or to the overlap resolution
+			auto& cache = m_context.GetTextureCache();
+			for (uint32_t i = 0; i < state.color_count; i++) (void)cache.ReplayImage(state.color_info[i].image_id);
+			if (state.depth_info.image_id) (void)cache.ReplayImage(state.depth_info.image_id);
+		}
+		if (hit) {
+			for (uint32_t i = 0; i < memo.color_count; i++) BindRenderTarget(state.color_info[i].image_id);
+			if (state.depth_info.image_id) BindRenderTarget(state.depth_info.image_id);
+			memo.hits++;
+			if (c0_targets) CleanDraws::t_front_parts.target_hit = true; // KYTY_TRACE_CLEAN_DRAWS
+			C1::Report(memo);
+			if (t1b == 2) {
+				// KYTY_CHECK_TARGET_MEMO=2 (T1b check): the full search too, binding nothing, must find the same targets with
+				// repeatable searches only and the image registry unchanged. Every N-th compared hit gets a wrong image.
+				std::array<RenderColorInfo, RENDER_COLOR_ATTACHMENTS_MAX> colors {};
+				RenderDepthInfo                                         depth {};
+				uint32_t                                                count = 0;
+				const uint64_t nonrepeat0 = TextureCache::NonRepeatableSearches();
+				const uint64_t registry0  = DrawRepeat::g_image_registry_epoch.load(std::memory_order_acquire);
+				m_bind_suppressed         = true;
+				for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+					if ((mrt_mask & (1u << slot)) == 0) continue;
+					ResolveRenderColorTarget(buffer, colors[count], render_target_slice_offset, slot);
+					if (colors[count].image_id) count++;
+				}
+				ResolveRenderDepthTarget(buffer, depth);
+				m_bind_suppressed = false;
+				C1::T1bCheck(state, colors, count, depth, TextureCache::NonRepeatableSearches() == nonrepeat0,
+				             DrawRepeat::g_image_registry_epoch.load(std::memory_order_acquire) == registry0);
+			}
+		}
+	}
+	if (!hit) {
+		const ChunkLead::FloorTimer floor_search(ChunkLead::FpTargetSearch); // KYTY_TRACE_PEEK_CENSUS (T1a)
+		const uint64_t nonrepeat0    = TextureCache::NonRepeatableSearches();
+		const auto     reasons0      = TextureCache::NonRepeatReasons();
 		for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
 			if ((mrt_mask & (1u << slot)) != 0) {
 				ResolveRenderColorTarget(buffer, state.color_info[state.color_count],
@@ -1629,10 +2103,33 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 			LogDrawPhase(draw.Name(), "ResolveRenderDepthTarget");
 		}
 		ResolveRenderDepthTarget(buffer, state.depth_info);
-		// Kept when every search was found-only and nothing was registered meanwhile (the key's epoch still holds).
-		memo.valid = TextureCache::FullSearches() == full_searches &&
+		// Kept when every search was found-only and nothing was registered meanwhile (the key's epoch still holds); with T1b,
+		// when every search was repeatable (TextureCache::NonRepeatableSearches).
+		const bool searches_kept = TextureCache::NonRepeatableSearches() == nonrepeat0;
+		if (C1::g_t1b.forced_pending) {
+			// (the forced abandon's full search: did its second materialization change the key's ticks, registry or meta?)
+			C1::g_t1b.forced_pending = false;
+			const auto& k            = C1::g_t1b.forced_key;
+			if (m_context.GetTextureCache().GcTick() != k.gc_tick || m_context.GetCommandScheduler().CurrentTick() != k.tick ||
+			    DrawRepeat::g_image_registry_epoch.load(std::memory_order_acquire) != k.registry ||
+			    CleanDraws::g_meta_ops.load(std::memory_order_relaxed) != k.meta_ops) {
+				C1::g_t1b.second_did++;
+			}
+		}
+		memo.valid = searches_kept &&
 		             DrawRepeat::g_image_registry_epoch.load(std::memory_order_acquire) == target_key.registry &&
 		             CleanDraws::g_meta_ops.load(std::memory_order_relaxed) == target_key.meta_ops;
+		if (ChunkLead::PeekCensusOn()) {
+			// T1a: whether every search of this draw was repeatable (the memo could keep the result), else the first reason
+			const auto& reasons1 = TextureCache::NonRepeatReasons();
+			int         first    = -1;
+			for (size_t i = 0; i < reasons1.size() && first < 0; i++) {
+				if (reasons1[i] != reasons0[i]) first = static_cast<int>(i);
+			}
+			C1::NoteT1a(TextureCache::NonRepeatableSearches() == nonrepeat0, first,
+			            DrawRepeat::g_image_registry_epoch.load(std::memory_order_acquire) != target_key.registry ||
+			                CleanDraws::g_meta_ops.load(std::memory_order_relaxed) != target_key.meta_ops);
+		}
 		if (memo.valid) {
 			memo.key         = target_key;
 			memo.color_count = state.color_count;
@@ -1643,9 +2140,44 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		C1::Report(memo);
 	}
 	census_targets.reset();
+	if (TargetRepeat::On()) {
+		TargetRepeat::NoteSearch(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                                                   std::chrono::steady_clock::now() - tr_search_start)
+		                                                   .count()),
+		                         hit);
+	}
 	if (c0_targets) {
 		CleanDraws::t_front_parts.targets_ns += static_cast<uint64_t>(
 		    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - c0_targets_start).count());
+	}
+	if (PeekTargets::Check()) {
+		// KYTY_CHECK_PEEK=2 (S2c): the same targets from the registers alone, inside the translator section.
+		auto& sc = PeekTargets::g_scratch;
+		++t_translator;
+		sc.count = 0;
+		for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+			if ((mrt_mask & (1u << slot)) == 0) continue;
+			if (DescribeRenderColorTarget(buffer.GetRegisters(), sc.colors[sc.count], render_target_slice_offset, slot, false)) sc.count++;
+		}
+		sc.depth = {};
+		(void)DescribeRenderDepthTarget(buffer.GetGraphics(), buffer.GetRegisters(), sc.depth);
+		--t_translator;
+		sc.valid  = true;
+		bool same = sc.count == state.color_count;
+		for (uint32_t i = 0; same && i < sc.count; i++) same = PeekTargets::SameColor(sc.colors[i], state.color_info[i]);
+		const bool depth_described = sc.depth.desc.view_info.format != vk::Format::eUndefined;
+		const bool depth_today = state.depth_info.desc.view_info.format != vk::Format::eUndefined && static_cast<bool>(state.depth_info.image_id);
+		same = same && depth_described == depth_today &&
+		       (!depth_today || (sc.depth.desc.view_info.format == state.depth_info.desc.view_info.format &&
+		                         sc.depth.desc.info.samples == state.depth_info.desc.info.samples));
+		if (!same) {
+			auto& st = PeekTargets::g_stats;
+			st.targets_bad++;
+			if (st.logged++ < 20u) {
+				std::fprintf(stderr, "CHECK_PEEK_TARGETS bad colors=%u/%u depth=%d/%d mrt=0x%x\n", sc.count, state.color_count,
+				             depth_described ? 1 : 0, depth_today ? 1 : 0, mrt_mask);
+			}
+		}
 	}
 
 	if (state.color_count == 0 && !state.depth_info.image_id && !state.ps_active) {
@@ -1985,12 +2517,408 @@ bool LongPrepPartsOn() {
 	return LongPrepThresholdUs() != 0;
 }
 
+// KYTY_CHECK_CHUNKS=2 (project 15, the oracle v2 of the parallel translation): a chunk member (a draw or a direct dispatch
+// of the project's passes) is prepared twice, the first time into bindings of its own (ChunkScratchBindings, as a worker
+// would), the second time into the ones the commit uses; the two prints are compared. The print: the storage, GDS, LDS,
+// vertex and index buffers binding by binding (the guest range always; when both preparations took a cached or fixed
+// buffer, its Vulkan buffer, offset and range; when both took the stream ring, its bytes (a sample: the ring is
+// write-combined memory); one of each is counted as mixed: which of them a preparation takes depends on what the
+// preparations before it uploaded), the images (ids, views) and samplers, the SRT (the flat words, the bindless patches,
+// the GPU-read words as the shader reaches them), the shader data, the bindless images. Not the pipeline (looked up once,
+// before both preparations) and not the images' layouts (the commit sets them). A cached buffer that is no longer the one
+// registered for its guest range when the print is taken (stale: a later acquisition of the same preparation replaced it)
+// is a difference (the buffer registry epoch guard, PrepareDrawBindings, took those away: 2310 per walk before it, 0
+// after). The bindless images are counted apart (bindless_info=): not a worker's result.
+// KYTY_CHECK_CHUNKS_FAULT=N (with =2, diagnostic): every N-th member gets one error in its first preparation's data, the
+// fields in turn; the oracle must report every one (PERF chunk_check fault[...]).
+namespace {
+enum ChunkField : uint32_t { CfBuffers, CfImages, CfSrt, CfData, CfBindless, CfVertex, CfCount };
+const char* const ChunkFieldNames[CfCount] = {"buffers", "images", "srt", "data", "bindless", "vertex"};
+inline uint64_t FpMix(uint64_t h, uint64_t v) {
+	return (h ^ (v + 0x9E3779B97F4A7C15ull + (h << 6u) + (h >> 2u))) * 0x100000001B3ull;
+}
+uint64_t FpBytes(const uint8_t* data, size_t size) {
+	uint64_t h = 0xCBF29CE484222325ull;
+	for (size_t i = 0; i < size; i++) h = (h ^ data[i]) * 0x100000001B3ull;
+	return h;
+}
+struct ChunkBufRec {
+	uint32_t field = CfBuffers; // CfBuffers or CfVertex
+	uint32_t kind  = 0;         // 0: a cached or fixed buffer (its Vulkan buffer, offset, range), 1: the stream ring (bytes)
+	uint64_t address = 0, size = 0; // the guest range (0 for GDS and LDS)
+	uint64_t buffer = 0, offset = 0, range = 0, bytes = 0;
+	bool     stale   = false; // a cached buffer that is no longer the one registered for its guest range
+	[[nodiscard]] bool Same(const ChunkBufRec& o) const {
+		return field == o.field && kind == o.kind && address == o.address && size == o.size && buffer == o.buffer &&
+		       offset == o.offset && range == o.range && bytes == o.bytes;
+	}
+};
+struct ChunkPrint {
+	std::array<uint64_t, CfCount> f {};
+	std::vector<ChunkBufRec>      bufs;
+	std::vector<uint64_t>         bindless; // the bindless images (generation << 32 | index), stage by stage
+};
+struct ChunkCheckState {
+	ChunkPrint                    first, second;
+	std::vector<PreparedBindings*> first_stages; // the first preparation's own bindings, stage by stage
+	uint64_t                      draws = 0, dispatches = 0, bad = 0, mixed = 0, members = 0;
+	uint64_t                      bindless_info = 0;
+	std::array<uint64_t, CfCount> mismatches {}, injected {}, detected {}, injected_mixed {};
+	uint32_t                      fault_turn  = 0;
+	int                           fault_field = -1;       // the field of this member's injected error (-1: none)
+	size_t                        fault_rec   = SIZE_MAX; // its binding record, for a binding
+	uint32_t                      logged      = 0;
+	std::chrono::steady_clock::time_point window = std::chrono::steady_clock::now();
+};
+ChunkCheckState g_chunk_check; // execution thread
+
+uint64_t ChunkFaultEvery() {
+	static const uint64_t every = [] {
+		const char*    value = std::getenv("KYTY_CHECK_CHUNKS_FAULT");
+		const uint64_t n     = value != nullptr ? std::strtoull(value, nullptr, 10) : 0u;
+		if (n != 0) {
+			std::fprintf(stderr, "CHECK_CHUNKS_FAULT=%llu: one error in the first preparation of every %llu-th chunk member\n",
+			             static_cast<unsigned long long>(n), static_cast<unsigned long long>(n));
+		}
+		return n;
+	}();
+	return every;
+}
+
+void ChunkPrintOf(BufferCache& cache, ChunkPrint& p, std::span<PreparedBindings* const> stages, const DrawPlan* plan) {
+	p.f = {};
+	p.bufs.clear();
+	p.bindless.clear();
+	auto&      stream        = cache.GetUtilityBuffer(MemoryUsage::Stream);
+	const auto stream_handle = stream.Handle();
+	const auto mapped        = stream.Mapped();
+	const auto add = [&](uint32_t field, uint64_t address, uint64_t size, vk::Buffer buffer, uint64_t offset, uint64_t range) {
+		ChunkBufRec r;
+		r.field   = field;
+		r.address = address;
+		r.size    = size;
+		if (buffer && buffer == stream_handle) {
+			r.kind  = 1;
+			r.range = range;
+			if (range != VK_WHOLE_SIZE && offset + range <= mapped.size()) {
+				// The first and the last 64 bytes (reads of write-combined memory are slow).
+				const uint64_t head = std::min<uint64_t>(range, 64u);
+				r.bytes = FpMix(FpBytes(mapped.data() + offset, head), FpBytes(mapped.data() + offset + range - head, head));
+			} else {
+				r.bytes = ~offset;
+			}
+		} else {
+			r.buffer = reinterpret_cast<uint64_t>(static_cast<VkBuffer>(buffer));
+			r.offset = offset;
+			r.range  = range;
+			if (address != 0 && size != 0 && buffer) {
+				const auto id = cache.LookupBuffer(address, size);
+				r.stale       = id && cache.GetBuffer(id).Handle() != buffer;
+			}
+		}
+		p.bufs.push_back(r);
+	};
+	auto& f = p.f;
+	for (const auto* stage: stages) {
+		const auto& st = *stage;
+		EXIT_IF(st.buffers.size() < st.buffer_sources.size());
+		for (size_t i = 0; i < st.buffer_sources.size(); i++) {
+			const auto& b = st.buffers[i];
+			add(CfBuffers, st.buffer_sources[i].address, st.buffer_sources[i].size, b.buffer, b.offset, b.range);
+		}
+		add(CfBuffers, 0, 0, st.gds.buffer, st.gds.offset, st.gds.range);
+		add(CfBuffers, 0, 0, st.shared_memory.buffer, st.shared_memory.offset, st.shared_memory.range);
+		for (const auto& image: st.images) {
+			f[CfImages] = FpMix(f[CfImages], (uint64_t {image.image_id.generation} << 32u) | image.image_id.index);
+			f[CfImages] = FpMix(f[CfImages], reinterpret_cast<uint64_t>(static_cast<VkImageView>(image.image_view)));
+			for (const auto view: image.mip_views) f[CfImages] = FpMix(f[CfImages], reinterpret_cast<uint64_t>(static_cast<VkImageView>(view)));
+		}
+		for (const auto sampler: st.samplers) f[CfImages] = FpMix(f[CfImages], reinterpret_cast<uint64_t>(static_cast<VkSampler>(sampler)));
+		if (st.runtime != nullptr && *st.runtime) {
+			const auto& flat = st.runtime->resources->flattened_srt;
+			f[CfSrt] = FpMix(f[CfSrt], FpBytes(reinterpret_cast<const uint8_t*>(flat.data()), flat.size() * sizeof(uint32_t)));
+		}
+		for (const auto& patch: st.bindless_patches) f[CfSrt] = FpMix(FpMix(FpMix(f[CfSrt], patch.offset), patch.region), patch.entries);
+		f[CfSrt]  = FpMix(f[CfSrt], st.gpu_words_key);
+		f[CfData] = FpMix(f[CfData], FpBytes(reinterpret_cast<const uint8_t*>(st.shader_data.data()), st.shader_data.size() * sizeof(uint32_t)));
+		f[CfBindless] = FpMix(f[CfBindless], st.bindless_images.size());
+		for (const auto id: st.bindless_images) {
+			p.bindless.push_back((uint64_t {id.generation} << 32u) | id.index);
+			f[CfBindless] = FpMix(f[CfBindless], p.bindless.back());
+		}
+	}
+	if (plan != nullptr && !plan->mesh_active) {
+		const auto& vin = plan->state->vertex_info[0];
+		const auto& vb  = plan->vertex_bindings;
+		f[CfVertex]     = FpMix(FpMix(f[CfVertex], static_cast<uint64_t>(vin.buffers_num)), vb.count);
+		for (uint32_t i = 0; i < vb.count; i++) {
+			const uint64_t address = static_cast<int>(i) < vin.buffers_num ? vin.buffers[i].addr : 0u;
+			add(CfVertex, address, vb.sizes[i], vb.buffers[i], vb.offsets[i], vb.sizes[i]);
+		}
+		const auto& ib = plan->index_binding;
+		f[CfVertex]    = FpMix(f[CfVertex], static_cast<uint64_t>(ib.type));
+		if (ib.buffer) add(CfVertex, plan->index_source.address, plan->index_source.size, ib.buffer, ib.offset, plan->index_source.size);
+	}
+}
+
+// The images fault: two image views (or two samplers) of the stage swapped; false when the stage has no two distinct ones.
+bool ChunkSwapImages(PreparedBindings& st) {
+	for (size_t j = 1; j < st.images.size(); j++) {
+		if (st.images[j].image_view != st.images[0].image_view) {
+			std::swap(st.images[0].image_view, st.images[j].image_view);
+			return true;
+		}
+	}
+	for (size_t j = 1; j < st.samplers.size(); j++) {
+		if (st.samplers[j] != st.samplers[0]) {
+			std::swap(st.samplers[0], st.samplers[j]);
+			return true;
+		}
+	}
+	return false;
+}
+
+// KYTY_CHECK_CHUNKS_FAULT: one error in the first preparation's data (its own bindings; the commit uses the second's):
+// the next field in turn this member has data for.
+void ChunkInjectFault(ChunkCheckState& s, std::span<PreparedBindings* const> stages, DrawPlan* plan) {
+	size_t stage_records = 0;
+	for (const auto* st: stages) stage_records += st->buffer_sources.size() + 2u;
+	for (uint32_t tries = 0; tries < CfCount && s.fault_field < 0; tries++) {
+		const uint32_t field = s.fault_turn++ % CfCount;
+		size_t         rec   = 0;
+		for (auto* stage: stages) {
+			auto& st = *stage;
+			if (field == CfBuffers && !st.buffer_sources.empty() && st.buffers[0].buffer) {
+				st.buffers[0].offset += 256u;
+				s.fault_rec = rec;
+			} else if (field == CfImages && ChunkSwapImages(st)) {
+			} else if (field == CfSrt && st.gpu_words_key != 0) {
+				st.gpu_words_key ^= 1u; // the GPU-read words as the shader reaches them
+			} else if (field == CfSrt && !st.bindless_patches.empty()) {
+				st.bindless_patches[0].entries += 1u;
+			} else if (field == CfData && !st.shader_data.empty()) {
+				st.shader_data.back() ^= 0x10u;
+			} else if (field == CfBindless && !st.bindless_images.empty()) {
+				st.bindless_images[0].generation += 1u;
+			} else {
+				rec += st.buffer_sources.size() + 2u;
+				continue;
+			}
+			s.fault_field = static_cast<int>(field);
+			break;
+		}
+		if (s.fault_field < 0 && field == CfVertex && plan != nullptr && !plan->mesh_active && plan->vertex_bindings.count != 0) {
+			plan->vertex_bindings.offsets[0] += 256u;
+			s.fault_rec   = stage_records;
+			s.fault_field = static_cast<int>(field);
+		}
+	}
+}
+
+void ChunkCompare(ChunkCheckState& s, bool dispatch, std::span<PreparedBindings* const> stages) {
+	(dispatch ? s.dispatches : s.draws)++;
+	std::array<bool, CfCount>   bad {};
+	std::array<size_t, CfCount> bad_rec {};
+	bad_rec.fill(SIZE_MAX);
+	for (uint32_t i = 0; i < CfCount; i++) bad[i] = s.first.f[i] != s.second.f[i];
+	const auto& a           = s.first.bufs;
+	const auto& b           = s.second.bufs;
+	bool        fault_mixed = false;
+	if (a.size() != b.size()) {
+		bad[CfBuffers] = true;
+	} else {
+		for (size_t i = 0; i < a.size(); i++) {
+			const bool same_range = a[i].field == b[i].field && a[i].address == b[i].address && a[i].size == b[i].size;
+			if (same_range && a[i].kind != b[i].kind) {
+				s.mixed++;
+				if (i == s.fault_rec) fault_mixed = true;
+				continue;
+			}
+			// A stale binding (a replaced buffer) is a difference in either preparation (the buffer registry epoch guard).
+			if (a[i].Same(b[i]) && !a[i].stale && !b[i].stale) continue;
+			bad[a[i].field] = true;
+			if (bad_rec[a[i].field] == SIZE_MAX && i != s.fault_rec) bad_rec[a[i].field] = i;
+		}
+	}
+	if (s.fault_field >= 0) {
+		const auto f = static_cast<uint32_t>(s.fault_field);
+		s.injected[f]++;
+		if (bad[f]) {
+			s.detected[f]++;
+		} else if (fault_mixed) {
+			s.injected_mixed[f]++;
+		}
+		bad[f] = bad_rec[f] != SIZE_MAX; // the injected error is not a difference; another binding of its field still is
+	}
+	// The bindless images are not a worker's result (the tables stay at the commit, plan 9.11 ~20:45; the first
+	// preparation's table state - in-draw marks, the once-per-draw refresh - is what the second sees): counted apart.
+	if (bad[CfBindless]) {
+		s.bindless_info++;
+		bad[CfBindless] = false;
+	}
+	bool any = false;
+	for (uint32_t i = 0; i < CfCount; i++) {
+		if (!bad[i]) continue;
+		s.mismatches[i]++;
+		any = true;
+		if (s.logged >= 40u) continue;
+		s.logged++;
+		const auto hash = [&](size_t k) {
+			return static_cast<unsigned long long>(k < stages.size() && stages[k]->runtime != nullptr && stages[k]->runtime->program != nullptr
+			                                           ? stages[k]->runtime->program->shader_hash
+			                                           : 0u);
+		};
+		std::fprintf(stderr, "CHUNK_CHECK mismatch field=%s op=%s frame=%u hash0=%016llx hash1=%016llx marker=[%s]", ChunkFieldNames[i],
+		             dispatch ? "dispatch" : "draw", DebugPresentCount().load(), hash(0), hash(1), DebugMarkerPath().c_str());
+		if (const auto r = bad_rec[i]; r < a.size() && r < b.size()) {
+			std::fprintf(stderr, " rec=%zu/%zu guest=%llx+%llx/%llx+%llx kind=%u/%u buffer=%llx/%llx offset=%llx/%llx range=%llx/%llx", r,
+			             a.size(), static_cast<unsigned long long>(a[r].address), static_cast<unsigned long long>(a[r].size),
+			             static_cast<unsigned long long>(b[r].address), static_cast<unsigned long long>(b[r].size), a[r].kind, b[r].kind,
+			             static_cast<unsigned long long>(a[r].buffer), static_cast<unsigned long long>(b[r].buffer),
+			             static_cast<unsigned long long>(a[r].offset), static_cast<unsigned long long>(b[r].offset),
+			             static_cast<unsigned long long>(a[r].range), static_cast<unsigned long long>(b[r].range));
+		} else if (i == CfBuffers && a.size() != b.size()) {
+			std::fprintf(stderr, " records=%zu/%zu", a.size(), b.size());
+		} else if (i == CfBindless) {
+			const auto& x = s.first.bindless;
+			const auto& y = s.second.bindless;
+			size_t      k = 0;
+			while (k < x.size() && k < y.size() && x[k] == y[k]) k++;
+			std::fprintf(stderr, " images=%zu/%zu first_diff=%zu id=%llx/%llx", x.size(), y.size(), k,
+			             static_cast<unsigned long long>(k < x.size() ? x[k] : ~0ull),
+			             static_cast<unsigned long long>(k < y.size() ? y[k] : ~0ull));
+		}
+		std::fprintf(stderr, "\n");
+	}
+	if (any) s.bad++;
+	const auto now = std::chrono::steady_clock::now();
+	if (now - s.window < std::chrono::seconds(5)) return;
+	std::string text;
+	for (uint32_t i = 0; i < CfCount; i++) {
+		text += std::string(i == 0 ? "" : " ") + ChunkFieldNames[i] + "=" + std::to_string(s.mismatches[i]);
+	}
+	if (ChunkFaultEvery() != 0) {
+		// Per field: injected/detected/injected into a mixed binding (not detectable: the two preparations' buffers differ).
+		text += "] fault[";
+		for (uint32_t i = 0; i < CfCount; i++) {
+			text += std::string(i == 0 ? "" : " ") + ChunkFieldNames[i] + "=" + std::to_string(s.injected[i]) + "/" +
+			        std::to_string(s.detected[i]) + "/" + std::to_string(s.injected_mixed[i]);
+		}
+	}
+	std::fprintf(stderr,
+	             "PERF chunk_check draws=%llu dispatches=%llu bad=%llu mixed=%llu bindless_info=%llu mismatches[%s]\n",
+	             static_cast<unsigned long long>(s.draws), static_cast<unsigned long long>(s.dispatches),
+	             static_cast<unsigned long long>(s.bad), static_cast<unsigned long long>(s.mixed),
+	             static_cast<unsigned long long>(s.bindless_info), text.c_str());
+	s.window = now;
+}
+} // namespace
+
+PreparedBindings& RenderExecutor::ChunkScratchBindings(uint32_t index) {
+	static std::array<PreparedBindings, 5> scratch; // execution thread
+	return scratch.at(index);
+}
+
+void RenderExecutor::ChunkCheckFirst(std::span<PreparedBindings* const> stages, DrawPlan* plan) {
+	auto& s       = g_chunk_check;
+	s.fault_field = -1;
+	s.fault_rec   = SIZE_MAX;
+	if (const uint64_t every = ChunkFaultEvery(); every != 0 && ++s.members % every == 0) ChunkInjectFault(s, stages, plan);
+	ChunkPrintOf(m_context.GetBufferCache(), s.first, stages, plan);
+	s.first_stages.assign(stages.begin(), stages.end());
+}
+
+void RenderExecutor::ChunkCheckSecond(std::span<PreparedBindings* const> stages, const DrawPlan* plan, bool dispatch) {
+	auto& s = g_chunk_check;
+	ChunkPrintOf(m_context.GetBufferCache(), s.second, stages, plan);
+	ChunkCompare(s, dispatch, stages);
+	// A table lists only the images whose layout changed since it last listed them (ListTableImagesByEvents): the first
+	// preparation took those events, so the committed stage also gets the images the first one listed (the commit's
+	// layout transitions are repeatable; it gets at least what a run without the oracle gets).
+	for (size_t k = 0; k < stages.size() && k < s.first_stages.size(); k++) {
+		auto&        committed = stages[k]->bindless_images;
+		const auto&  first     = s.first_stages[k]->bindless_images;
+		const size_t before    = committed.size();
+		for (const auto id: first) {
+			// Without the duplicate check above a few images (the search is linear; a repeated transition is harmless).
+			if (before > 64u || first.size() > 64u || std::ranges::find(committed, id) == committed.end()) committed.push_back(id);
+		}
+	}
+}
+
+// Project 15 (the buffer registry epoch guard, 9.11; found by the oracle v2: merged=): a draw takes its buffer bindings
+// one after another - the stages' storage buffers (RebindBuffers), then the vertex, index and indirect buffers - and a later
+// acquisition can create a buffer that joins one an earlier binding named (CreateBuffer, JoinOverlap: the old buffer is
+// unregistered, its bytes copied into the new one; a read through the old one gets the same bytes, a write would be lost).
+// FindBuffers registers the stages' ranges first, the vertex and index ranges it does not. So when the buffer registry
+// changed while the bindings were taken (DrawRepeat::g_buffer_registry_epoch, every registration and unregistration), the
+// buffer part is taken again: the next pass creates nothing (every range is registered now), its bindings name the
+// registered buffers. PrepareBindings is not repeated (a table's image listing is taken once, ListTableImagesByEvents).
+void RenderExecutor::PrepareDrawBindings(DrawPlan& plan, CommandBuffer& buffer, std::span<RenderColorInfo> colors,
+                                         std::chrono::steady_clock::time_point* buffers_mark) {
+	const ChunkLead::FloorTimer floor_draw_bind(ChunkLead::FpDrawBind); // KYTY_TRACE_PEEK_CENSUS (way B W0 A8)
+	const auto stages = std::span {plan.descriptor_stages.data(), plan.stage_count};
+	PrepareGraphicsBuffersHead(stages);
+	PrepareGraphicsImages(stages, colors);
+	const auto& epoch = DrawRepeat::g_buffer_registry_epoch;
+	uint64_t    seen  = epoch.load(std::memory_order_acquire);
+	struct GuardStats {
+		uint64_t repeated = 0, passes = 0, unstable = 0;
+		std::chrono::steady_clock::time_point window = std::chrono::steady_clock::now();
+	};
+	static GuardStats stats; // execution thread
+	for (uint32_t pass = 0;; pass++) {
+		PrepareGraphicsBuffersTail(stages);
+		if (pass == 0 && buffers_mark != nullptr) *buffers_mark = std::chrono::steady_clock::now();
+		if (!plan.mesh_active) {
+			const ChunkLead::FloorTimer floor_vtx(ChunkLead::FpVtxIdx); // KYTY_TRACE_PEEK_CENSUS (W3 P0)
+			if (pass == 0) LogDrawPhase(plan.draw.Name(), "PrepareVertexBuffers");
+			plan.vertex_bindings = {};
+			AcquireVertexBuffers(buffer, plan.state->vertex_info[0], plan.vertex_bindings);
+			plan.index_binding = PrepareIndexBuffer(buffer, plan.index_source);
+			if (plan.indirect) {
+				// GPU-written records stay in their cached buffer (no readback); CPU-written ones upload.
+				auto& cache        = m_context.GetBufferCache();
+				plan.indirect_args = cache.ObtainBuffer(plan.indirect->args_addr, plan.indirect->args_size, false);
+				if (plan.indirect->count_addr != 0) {
+					plan.indirect_count = cache.ObtainBuffer(plan.indirect->count_addr, sizeof(uint32_t), false);
+				}
+			}
+		}
+		const uint64_t now_epoch = epoch.load(std::memory_order_acquire);
+		if (now_epoch == seen) break;
+		seen = now_epoch;
+		if (pass == 0) stats.repeated++;
+		stats.passes++;
+		if (pass == 3) {
+			// Still changing after four passes: today's bindings of the last pass are kept (counted; expected 0).
+			if (stats.unstable++ == 0) {
+				std::fprintf(stderr, "BUFFER_GUARD unstable frame=%u marker=[%s]\n", DebugPresentCount().load(), DebugMarkerPath().c_str());
+			}
+			break;
+		}
+	}
+	static const bool perf = std::getenv("KYTY_TRACE_PERF") != nullptr;
+	if (perf) {
+		const auto now = std::chrono::steady_clock::now();
+		if (now - stats.window >= std::chrono::seconds(5)) {
+			std::fprintf(stderr, "PERF buffer_guard repeated=%llu passes=%llu unstable=%llu\n",
+			             static_cast<unsigned long long>(stats.repeated), static_cast<unsigned long long>(stats.passes),
+			             static_cast<unsigned long long>(stats.unstable));
+			stats.window = now;
+		}
+	}
+}
+
+static bool PlanNoSetHint(); // N5.0 (below)
+
 void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer,
                                          const DrawCallInfo& draw, DrawRenderState& state,
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
                                          const DrawIndexBufferSource& index_source,
 	                                     bool primitive_restart_enable,
                                          const DrawIndirectSource* indirect) {
+	const ChunkLead::FloorTimer floor_execute(ChunkLead::FpExecute); // KYTY_TRACE_PEEK_CENSUS (N3.0)
 	auto& ucfg = buffer.GetUserConfig();
 	// KYTY_DIAG_GPU_BURN_AT=draw (measurement only, map 6.11): the per-draw sensitivity - every draw's preparation.
 	if (GpuBurnSelected() == GpuBurnSite::Draw) GpuBurnAt(GpuBurnSite::Draw);
@@ -2056,17 +2984,70 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	const bool     c0_parts     = CleanDraws::On();
 	const auto     c0_pipeline  = c0_parts ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 	const uint64_t c0_programs0 = CleanDraws::t_front_parts.programs_ns;
+	// KYTY_CHECK_PEEK=2 (S2c): the key from the described targets and the registers, and the pipeline found without a write.
+	std::pair<PipelineCache::Pipeline*, PipelineCache::PipelineFind> peek_find {nullptr, PipelineCache::PipelineFind::Count};
+	size_t                                                           peek_pipelines = 0;
+	if (PeekTargets::Check() && PeekTargets::g_scratch.valid) {
+		auto& sc = PeekTargets::g_scratch;
+		auto& st = PeekTargets::g_stats;
+		auto& pc = m_context.GetPipelineCache();
+		sc.valid = false;
+		st.draws++;
+		const auto* ps_info   = state.ps_active ? &state.ps_input_info : nullptr;
+		++t_translator;
+		const auto  key_peek  = pc.MakeGraphicsPipelineKeyFrom(std::span {sc.colors, sc.count}, sc.depth, vertex_stages, buffer.GetRegisters(),
+		                                                       buffer.GetUserConfig(), ps_info, topology, primitive_restart_enable,
+		                                                       state.programs, true);
+		peek_find             = pc.FindGraphicsPipeline(key_peek);
+		--t_translator;
+		const auto key_today = pc.MakeGraphicsPipelineKeyFrom(std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages,
+		                                                      buffer.GetRegisters(), buffer.GetUserConfig(), ps_info, topology,
+		                                                      primitive_restart_enable, state.programs, false);
+		if (!(key_peek == key_today)) st.key_bad++;
+		CheckAheadKey(key_today);
+		st.find[static_cast<size_t>(peek_find.second)]++;
+		if (peek_find.second == PipelineCache::PipelineFind::Found && !mesh_active) t_op_pipeline = true; // the operation's plan
+		if (t_peek_member == 1) st.member_find[static_cast<size_t>(peek_find.second)]++;
+		peek_pipelines = pc.GraphicsPipelineCount();
+		PeekTargets::Report();
+	}
+	const auto peek_compare = [&](PipelineCache::Pipeline* today) {
+		if (peek_find.second != PipelineCache::PipelineFind::Found) return;
+		auto& st = PeekTargets::g_stats;
+		st.compared++;
+		auto*      predicted = peek_find.first;
+		const bool fault     = PeekTargets::FaultEvery() != 0 && st.compared % PeekTargets::FaultEvery() == 0;
+		if (fault) {
+			predicted = nullptr;
+			st.injected++;
+		}
+		const bool created = m_context.GetPipelineCache().GraphicsPipelineCount() != peek_pipelines;
+		if (created) st.created++;
+		if (predicted != today || created) (fault ? st.detected : st.bad)++;
+	};
 	// A draw of today's programs whose pipeline is not created yet is not issued (StageWritesMemory, above).
 	PipelineCache::Pipeline* async_pipeline = nullptr;
-	// KYTY_PERF_TABLE_ASYNC=0: every draw waits for its pipeline (none is skipped), as draws that write memory always do.
-	if (DrawWritesMemory(state) || !PipelineCache::TableAsyncEnabled()) {
+	// N4.3/N5: a plan with programs adopted as predicted is used (its pipeline, sets, buffer entries); not under the checks
+	// that compare it with today's way (the oracle, the buffer-entry check).
+	const bool use_plan = !ChunkCensus::CheckOn() && !BufferCache::PlanBufferCheck() && PlanPresent() && PlanProgramsHold();
+	if (use_plan) {
+		g_ahead.used_draws++;
+		async_pipeline = m_context.GetPipelineCache().TakePlannedPipeline(PlanPipeline());
+		if (async_pipeline != nullptr) g_ahead.used_pipeline++;
+	}
+	if (async_pipeline != nullptr) {
+		// (taken from the plan)
+	} else if (DrawWritesMemory(state) || !PipelineCache::TableAsyncEnabled()) {
+		// KYTY_PERF_TABLE_ASYNC=0: every draw waits for its pipeline (none is skipped), as draws that write memory always do.
 		NoteAsyncDraw(false);
 	} else {
 		bool failed    = false; // (a worker could not create it: today's creation on this thread)
+		const ChunkLead::FloorTimer floor_pipeline(ChunkLead::FpPipeline); // KYTY_TRACE_PEEK_CENSUS (N3.0)
 		async_pipeline = m_context.GetPipelineCache().GetGraphicsPipelineAsync(
 		    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
 		    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable, state.programs, &failed);
 		if (async_pipeline == nullptr && !failed) {
+			peek_compare(nullptr);
 			NoteAsyncDraw(true);
 			m_async_skipped_draws++;
 			return;
@@ -2078,6 +3059,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	                           std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
 	                           state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
 	                           state.programs);
+	peek_compare(&pipeline);
 	if (c0_parts) {
 		const auto total = static_cast<uint64_t>(
 		    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - c0_pipeline).count());
@@ -2112,6 +3094,55 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	plan.indirect_args     = {};
 	plan.indirect_count    = {};
 	if (CleanDraws::On()) C0::Plan(plan, buffer, state, vertex_stages, &pipeline); // KYTY_TRACE_CLEAN_DRAWS
+	// KYTY_CHECK_CHUNKS=2 (project 15, the oracle v2): a chunk-member draw is prepared once more, into bindings of its own,
+	// before its preparation below; the two preparations' prints must be equal (the commit uses the second).
+	const bool chunk_check = ChunkCensus::CheckOn() && ChunkCensus::t_member && !mesh_active;
+	if (chunk_check) {
+		// N4.2a: with a plan (PeekAhead, programs predicted right), the first preparation takes the plan's table sets and
+		// pipeline; without one, or with programs adopted otherwise (the plan rejected), today's.
+		auto&      a        = g_ahead;
+		const bool has_plan = PlanPresent();
+		const bool use_plan = has_plan && PlanProgramsHold();
+		if (!has_plan) {
+			a.no_plan++;
+		} else if (!use_plan) {
+			a.rejected++;
+		} else {
+			a.plan_draws++;
+			if (auto* planned = PlanPipeline(); planned != nullptr && planned != &pipeline) a.pipeline_bad++;
+		}
+		const auto prepare_first = [&](const ShaderStageRuntime& stage, PreparedBindings& out) {
+			m_plan_set_version = use_plan ? PlanSetVersion(stage.program) : 0u;
+			PrepareBindings(stage, out);
+			m_plan_set_version = 0;
+		};
+		for (uint32_t i = 0; i < vertex_stages.size(); i++) {
+			prepare_first(state.vertex_info[i].stage, ChunkScratchBindings(i));
+			plan.descriptor_stages[plan.stage_count++] = &ChunkScratchBindings(i);
+		}
+		if (state.ps_active) {
+			prepare_first(state.ps_input_info.stage, ChunkScratchBindings(3));
+			plan.descriptor_stages[plan.stage_count++] = &ChunkScratchBindings(3);
+		}
+		PrepareDrawBindings(plan, buffer, std::span {state.color_info, state.color_count}, nullptr);
+		ChunkCheckFirst(std::span {plan.descriptor_stages.data(), plan.stage_count}, &plan);
+		plan.descriptor_stages = {};
+		plan.stage_count       = 0;
+		plan.vertex_bindings   = {};
+		plan.index_binding     = {};
+		plan.indirect_args     = {};
+		plan.indirect_count    = {};
+		m_context.GetBindlessTable().BeginPlan();
+	}
+	// N4.2b (KYTY_CHECK_PLAN_BUFFERS=2): the plan's buffer entries checked by the acquisitions below.
+	struct PlanBuffersScope {
+		bool on;
+		~PlanBuffersScope() {
+			if (on) BufferCache::SetPlanBuffers(nullptr);
+		}
+	} const plan_buffers_scope {BufferCache::PlanBufferCheck() || use_plan};
+	if (plan_buffers_scope.on) PlanBuffersBegin();
+	m_plan_set_version = 0;
 	// The binding preparation.
 	{
 		const uint32_t long_us = LongPrepThresholdUs(); // KYTY_TRACE_LONG_PREP
@@ -2122,34 +3153,43 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 		{
 			for (uint32_t i = 0; i < vertex_stages.size(); i++) {
+				m_plan_set_version = use_plan && !PlanNoSetHint() ? PlanSetVersion(state.vertex_info[i].stage.program) : 0u; // N4.3
 				PrepareBindings(state.vertex_info[i].stage, bindings.vertex[i]);
+				m_plan_set_version = 0;
 				plan.descriptor_stages[plan.stage_count++] = &bindings.vertex[i];
 			}
 			if (long_us != 0) marks[1] = std::chrono::steady_clock::now();
 			if (state.ps_active) {
 				if (!bindings.pixel) bindings.pixel.emplace();
+				m_plan_set_version = use_plan && !PlanNoSetHint() ? PlanSetVersion(state.ps_input_info.stage.program) : 0u; // N4.3
 				PrepareBindings(state.ps_input_info.stage, *bindings.pixel);
+				m_plan_set_version = 0;
 				plan.descriptor_stages[plan.stage_count++] = &*bindings.pixel;
 			}
 			if (long_us != 0) marks[2] = std::chrono::steady_clock::now();
-			const auto stages = std::span {plan.descriptor_stages.data(), plan.stage_count};
-			PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
-			if (long_us != 0) marks[3] = std::chrono::steady_clock::now();
-			if (!plan.mesh_active) {
-				LogDrawPhase(draw.Name(), "PrepareVertexBuffers");
-				AcquireVertexBuffers(buffer, state.vertex_info[0], plan.vertex_bindings);
-				plan.index_binding = PrepareIndexBuffer(buffer, index_source);
-				if (indirect != nullptr) {
-					// GPU-written records stay in their cached buffer (no readback); CPU-written ones upload.
-					auto& cache        = m_context.GetBufferCache();
-					plan.indirect_args = cache.ObtainBuffer(indirect->args_addr, indirect->args_size, false);
-					if (indirect->count_addr != 0) {
-						plan.indirect_count = cache.ObtainBuffer(indirect->count_addr, sizeof(uint32_t), false);
-					}
-				}
-			}
+			PrepareDrawBindings(plan, buffer, std::span {state.color_info, state.color_count}, long_us != 0 ? &marks[3] : nullptr);
 		}
 		if (long_us != 0) marks[4] = std::chrono::steady_clock::now();
+		if (long_us != 0) {
+			// Every draw's parts summed; about every 5 s their mean per draw (us) as one PERF prep_parts line.
+			static std::array<uint64_t, 37> sum {};
+			static uint64_t                 draws = 0;
+			static auto                     window = std::chrono::steady_clock::now();
+			for (size_t i = 0; i < 33; i++) sum[i] += t_long_prep_parts[i];
+			for (size_t i = 0; i < 4; i++)
+				sum[33 + i] += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(marks[i + 1] - marks[i]).count());
+			draws++;
+			if (marks[4] - window >= std::chrono::seconds(5)) {
+				const double n = static_cast<double>(draws) * 1e3;
+				std::fprintf(stderr, "PERF prep_parts draws=%llu vs=%.2f ps=%.2f graphics=%.2f vtx=%.2f |",
+				             static_cast<unsigned long long>(draws), sum[33] / n, sum[34] / n, sum[35] / n, sum[36] / n);
+				for (size_t i = 1; i < 33; i++) {
+					if (i < 26 || i > 29) std::fprintf(stderr, " %zu=%.3f", i, sum[i] / n);
+				}
+				std::fprintf(stderr, "\n");
+				sum = {}; draws = 0; window = marks[4];
+			}
+		}
 		if (long_us != 0) {
 			const auto us   = [&](size_t a, size_t b) {
                 return static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(marks[b] - marks[a]).count()) / 1e3;
@@ -2187,12 +3227,14 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		plan.bindless_heaps_end  = m_context.GetBindlessTable().DrawHeapCount(); // S2 step B.4f
 		plan.bindless_tables_end = m_context.GetBindlessTable().DrawTableCount();
 	}
+	if (chunk_check) ChunkCheckSecond(std::span {plan.descriptor_stages.data(), plan.stage_count}, &plan, false);
 	CommitPreparedDraw(plan);
 }
 
 // The second half of a draw: records what its preparation left in the plan (renderDrawPlan.h). With the render mutex held.
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::CommitPreparedDraw(DrawPlan& plan) {
+	const ChunkLead::FloorTimer floor_commit(ChunkLead::FpCommit); // KYTY_TRACE_PEEK_CENSUS (N3.0)
 	const auto                submit_id                = plan.submit_id;
 	CommandBuffer&            buffer                   = *plan.buffer;
 	const DrawCallInfo&       draw                     = plan.draw;
@@ -2214,6 +3256,7 @@ void RenderExecutor::CommitPreparedDraw(DrawPlan& plan) {
 	std::optional<C0::CommitScope> c0_commit; // KYTY_TRACE_CLEAN_DRAWS: the draw's kind and its commit's time
 	if (CleanDraws::On()) c0_commit.emplace(C0::Commit(plan, stages, buffer.Handle()));
 	std::optional<DispatchSubTimer> commit_census(std::in_place, DispatchSub::CAcquire); // KYTY_TRACE_DRAW_CENSUS
+	std::optional<ChunkLead::FloorTimer> floor_acquire(std::in_place, ChunkLead::FpAcquire); // KYTY_TRACE_PEEK_CENSUS (W0 A12)
 	ApplyPlanFlags(); // the plan flags: the draw's image flags, before the targets read them
 	// S1.2: the render targets are acquired in order (GPU-written marks, tracking, layout transitions): part of the
 	// commit, before its recording.
@@ -2226,9 +3269,22 @@ void RenderExecutor::CommitPreparedDraw(DrawPlan& plan) {
 		const bool any = OwnerDrawRect(vertex_stages.back(), state.color_info, state.color_count, plan.regs, ox0, oy0, ox1, oy1);
 		TextureCache::OwnerSetDrawRect(any, ox0, oy0, ox1, oy1);
 	}
+	const bool     target_repeat = TargetRepeat::On(); // KYTY_TRACE_TARGET_REPEAT
+	const auto     tr_start      = target_repeat ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+	const uint64_t tr_barriers   = DrawCoverage::t_barriers;
+	TargetTrace::t_phase  = 1;
 	RenderState rendering = AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info, feedback_aspects, stages);
+	TargetTrace::t_phase  = 0;
+	if (target_repeat) {
+		TargetRepeat::Note(rendering,
+		                   static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                                             std::chrono::steady_clock::now() - tr_start)
+		                                             .count()),
+		                   DrawCoverage::t_barriers - tr_barriers);
+	}
 	if (owner_on) TextureCache::OwnerSetDrawRect(false, 0, 0, 0, 0);
 	commit_census.reset();
+	floor_acquire.reset();
 	// Resource preparation (ExecutePreparedDraw) may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest memory.
 	auto vk_buffer = buffer.Handle();
@@ -2255,7 +3311,9 @@ void RenderExecutor::CommitPreparedDraw(DrawPlan& plan) {
 		const DispatchSubTimer bind_census(DispatchSub::CBind); // KYTY_TRACE_DRAW_CENSUS
 		const CommitTargets    commit_targets {state.color_info, state.color_count, &state.depth_info}; // K5
 		m_commit_targets = &commit_targets;
+		TargetTrace::t_phase = 2; // KYTY_TRACE_TARGET_REPEAT
 		CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
+		TargetTrace::t_phase = 0;
 		m_commit_targets    = nullptr;
 	}
 	// The ObjPrimID write: this draw's VGT_OBJECT_ID, after CommitBindings (which pushes the whole block). The
@@ -2886,7 +3944,7 @@ void RenderExecutor::CommitPreparedDraw(DrawPlan& plan) {
 	}
 }
 
-// A resolution ahead of execution (see ResolveDrawAhead): the draw state with its shader programs or the dispatch's input
+// A resolution ahead of execution (see ResolveTaskInto): the draw state with its shader programs or the dispatch's input
 // info, the stages they point to, and whether the execution thread still uses them.
 // Based on TheCruZ/KytyPS5-GTA daaf45201 (renderDraw.cpp), GPL-2.0.
 struct RenderExecutor::ResolvedDraw {
@@ -2901,8 +3959,27 @@ struct RenderExecutor::ResolvedDraw {
 	const HW::Shader*      shaders    = nullptr; // the draw's register snapshot
 	bool                   is_compute = false;
 	bool                   consumed   = false; // an indirect packet's CPU expansion: only its first draw asks
-	std::atomic_bool       busy {false};
+	// Project 15 N2.2: the slot's phase (ResolvedPhase): free; pending (taken, its task not begun); running (a helper
+	// resolves it); ready (resolved, `empty`: nothing to resolve); stolen (the execution thread took its operation before
+	// the helper began; the helper frees it when it takes the task).
+	std::atomic<uint8_t>   phase {0};
+	bool                   empty = false;
+	ResolvedDraw*          check = nullptr; // KYTY_CHECK_RESOLVE=2: the helper's slot of the same operation
+	uint32_t               fault = 0;       // KYTY_CHECK_RESOLVE_FAULT: the error put into this (helper's) result
+	// Project 15 N4.1 (KYTY_CHECK_PEEK=2): what the chunk's opening peeked for this draw ahead (PeekAhead).
+	struct Ahead {
+		bool                                                             key_valid = false, front = false, planned = false;
+		uint32_t                                                         distance  = 0;
+		PipelineCache::GraphicsPipelineKey                               key {};
+		std::pair<PipelineCache::Pipeline*, PipelineCache::PipelineFind> find {nullptr, PipelineCache::PipelineFind::Count};
+		std::vector<std::pair<const void*, PeekStageImagesResult>>      images;
+		std::vector<PlanBuffer>                                          buffers; // N4.2b
+	} ahead;
 };
+
+namespace {
+enum ResolvedPhase : uint8_t { PhaseFree = 0, PhasePending = 1, PhaseRunning = 2, PhaseReady = 3, PhaseStolen = 4 };
+} // namespace
 
 // More resolutions than operations can wait between the resolve and execution threads (GuestGpu::ResolvedQueueSize), so
 // the resolve thread only ever waits for room in that queue.
@@ -2919,22 +3996,32 @@ RenderExecutor::ResolvedDraw& RenderExecutor::NextResolvedDraw() {
 	}
 	auto& ring = *m_resolved_ring;
 	auto& draw = ring.draws[ring.next];
-	// The execution thread releases resolutions in order.
-	for (Common::SpinWait wait; draw.busy.load(std::memory_order_acquire);) {
+	// The execution thread releases resolutions in order (a stolen slot: the helper, when it takes its task).
+	for (Common::SpinWait wait; draw.phase.load(std::memory_order_acquire) != PhaseFree;) {
 		if (!wait.Spin()) std::this_thread::yield();
 	}
 	ring.next     = (ring.next + 1) % ResolvedDrawRing::Size;
 	draw.consumed = false;
+	draw.ahead.key_valid = false; // N4.1
+	draw.ahead.find      = {nullptr, PipelineCache::PipelineFind::Count}; // (n4-3-przeglad.md 2.1)
+	draw.ahead.planned   = false;
+	draw.ahead.images.clear();
+	draw.ahead.buffers.clear();
+	draw.empty    = false;
+	draw.check    = nullptr;
+	draw.fault    = 0;
 	return draw;
 }
 
-RenderExecutor::ResolvedDraw* RenderExecutor::ResolveDrawAhead(const HW::Context& context, const HW::UserConfig& user_config,
-                                                               const HW::Shader& shaders,
-                                                               const ShaderIndirectDrawInfo& indirect_draw) {
-	// A metadata, copy or resolve operation in place of the draw selects nothing.
-	const auto mode = context.GetColorControl().mode;
-	if ((mode != 0u && mode != 1u) || !DrawHasValidVertexShader(shaders)) return nullptr;
+RenderExecutor::ResolvedDraw& RenderExecutor::TakeResolvedSlot() {
 	auto& draw = NextResolvedDraw();
+	draw.phase.store(PhasePending, std::memory_order_relaxed); // taken from its allocation (published with its operation or task)
+	return draw;
+}
+
+bool RenderExecutor::ResolveDrawInto(ResolvedDraw& draw, const HW::Context& context, const HW::UserConfig& user_config,
+                                     const HW::Shader& shaders, const ShaderIndirectDrawInfo& indirect_draw) {
+	std::optional<ChunkLead::PartTimer> slot_timer(std::in_place, ChunkLead::RpSlot); // KYTY_TRACE_CHUNK_LEAD (N2.0)
 	auto& state = draw.state;
 	ResetDrawState(state);
 	state.indirect_draw = indirect_draw;
@@ -2945,35 +4032,37 @@ RenderExecutor::ResolvedDraw* RenderExecutor::ResolveDrawAhead(const HW::Context
 	state.ps_active               = shaders.GetPs().ps_regs.data_addr != 0 &&
 	                  (color_output_mask != 0 || PixelShaderHasDepthOrCoverageSideEffects(shader_regs));
 	const auto target_export_mapping = TargetExportMapping(context, color_output_mask);
+	slot_timer.reset();
 	m_context.GetPipelineCache().ResolveGraphicsPrograms(m_context, shaders.GetVs(), shaders.GetPs(), shader_regs, context,
 	                                                     user_config, target_export_mapping, state.ps_active, state.vertex_info,
 	                                                     state.ps_input_info, indirect_draw, state.programs, *draw.stages);
-	if (ResolvedStagesEmpty(*draw.stages)) return nullptr;
+	if (ResolvedStagesEmpty(*draw.stages)) return false;
 	draw.shaders    = &shaders;
 	draw.is_compute = false;
-	draw.busy.store(true, std::memory_order_relaxed); // published with the operation that carries it
-	return &draw;
+	return true;
 }
 
-RenderExecutor::ResolvedDraw* RenderExecutor::ResolveDispatchAhead(const HW::Shader& shaders, uint32_t groups_x,
-                                                                   uint32_t groups_y, uint32_t groups_z, uint32_t mode,
-                                                                   bool indirect, bool async_compute) {
-	auto& draw = NextResolvedDraw();
+bool RenderExecutor::ResolveDispatchInto(ResolvedDraw& draw, const HW::Shader& shaders, uint32_t groups_x, uint32_t groups_y,
+                                         uint32_t groups_z, uint32_t mode, bool indirect, bool async_compute) {
 	m_context.GetPipelineCache().ResolveDispatchPrograms(m_context, shaders.GetCs(), groups_x, groups_y, groups_z, mode, indirect,
 	                                                     async_compute, draw.compute, draw.compute_program, *draw.stages);
-	if (ResolvedStagesEmpty(*draw.stages)) return nullptr;
+	if (ResolvedStagesEmpty(*draw.stages)) return false;
 	draw.shaders    = &shaders;
 	draw.is_compute = true;
-	draw.busy.store(true, std::memory_order_relaxed);
-	return &draw;
+	return true;
 }
 
 void RenderExecutor::UseResolvedDraw(ResolvedDraw* resolved) noexcept {
 	m_resolved_draw   = resolved;
+	m_slot_taken      = false;
 	t_resolved_stages = resolved != nullptr ? resolved->stages : nullptr;
 }
 
 DrawRenderState* RenderExecutor::TakeResolvedState(const ShaderIndirectDrawInfo& indirect_draw) {
+	const ChunkLead::FloorTimer floor_take(ChunkLead::FpTake); // KYTY_TRACE_PEEK_CENSUS (way B W0 A2)
+	// N7.2: per draw, not per operation - a GPU indirect packet that took the slot and then went to the CPU expansion must
+	// not leave its plan to the expansion's draws (they fail to take the used slot).
+	m_slot_taken         = false;
 	auto* const resolved = m_resolved_draw;
 	if (resolved == nullptr || resolved->is_compute || std::exchange(resolved->consumed, true) ||
 	    t_draw_regs.sh != resolved->shaders || indirect_draw.Key() != resolved->state.indirect_draw.Key() ||
@@ -2981,6 +4070,7 @@ DrawRenderState* RenderExecutor::TakeResolvedState(const ShaderIndirectDrawInfo&
 		return nullptr;
 	}
 	m_state_resolved = true;
+	m_slot_taken     = true; // N4.2: the draw runs on the slot's state (its plan may be used)
 	return &resolved->state;
 }
 
@@ -2998,7 +4088,110 @@ bool RenderExecutor::TakeResolvedDispatch(ShaderComputeInputInfo& input_info, Sh
 }
 
 void RenderExecutor::ReleaseResolvedDraw(ResolvedDraw* resolved) noexcept {
-	resolved->busy.store(false, std::memory_order_release);
+	resolved->phase.store(PhaseFree, std::memory_order_release);
+}
+
+// Project 15 N2.2: the helper's resolution of a task (the draw's pre-check included) and the phases around it.
+bool RenderExecutor::ResolveTaskInto(ResolvedDraw& slot, const ResolveTask& task) {
+	bool ok = false;
+	if (task.dispatch) {
+		ok = ResolveDispatchInto(slot, *task.shaders, task.groups_x, task.groups_y, task.groups_z, task.mode, task.indirect,
+		                         task.async_compute);
+	} else {
+		const auto mode = task.context->GetColorControl().mode;
+		ok              = (mode == 0u || mode == 1u) && DrawHasValidVertexShader(*task.shaders) &&
+		     ResolveDrawInto(slot, *task.context, *task.user_config, *task.shaders, task.indirect_draw);
+	}
+	if (ok && task.fault != 0u) { // KYTY_CHECK_RESOLVE_FAULT
+		ResolveCheckFault(slot, task.fault);
+		slot.fault = task.fault;
+	}
+	slot.empty = !ok;
+	if (ok && !task.dispatch && task.build_plan) {
+		// N5.3: the helper builds the draw's plan while the slot is still its own (before it is marked ready).
+		PeekAhead(&slot, *task.context, *task.user_config, *task.shaders, task.indexed, task.draw_count, 1u, task.index_type,
+		          task.slice_offset, task.draw_indirect, std::min(task.lead, 127u), task.index_address,
+		          task.gpu_indirect ? &task.indirect_args : nullptr);
+		// N7.1: the outcome counters for the report (the helper's scratch slot 3 + index names its row)
+		if (slot.ahead.planned) t_helper_plans_made++;
+		if (task.gpu_indirect) t_helper_packets++;
+		const uint32_t row = ShaderRecompiler::IR::t_ahead_scratch_slot - 3u;
+		if ((t_ahead_helper.planned & 255u) == 0 && row < 2u) {
+			g_helper_plan_snap[row].Publish(t_ahead_helper, t_helper_plans_made, t_helper_packets);
+		}
+	}
+	slot.phase.store(PhaseReady, std::memory_order_release);
+	return ok;
+}
+
+bool RenderExecutor::BeginResolveTask(ResolvedDraw* slot) noexcept {
+	uint8_t expected = PhasePending;
+	if (slot->phase.compare_exchange_strong(expected, PhaseRunning, std::memory_order_acq_rel)) return true;
+	// Stolen: the execution thread went on without it; this task was its last user.
+	slot->phase.store(PhaseFree, std::memory_order_release);
+	return false;
+}
+
+RenderExecutor::ResolvedClaim RenderExecutor::TryClaimResolvedDraw(ResolvedDraw* resolved, bool steal) noexcept {
+	uint8_t phase = resolved->phase.load(std::memory_order_acquire);
+	if (phase == PhasePending && steal &&
+	    resolved->phase.compare_exchange_strong(phase, PhaseStolen, std::memory_order_acq_rel)) {
+		return ResolvedClaim::Stolen;
+	}
+	if (phase == PhaseReady) return resolved->empty ? ResolvedClaim::Empty : ResolvedClaim::Ready;
+	return ResolvedClaim::Running;
+}
+
+RenderExecutor::ResolvedDraw* RenderExecutor::ResolvedCheckSlot(ResolvedDraw* resolved) noexcept {
+	return resolved->check;
+}
+
+void RenderExecutor::SetResolvedCheckSlot(ResolvedDraw* resolved, ResolvedDraw* check) noexcept {
+	resolved->check = check;
+}
+
+int RenderExecutor::CompareResolved(const ResolvedDraw& reference, const ResolvedDraw& helper, const char** field) {
+	*field = nullptr;
+	if (reference.empty && helper.empty) return 0;
+	if (reference.empty != helper.empty) {
+		*field = "empty";
+		return 1;
+	}
+	const int stages = ResolvedStagesCompare(*reference.stages, *helper.stages, field);
+	if (stages != 3) return stages;
+	const auto bad = [&](const char* name) {
+		*field = name;
+		return 4;
+	};
+	if (reference.is_compute != helper.is_compute) return bad("is_compute");
+	if (reference.shaders != helper.shaders) return bad("shaders");
+	if (reference.is_compute) {
+		if (!std::ranges::equal(reference.compute.workgroup_counts, helper.compute.workgroup_counts)) return bad("compute_groups");
+	} else {
+		if (reference.state.ps_active != helper.state.ps_active) return bad("ps_active");
+		if (reference.state.indirect_draw.Key() != helper.state.indirect_draw.Key()) return bad("indirect_draw");
+	}
+	return 3;
+}
+
+uint32_t RenderExecutor::ResolvedFault(const ResolvedDraw* slot) noexcept {
+	return slot->fault;
+}
+
+void RenderExecutor::SetResolveCheckMode(bool on) {
+	SetResolveCheck(on);
+}
+
+void RenderExecutor::ResolveCheckFault(ResolvedDraw& slot, uint32_t fault) {
+	if (fault % 7u == 6u && !slot.is_compute) {
+		slot.state.ps_active = !slot.state.ps_active;
+		return;
+	}
+	if (fault % 7u == 5u && slot.is_compute) {
+		slot.compute.workgroup_counts[0]++;
+		return;
+	}
+	ResolvedStagesFault(*slot.stages, fault);
 }
 
 // KYTY_DIAG_GPU_BURN_NS=<ns> (measurement only, default 0; KYTY_LIVE_AB toggles 0/8000 or NAME=<ns>): the GPU thread spins
@@ -3088,8 +4281,278 @@ static bool SkipDirectDrawsCeiling() {
 	return on;
 }
 
+void RenderExecutor::CheckAheadKey(const PipelineCache::GraphicsPipelineKey& key_today) {
+	if (m_resolved_draw == nullptr || !m_resolved_draw->ahead.key_valid) return;
+	// N4.1: the key and pipeline the opening's peek found, when its programs were predicted right.
+	auto& ah     = m_resolved_draw->ahead;
+	auto& a      = g_ahead;
+	ah.key_valid = false;
+	if (!PipelineCache::AheadProgramsOk(*m_resolved_draw->stages)) {
+		a.k_unchecked++;
+		return;
+	}
+	a.k_compared++;
+	const bool fault = PeekTargets::FaultEvery() != 0 && a.k_compared % PeekTargets::FaultEvery() == 0;
+	if (fault) a.k_injected++;
+	if (!(ah.key == key_today) || fault) (fault ? a.k_detected : a.k_bad)++;
+	if (ah.find != m_context.GetPipelineCache().FindGraphicsPipeline(key_today)) a.k_find_diff++;
+}
+
+// KYTY_DIAG_PLAN_NO_SET_HINT=1 (N5.0 measurement only): the plans without the table-set hint.
+static bool PlanNoSetHint() {
+	static const bool on = [] {
+		const char* env = std::getenv("KYTY_DIAG_PLAN_NO_SET_HINT");
+		return env != nullptr && env[0] == '1';
+	}();
+	return on;
+}
+
+void RenderExecutor::PlanBuffersBegin() {
+	BufferCache::SetPlanBuffers(PlanPresent() && PlanProgramsHold() ? &m_resolved_draw->ahead.buffers : nullptr);
+}
+
+bool RenderExecutor::PlanPresent() const {
+	return m_resolved_draw != nullptr && m_slot_taken && m_resolved_draw->ahead.planned; // n4-2b-wejscia.md 1
+}
+
+uint64_t RenderExecutor::PlanSetVersion(const void* program) const {
+	if (!PlanPresent()) return 0;
+	for (const auto& [ahead_program, ahead]: m_resolved_draw->ahead.images) {
+		if (ahead_program == program) return ahead.set_version;
+	}
+	return 0;
+}
+
+bool RenderExecutor::PlanProgramsHold() const {
+	if (!PlanPresent()) return false;
+	const auto& stages = *m_resolved_draw->stages;
+	for (uint32_t i = 0; i < PipelineCache::StageCount(stages); i++) {
+		if (PipelineCache::AheadProgram(stages, i) != PipelineCache::AdoptedProgram(stages, i)) return false;
+	}
+	return true;
+}
+
+PipelineCache::Pipeline* RenderExecutor::PlanPipeline() const {
+	if (!PlanPresent()) return nullptr;
+	const auto& find = m_resolved_draw->ahead.find;
+	return find.second == PipelineCache::PipelineFind::Found ? find.first : nullptr;
+}
+
+bool RenderExecutor::TakeAheadImages(const void* program, PeekStageImagesResult& out, uint32_t& distance) {
+	if (m_resolved_draw == nullptr) return false;
+	for (auto& [ahead_program, ahead]: m_resolved_draw->ahead.images) {
+		if (ahead_program != program) continue;
+		out           = std::move(ahead);
+		distance      = m_resolved_draw->ahead.distance;
+		ahead_program = nullptr;
+		return true;
+	}
+	return false;
+}
+
+void RenderExecutor::PeekAhead(ResolvedDraw* slot, const HW::Context& ctx, const HW::UserConfig& ucfg, const HW::Shader& shaders,
+                               bool indexed, uint32_t count, uint32_t instances, uint32_t index_type, uint32_t slice_offset,
+                               uint64_t indirect, uint32_t distance, uint64_t index_address,
+                               const DrawIndirectGpuArgs* gpu_indirect) {
+	const bool     on_helper = !GuestGpu::IsGpuThread();
+	auto&          a         = on_helper ? t_ahead_helper : g_ahead;
+	const uint32_t bucket = AheadBucket(distance);
+	a.planned++;
+	a.peeked[bucket]++;
+	if (slot == nullptr || slot->empty || slot->is_compute) {
+		a.gated[1]++;
+		return;
+	}
+	slot->ahead.key_valid = false;
+	slot->ahead.find      = {nullptr, PipelineCache::PipelineFind::Count}; // a mesh draw's plan has no pipeline
+	slot->ahead.front     = false;
+	slot->ahead.planned   = false;
+	slot->ahead.distance  = distance;
+	slot->ahead.images.clear();
+	slot->ahead.buffers.clear();
+	// The gates DrawIndex / DrawAuto pass before the targets are described (their order).
+	if (slot->shaders != &shaders) {
+		a.gated[2]++;
+		return;
+	}
+	if (!PipelineCache::StagesAdoptable(*slot->stages)) {
+		a.gated[3]++;
+		return;
+	}
+	// N7.2: a GPU indirect packet passes the execution thread's early checks (ranges clamped without a write) or has no plan.
+	IndirectEarly early;
+	if (gpu_indirect != nullptr) {
+		if (IndirectEarlyChecks(m_context.GetGraphics(), ucfg, ctx, *gpu_indirect, true, early) != nullptr || early.no_draw) {
+			a.gated[8]++;
+			return;
+		}
+	} else if (count == 0 || instances == 0 || indirect != 0) {
+		a.gated[4]++;
+		return;
+	}
+	if (ctx.GetColorControl().mode > static_cast<uint8_t>(CbColorMode::Normal) || DepthStencilCopyAsked(ctx)) {
+		a.gated[5]++;
+		return;
+	}
+	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
+	uint32_t              element  = 0;
+	if (indexed) {
+		switch (static_cast<Prospero::IndexType>(index_type)) {
+			case Prospero::IndexType::kIndex16: element = 2; break;
+			case Prospero::IndexType::kIndex32: element = 4; break;
+			case Prospero::IndexType::kIndex8: element = 1; break;
+			default: element = 0; break;
+		}
+	}
+	if (!GetDrawTopology(ucfg, topology) || (indexed && element == 0)) {
+		a.gated[6]++;
+		return;
+	}
+	auto& pc = m_context.GetPipelineCache();
+	// N5.0: without the checks that read them, the builder skips the check-only data.
+	static const bool slim = std::getenv("KYTY_CHECK_PEEK") == nullptr && std::getenv("KYTY_CHECK_CHUNKS") == nullptr;
+	t_peek_slim            = slim;
+	++t_translator;
+	if (!pc.PeekAdoptAhead(*slot->stages, distance)) {
+		--t_translator;
+		a.compile++;
+		return;
+	}
+	slot->ahead.planned = true;
+	PipelineCache::AheadSaved saved;
+	PipelineCache::InstallAhead(*slot->stages, saved);
+	auto& state = slot->state;
+	bool  front = false;
+	if (state.vertex_info[0].stage.program == nullptr || state.vertex_info[0].stage.program->stage == ShaderType::Mesh) {
+		a.gated[7]++;
+	} else if (gpu_indirect != nullptr &&
+	           (state.programs.VertexStageCount() != 1u || state.vertex_info[0].stage.program->stage != ShaderType::Vertex)) {
+		a.gated[9]++; // N7.2: the packet goes to the CPU expansion after taking the slot (no key: nothing else is planned)
+	} else {
+		// The targets as PrepareDrawRenderState finds them, from the predicted pixel program's outputs.
+		const auto color_output_mask = DrawColorOutputMask(ctx);
+		uint32_t   mrt_mask = 0, objprim_mask = 0;
+		if (state.ps_active && state.ps_input_info.stage.program != nullptr) {
+			for (const auto& output: state.ps_input_info.stage.program->info.outputs) {
+				if (output.kind == ShaderRecompiler::IR::StageOutputKind::Mrt ||
+				    output.kind == ShaderRecompiler::IR::StageOutputKind::ObjectPrimitiveId) {
+					mrt_mask |= 1u << output.location;
+				} else if (output.kind == ShaderRecompiler::IR::StageOutputKind::ObjPrimId) {
+					objprim_mask |= 1u << output.location;
+				}
+			}
+		}
+		mrt_mask = (mrt_mask & color_output_mask) | objprim_mask;
+		std::array<RenderColorInfo, RENDER_COLOR_ATTACHMENTS_MAX> colors {};
+		uint32_t                                                  color_count = 0;
+		t_describe_soft   = true; // N5.1: a fail here means no plan, never a stop
+		t_describe_failed = false;
+		for (uint32_t target = 0; target < RENDER_COLOR_ATTACHMENTS_MAX; target++) {
+			if ((mrt_mask & (1u << target)) == 0) continue;
+			if (DescribeRenderColorTarget(ctx, colors[color_count], slice_offset, target, false)) color_count++;
+		}
+		RenderDepthInfo depth {};
+		(void)DescribeRenderDepthTarget(m_context.GetGraphics(), ctx, depth);
+		// A custom restart index: today's scan finds no restart (or stops the emulator), so false.
+		const bool restart = indexed && ClassifyPrimitiveRestartRegs(ucfg, ctx, element) == PrimitiveRestartKind::Native;
+		const auto vertex_stages = std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
+		slot->ahead.key = pc.MakeGraphicsPipelineKeyFrom(std::span {colors.data(), color_count}, depth, vertex_stages, ctx, ucfg,
+		                                                 state.ps_active ? &state.ps_input_info : nullptr, topology, restart,
+		                                                 state.programs, true);
+		t_describe_soft = false;
+		const bool describe_failed = std::exchange(t_describe_failed, false); // never left set (n5-1-uwagi.md 0.1)
+		if (describe_failed) {
+			a.describe_failed++;
+			PipelineCache::RestoreAhead(*slot->stages, saved);
+			slot->ahead.planned = false;
+			--t_translator;
+			return;
+		}
+		slot->ahead.key_valid = true;
+		slot->ahead.find      = pc.FindGraphicsPipeline(slot->ahead.key, GuestGpu::IsGpuThread());
+		front                 = slot->ahead.find.second == PipelineCache::PipelineFind::Found;
+		// The stages' images and samplers, with the predicted programs.
+		for (uint32_t i = 0; i < PipelineCache::StageCount(*slot->stages); i++) {
+			const auto* program   = PipelineCache::AheadProgram(*slot->stages, i);
+			const auto* resources = PipelineCache::StageResources(*slot->stages, i);
+			if (program == nullptr || resources == nullptr) continue;
+			if (!on_helper) { // (a helper does not read the table sets: they are the execution thread's, n5-projekt.md 4)
+				PeekStageImagesResult images;
+				front = PeekStageImages(*program, *resources, false, images, false) && front;
+				slot->ahead.images.emplace_back(program, std::move(images));
+			}
+			// N4.2b: the stage's buffers
+			PeekStageBuffers(*program, *resources, PipelineCache::StageRecord(*slot->stages, i), distance, slot->ahead.buffers);
+		}
+		// N4.2b: the merged vertex ranges (clamped as AcquireVertexBuffers clamps them) and the 16/32-bit index buffer.
+		auto& cache = m_context.GetBufferCache();
+		// N5.1: off the execution thread under the lookup lock, tried (busy: no entries).
+		const bool helper      = !GuestGpu::IsGpuThread();
+		const bool lookup_held = !helper || cache.TryLockLookupSpin(); // (W2.1)
+		if (!lookup_held) a.lookup_busy++;
+		std::array<uint64_t, ShaderVertexInputInfo::RES_MAX>          sizes;
+		std::array<VertexBufferRange, ShaderVertexInputInfo::RES_MAX> merged;
+		const auto& vs_input = state.vertex_info[0];
+		const uint32_t merged_count =
+		    vs_input.buffers_num >= 0 && vs_input.buffers_num <= ShaderVertexInputInfo::RES_MAX ? MergedVertexRanges(vs_input, sizes, merged, false)
+		                                                                                         : UINT32_MAX;
+		for (uint32_t m = 0; lookup_held && merged_count != UINT32_MAX && m < merged_count; m++) {
+			uint64_t       generation = 0;
+			const uint64_t size = Libs::LibKernel::Memory::ClampRangeSizeAhead(merged[m].base_address, merged[m].RequestedSize(), &generation);
+			if (size == 0) continue;
+			auto& entry    = slot->ahead.buffers.emplace_back();
+			entry.vaddr    = merged[m].base_address;
+			entry.size     = size;
+			entry.kind     = 2;
+			entry.distance = distance;
+			entry.peek     = cache.PeekBuffer(entry.vaddr, size, false, false, {});
+		}
+		// (N7.2: a packet's index buffer is its whole bound range, clamped as the execution thread clamps it)
+		const uint64_t index_vaddr = gpu_indirect != nullptr ? early.index_source.address : index_address;
+		const uint64_t index_size  = gpu_indirect != nullptr ? early.index_source.size : static_cast<uint64_t>(count) * element;
+		if (lookup_held && indexed && (element == 2u || element == 4u) && index_vaddr != 0 && index_size != 0) {
+			auto& entry    = slot->ahead.buffers.emplace_back();
+			entry.vaddr    = index_vaddr;
+			entry.size     = index_size;
+			entry.kind     = 3;
+			entry.distance = distance;
+			entry.peek     = cache.PeekBuffer(entry.vaddr, entry.size, false, false, {});
+		}
+		if (lookup_held && gpu_indirect != nullptr) {
+			// N7.2: the packet's argument records and draw count (ExecutePreparedDraw's acquisitions)
+			auto& args    = slot->ahead.buffers.emplace_back();
+			args.vaddr    = early.indirect.args_addr;
+			args.size     = early.indirect.args_size;
+			args.kind     = 4;
+			args.distance = distance;
+			args.peek     = cache.PeekBuffer(args.vaddr, args.size, false, false, {});
+			if (early.indirect.count_addr != 0) {
+				auto& counter    = slot->ahead.buffers.emplace_back();
+				counter.vaddr    = early.indirect.count_addr;
+				counter.size     = sizeof(uint32_t);
+				counter.kind     = 5;
+				counter.distance = distance;
+				counter.peek     = cache.PeekBuffer(counter.vaddr, counter.size, false, false, {});
+			}
+		}
+		if (helper && lookup_held) cache.UnlockLookup();
+	}
+	PipelineCache::RestoreAhead(*slot->stages, saved);
+	--t_translator;
+	if (!GuestGpu::IsGpuThread()) {
+		// N5.1: the writes a helper's peeks noted (expected 0), into the shared counters.
+		for (size_t i = 0; i < t_translator_writes.size(); i++) {
+			if (t_translator_writes[i] != 0) g_helper_translator_writes[i].fetch_add(t_translator_writes[i], std::memory_order_relaxed);
+			t_translator_writes[i] = 0;
+		}
+	}
+	slot->ahead.front = front;
+	if (front) a.front[bucket]++;
+}
+
 bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                const DrawIndexArgs& args) {
+	const Common::SlowFrame::Scope slow_frame_scope(Common::SlowFrame::DrawOp); // KYTY_TRACE_SLOW_FRAMES
 	if (args.indirect.address != 0) {
 		// Upstream c513a4a13 / 949de19bb: GPU-read indexed indirect records. Not drawn on this path (our
 		// DrawIndirectGpu and the CPU expansion are): the caller expands them on the CPU.
@@ -3359,109 +4822,22 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 const char* RenderExecutor::DrawIndirectGpu(uint64_t submit_id, CommandBuffer& buffer,
                                             const DrawIndirectGpuArgs& args) {
-	// The checks that need only the registers and the packet (none of the draw's programs): at the queue and at the draw.
-	DrawIndirectSource    indirect {};
-	DrawIndexBufferSource index_source {};
-	bool                  primitive_restart = false;
-	bool                  no_draw           = false; // max_count == 0
-	const auto            early_checks      = [&]() -> const char* {
-		// Argument records larger than this, or index ranges, stay on the CPU path (cache buffers).
-		constexpr uint64_t MaxArgumentBytes = 4ull << 20u;
-		constexpr uint64_t MaxIndexBytes    = 64ull << 20u;
-
-		EXIT_IF(buffer.IsInvalid());
-		auto&       ucfg     = buffer.GetUserConfig();
-		const auto& graphics = m_context.GetGraphics();
-		if (!graphics.gpu_indirect_draw_enabled) {
-			return "host device features";
-		}
-		switch (ucfg.GetPrimType()) {
-			case Prospero::PrimitiveType::kPointList:
-			case Prospero::PrimitiveType::kLineList:
-			case Prospero::PrimitiveType::kLineStrip:
-			case Prospero::PrimitiveType::kTriList:
-			case Prospero::PrimitiveType::kTriFan:
-			case Prospero::PrimitiveType::kTriStrip:
-			case Prospero::PrimitiveType::kPolygon: break;
-			default: return "primitive type";
-		}
-		// Merged (NGG GS) stages draw through the mesh path, which sizes its workgroups from the counts.
-		if ((buffer.GetRegisters().GetShaderStages() & 0x20u) != 0) {
-			return "mesh vertex stage";
-		}
-		const uint32_t record_size = args.indexed ? 20u : 16u;
-		static_assert(sizeof(vk::DrawIndexedIndirectCommand) == 20u &&
-		              sizeof(vk::DrawIndirectCommand) == 16u);
-		if (args.max_count == 0) {
-			no_draw = true;
-			return nullptr;
-		}
-		if ((args.args_addr & 3u) != 0 || (args.count_addr & 3u) != 0) {
-			return "unaligned arguments";
-		}
-		if ((args.count_addr != 0 || args.max_count > 1u) &&
-		    ((args.stride & 3u) != 0 || args.stride < record_size)) {
-			return "argument stride";
-		}
-		if (args.max_count > graphics.GetPhysicalDeviceProperties().limits.maxDrawIndirectCount) {
-			return "draw count limit";
-		}
-		indirect = DrawIndirectSource {
-		    .args_addr  = args.args_addr,
-		    .args_size  = uint64_t {args.stride} * (args.max_count - 1u) + record_size,
-		    .count_addr = args.count_addr,
-		    .max_count  = args.max_count,
-		    .stride     = args.stride,
-		};
-		if (indirect.args_size > MaxArgumentBytes ||
-		    Libs::LibKernel::Memory::ClampRangeSize(indirect.args_addr, indirect.args_size) !=
-		        indirect.args_size) {
-			return "argument range";
-		}
-		index_source      = {};
-		primitive_restart = false;
-		if (args.indexed) {
-			switch (static_cast<Prospero::IndexType>(args.index_type_and_size)) {
-				case Prospero::IndexType::kIndex16:
-					index_source.type               = vk::IndexType::eUint16;
-					index_source.guest_element_size = 2;
-					break;
-				case Prospero::IndexType::kIndex32:
-					index_source.type               = vk::IndexType::eUint32;
-					index_source.guest_element_size = 4;
-					break;
-				default: return "index type"; // 8-bit indices are widened on the CPU
-			}
-			if (args.index_base_addr == 0 ||
-			    (args.index_base_addr & (index_source.guest_element_size - 1u)) != 0) {
-				return "index base address";
-			}
-			// Without INDEX_BUFFER_SIZE the bound range would be unknown.
-			if (args.index_buffer_size == 0) {
-				return "index buffer size";
-			}
-			index_source.address = args.index_base_addr;
-			index_source.size =
-			    uint64_t {args.index_buffer_size} * index_source.guest_element_size;
-			if (index_source.size > MaxIndexBytes) {
-				return "index range";
-			}
-			if (!ResolvePrimitiveRestartWithoutScan(buffer, index_source.guest_element_size,
-			                                        primitive_restart)) {
-				return "primitive restart index";
-			}
-			index_source.size =
-			    Libs::LibKernel::Memory::ClampRangeSize(index_source.address, index_source.size);
-		}
-		return nullptr;
-	};
+	const Common::SlowFrame::Scope slow_frame_scope(Common::SlowFrame::DrawIndirect); // KYTY_TRACE_SLOW_FRAMES
+	// The checks that need only the registers and the packet (none of the draw's programs): IndirectEarlyChecks (N7.2: the
+	// same function builds a helper's plan).
+	IndirectEarly early;
 	GpuBurnAt(GpuBurnSite::Indirect); // KYTY_DIAG_GPU_BURN_AT=indirect (measurement only)
 	KYTY_PROFILER_FUNCTION();
 	if (!buffer.IsInvalid()) FlushComputeAccess(buffer.Handle());
-	if (const char* reason = early_checks(); reason != nullptr) {
+	EXIT_IF(buffer.IsInvalid());
+	if (const char* reason = IndirectEarlyChecks(m_context.GetGraphics(), buffer.GetUserConfig(), buffer.GetRegisters(), args, false, early);
+	    reason != nullptr) {
 		return reason;
 	}
-	if (no_draw) return nullptr;
+	if (early.no_draw) return nullptr;
+	const DrawIndirectSource&    indirect          = early.indirect;
+	const DrawIndexBufferSource& index_source      = early.index_source;
+	const bool                   primitive_restart = early.primitive_restart;
 	auto&       ucfg     = buffer.GetUserConfig();
 	auto&       sh_ctx   = buffer.GetShaders();
 

@@ -37,6 +37,7 @@ struct TimedCommand {
 	uint32_t before = 0;
 	uint32_t after  = 0;
 	uint32_t marker = 0; // KYTY_TRACE_GPU_TIME_MARKERS: interned game marker path (0: none)
+	uint32_t queue  = 0; // KYTY_TRACE_GPU_TIMELINE: t_guest_queue when recorded
 };
 
 // KYTY_TRACE_GPU_TIME_MARKERS=1 (with KYTY_TRACE_GPU_TIME=1): the per-command GPU time is also summed by the game's
@@ -278,6 +279,12 @@ void Accumulate(State& s, const Chunk& chunk) {
 			uint32_t calls;
 		};
 		std::vector<ProgramTime>                   by_program;
+		struct ShaderTicks {
+			uint64_t ticks = 0, a = 0;
+			char     kind = 0;
+		};
+		std::vector<ShaderTicks> by_shader; // the costliest commands by their shader (a)
+		std::vector<std::pair<uint32_t, uint64_t>> by_queue; // (guest queue, ticks)
 		uint64_t                                   other_ticks = 0;
 		for (uint32_t query = 0; query + 1u < chunk.used; query++) {
 			const auto from = ts(query), to = ts(query + 1u);
@@ -294,6 +301,13 @@ void Accumulate(State& s, const Chunk& chunk) {
 				else it->first += to - from;
 				continue;
 			}
+			const auto& command = chunk.commands[index];
+			auto sh = std::find_if(by_shader.begin(), by_shader.end(), [&](const auto& e) { return e.a == command.a && e.kind == command.kind; });
+			if (sh == by_shader.end()) by_shader.push_back({to - from, command.a, command.kind});
+			else sh->ticks += to - from;
+			auto qu = std::find_if(by_queue.begin(), by_queue.end(), [&](const auto& e) { return e.first == command.queue; });
+			if (qu == by_queue.end()) by_queue.push_back({command.queue, to - from});
+			else qu->second += to - from;
 			const uint32_t marker = chunk.commands[index].marker;
 			auto it = std::find_if(by_marker.begin(), by_marker.end(), [&](const auto& e) { return e.second == marker; });
 			if (it == by_marker.end()) by_marker.push_back({to - from, marker});
@@ -319,6 +333,21 @@ void Accumulate(State& s, const Chunk& chunk) {
 			       (m < s.marker_names.size() ? s.marker_names[m] : std::string("?")) + "]";
 		}
 		std::sort(by_mark.begin(), by_mark.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
+		std::sort(by_shader.begin(), by_shader.end(), [](const auto& x, const auto& y) { return x.ticks > y.ticks; });
+		top += " | sh:";
+		for (size_t i = 0; i < by_shader.size() && i < 5u; i++) {
+			char item[48];
+			std::snprintf(item, sizeof(item), " %c%08llx=%dus", by_shader[i].kind,
+			              static_cast<unsigned long long>(by_shader[i].a >> 32u), static_cast<int>(us(by_shader[i].ticks)));
+			top += item;
+		}
+		top += " | q:";
+		for (const auto& [queue, ticks]: by_queue) {
+			char item[32];
+			if (queue == 0) std::snprintf(item, sizeof(item), " gfx=%dus", static_cast<int>(us(ticks)));
+			else std::snprintf(item, sizeof(item), " cq%02x=%dus", queue, static_cast<int>(us(ticks)));
+			top += item;
+		}
 		top += " | other=" + std::to_string(static_cast<int>(us(other_ticks))) + "us emu:";
 		for (size_t i = 0; i < by_mark.size() && i < 3u; i++) {
 			char item[48];
@@ -556,7 +585,7 @@ void EndCommand(vk::CommandBuffer buffer, uint32_t slot, char kind, uint64_t a, 
 	auto&      chunk = s.chunks[s.current];
 	const auto query = chunk.used++;
 	buffer.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, s.pool, ChunkBase(s.current) + query);
-	chunk.commands.push_back({kind, a, b, slot & 0xffffu, query, MarkersEnabled() ? InternMarker(s) : 0u});
+	chunk.commands.push_back({kind, a, b, slot & 0xffffu, query, MarkersEnabled() ? InternMarker(s) : 0u, t_guest_queue});
 }
 
 } // namespace Libs::Graphics::GpuTimer

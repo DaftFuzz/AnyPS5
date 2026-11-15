@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_PIPELINE_SHADERPRECOMPILE_H_
 
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/reuseDisk.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
@@ -13,6 +14,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -245,6 +247,9 @@ struct PrecompileProgress {
 	uint32_t other_layout_journals = 0;
 };
 [[nodiscard]] PrecompileProgress GetPrecompileProgress();
+// While the game's start waits for the shader precompile (PipelineCache::StartBackgroundCompiles): its percent for the
+// window title; -1 when not waiting.
+inline std::atomic<int> g_precompile_wait_percent {-1};
 
 class ShaderPrecompiler {
 public:
@@ -386,6 +391,8 @@ private:
 	std::filesystem::path  m_suspects_path;
 	std::atomic<uint32_t>& m_created;
 	PrecompileWarmList*    m_warm = nullptr;
+	// The shader reuse disk (reuseDisk.h): the reuse store's translations on disk (null: the store is off).
+	std::unique_ptr<ReuseDisk> m_disk;
 
 	mutable std::mutex                     m_mutex;
 	std::condition_variable                m_done; // a job or a stage compile finished

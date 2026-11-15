@@ -238,6 +238,17 @@ public:
 		return Take(head);
 	}
 
+	// Consumer side: the element `index` places after the front, without taking it (null: not published yet). The producer
+	// does not touch published places, so it stays valid until the consumer pops past it (project 15 N4).
+	[[nodiscard]] const T* PeekAt(size_t index) {
+		const auto head = m_head.load(std::memory_order_relaxed);
+		if (m_consumer_tail - head <= index) {
+			m_consumer_tail = m_tail.load(std::memory_order_acquire);
+			if (m_consumer_tail - head <= index) return nullptr;
+		}
+		return Element(head + index);
+	}
+
 	// Any thread: wakes the consumer, whose Pop() returns nothing once the ring is empty.
 	void Stop() {
 		m_stopped.store(true, std::memory_order_seq_cst);
@@ -246,6 +257,13 @@ public:
 	}
 
 	[[nodiscard]] size_t Capacity() const noexcept { return m_capacity; }
+
+	// Any thread: about how many elements are in the ring (the two indices are read at different times).
+	[[nodiscard]] size_t SizeApprox() const noexcept {
+		const auto tail = m_tail.load(std::memory_order_relaxed);
+		const auto head = m_head.load(std::memory_order_relaxed);
+		return tail >= head ? static_cast<size_t>(tail - head) : 0;
+	}
 
 	// Consumer: nothing to pop now (for a consumer that waits for more than this ring).
 	[[nodiscard]] bool Empty() const noexcept {

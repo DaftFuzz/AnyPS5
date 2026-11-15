@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include <set>
 #include "graphics/shader/recompiler/Tessellation.h"
 
 #include "common/assert.h"
@@ -19,6 +20,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
+#include "graphics/shader/recompiler/ir/passes/SrtTape.h"
 #include "graphics/shader/recompiler/ir/passes/SsaRewrite.h"
 
 #include <algorithm>
@@ -897,6 +899,7 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 		}
 	}
 	IR::TrackResources(ir, decoded, native_cfg);
+	IR::PlanSrtGpuWords(ir); // KYTY_PERF_SRT_GPU_WORDS
 	TranslateResult result;
 	result.program = std::move(ir);
 	if (options.dump_ir) {
@@ -966,7 +969,8 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	// The frontend writes every VGPR as Select(exec, new, old). When every later observation of a result happens on lanes
 	// where the select condition holds, the select is replaced by `new` (ir/passes/ReadLaneElimination.cpp has the proof
 	// obligations). The pass changes the value of unobserved lanes only.
-	if (const auto stats = IR::ElideRedundantExecSelects(ir); stats.elided != 0 || stats.rewritten != 0) {
+	const auto elide_stats = IR::ElideRedundantExecSelects(ir);
+	if (elide_stats.elided != 0 || elide_stats.rewritten != 0) {
 		IR::RemoveIdentities(ir);
 		IR::EliminateDeadCode(ir.blocks);
 	}
@@ -985,6 +989,45 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 		}
 	}
 
+	// KYTY_TRACE_SHADER_CODE_STATS=1 (diagnostic, output only): what the translator spends on lane masking per module -
+	// branch conditions by kind and repeats of one condition in a block, the exec-select elider's counts, and the votes,
+	// barriers, selects and phis of the emitted SPIR-V (PROJEKT-MNIEJSZY-KOD-SHADEROW K0).
+	static const bool code_stats = [] {
+		const char* v = std::getenv("KYTY_TRACE_SHADER_CODE_STATS");
+		return v != nullptr && v[0] == '1';
+	}();
+	std::array<uint32_t, 10> cond_kinds {};
+	uint32_t                 cond_dup = 0, ir_selects = 0;
+	// Repeats in other blocks (K2 follow-up): the same value and kind already used by a condition in an earlier block
+	// (xblock), or the same value with any kind (xblock_any, e.g. SccZero and SccNonZero of one compare). Immediates skipped.
+	uint32_t                                 cond_xblock = 0, cond_xblock_any = 0;
+	std::set<std::pair<uintptr_t, uint32_t>> program_seen;
+	std::set<uintptr_t>                      program_seen_any;
+	if (code_stats) {
+		for (const auto* block: ir.blocks) {
+			std::set<std::pair<uintptr_t, uint32_t>> block_keys;
+			std::set<uintptr_t>                      block_values;
+			std::set<std::pair<uintptr_t, uint32_t>> seen;
+			for (const auto& inst: *block) {
+				if (inst.GetOpcode() == IR::ValueOpcode::SelectU32) ++ir_selects;
+				if (inst.GetOpcode() != IR::ValueOpcode::ConditionRef) continue;
+				const auto kind = static_cast<uint32_t>(inst.Flags<CFG::BranchCondition>());
+				if (kind < cond_kinds.size()) ++cond_kinds[kind];
+				const auto arg = inst.Arg(0);
+				const auto key = arg.IsImmediate() ? uintptr_t {arg.U1() ? 1u : 2u}
+				                                   : reinterpret_cast<uintptr_t>(arg.ResolveInstruction());
+				if (!seen.emplace(key, kind).second) ++cond_dup;
+				if (!arg.IsImmediate()) {
+					if (program_seen.contains({key, kind})) ++cond_xblock;
+					if (program_seen_any.contains(key)) ++cond_xblock_any;
+					block_keys.emplace(key, kind);
+					block_values.insert(key);
+				}
+			}
+			program_seen.insert(block_keys.begin(), block_keys.end());
+			program_seen_any.insert(block_values.begin(), block_values.end());
+		}
+	}
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram\n",
 	     GetDumpLabel(options), StageName(ir.stage), ir.shader_hash);
 	auto spirv = Spirv::EmitProgram(ir, options.input_info, push_data_start_dword, *options.profile,
@@ -996,6 +1039,22 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	     static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
 	                               std::chrono::steady_clock::now() - emit_begin)
 	                               .count()));
+	if (code_stats) {
+		uint32_t any = 0, all = 0, ballot = 0, barrier = 0, select = 0, phi = 0, atomic_store = 0;
+		for (size_t i = 5; i < spirv.size();) {
+			const uint32_t op = spirv[i] & 0xffffu, count = spirv[i] >> 16u;
+			any += op == 335u; all += op == 334u; ballot += op == 339u; barrier += op == 224u;
+			select += op == 169u; phi += op == 245u; atomic_store += op == 228u;
+			i += count == 0u ? 1u : count;
+		}
+		std::fprintf(stderr,
+		             "CODE_STATS stage=%s hash=%016llx words=%zu cond[scc=%u vcc=%u exec=%u scalar=%u] cond_dup=%u cond_xblock=%u cond_xblock_any=%u ir_selects=%u "
+		             "elide[selects=%u elided=%u top=%u wider=%u] spv[any=%u all=%u ballot=%u barrier=%u select=%u phi=%u atomic_store=%u]\n",
+		             StageName(ir.stage), static_cast<unsigned long long>(ir.shader_hash), spirv.size(),
+		             cond_kinds[1] + cond_kinds[2], cond_kinds[3] + cond_kinds[4], cond_kinds[5] + cond_kinds[6], cond_kinds[7], cond_dup, cond_xblock, cond_xblock_any,
+		             ir_selects, elide_stats.selects, elide_stats.elided, elide_stats.top, elide_stats.wider, any, all, ballot, barrier,
+		             select, phi, atomic_store);
+	}
 	if (startup_trace) {
 		const auto ms = [](auto from, auto to) { return std::chrono::duration<double, std::milli>(to - from).count(); };
 		const auto end = std::chrono::steady_clock::now();

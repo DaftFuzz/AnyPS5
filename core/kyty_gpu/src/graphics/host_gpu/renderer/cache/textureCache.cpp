@@ -1,7 +1,9 @@
+#include "common/slowFrame.h" // KYTY_TRACE_SLOW_FRAMES (diagnostic)
 #include "graphics/host_gpu/renderer/debugSample.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/gpuCheckpoints.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
+#include "graphics/guest_gpu/chunkLead.h"
 #include "graphics/host_gpu/renderer/cache/textureCacheShared.h"
 #include "graphics/host_gpu/renderer/cache/textureCacheTrace.h"
 
@@ -30,6 +32,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "kernel/memory.h"
 
+#include <optional>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -294,6 +297,7 @@ static bool EvictReuseTrace() {
 }
 
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
+	const Common::SlowFrame::Scope slow_frame_scope(Common::SlowFrame::NewImage); // KYTY_TRACE_SLOW_FRAMES
 	Common::StartupTrace::Scope startup_scope(Common::StartupTrace::Counter::ImageCreate); // KYTY_TRACE_STARTUP
 	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
 	m_slot_images[id].self_id = id; // bindless table refresh events (the bindless layout log)
@@ -327,7 +331,22 @@ std::atomic<uint32_t> g_image_starts[kImageStartSlots] {};
 std::atomic<uint32_t>& ImageStartCount(uint64_t address) {
 	return g_image_starts[(address >> 16u) & (kImageStartSlots - 1u)];
 }
+// Project 15 S2a: the same count keyed by a hash of the exact first byte (a collision only keeps a count above 0), so
+// the buffer peek answers for a buffer in a granule where another image starts.
+constexpr uint32_t    kImageExactBits = 20u;
+std::atomic<uint32_t> g_image_exact_starts[1u << kImageExactBits] {};
+std::atomic<uint32_t>& ImageExactStartCount(uint64_t address) {
+	return g_image_exact_starts[((address >> 8u) * 0x9E3779B97F4A7C15ull) >> (64u - kImageExactBits)];
+}
 } // namespace
+
+bool TextureCache::ImageMayStartAt(uint64_t address) {
+	return ImageStartCount(address).load(std::memory_order_acquire) != 0u;
+}
+
+bool TextureCache::ImageMayStartExactlyAt(uint64_t address) {
+	return ImageExactStartCount(address).load(std::memory_order_acquire) != 0u;
+}
 
 TextureCache::RegisteredPageCounts::~RegisteredPageCounts() {
 	for (auto& leaf: m_leaves) {
@@ -369,6 +388,7 @@ void TextureCache::RegisterImage(ImageId id) {
 		m_image_page_table[page].push_back(id);
 	});
 	ImageStartCount(image.info.data.address).fetch_add(1, std::memory_order_release); // common/lookupMemo.h
+	ImageExactStartCount(image.info.data.address).fetch_add(1, std::memory_order_release); // before the registry epoch
 	image.registered = true;
 	DrawRepeat::NoteImageRegistryChange(image.info.data.address, image.info.data.size); // the registry epoch (drawRepeat.h)
 	{
@@ -434,6 +454,10 @@ void TextureCache::UnregisterImage(ImageId id) {
 	if (ImageStartCount(image.info.data.address).fetch_sub(1, std::memory_order_release) == 0u) {
 		ImageStartCount(image.info.data.address).fetch_add(1, std::memory_order_release);
 		std::fprintf(stderr, "IMAGE_START_UNDERFLOW addr=0x%llx\n", static_cast<unsigned long long>(image.info.data.address));
+	}
+	if (ImageExactStartCount(image.info.data.address).fetch_sub(1, std::memory_order_release) == 0u) {
+		ImageExactStartCount(image.info.data.address).fetch_add(1, std::memory_order_release);
+		std::fprintf(stderr, "IMAGE_EXACT_START_UNDERFLOW addr=0x%llx\n", static_cast<unsigned long long>(image.info.data.address));
 	}
 	DrawRepeat::NoteImageRegistryChange(image.info.data.address, image.info.data.size); // the registry epoch (drawRepeat.h)
 }
@@ -984,6 +1008,7 @@ bool TextureCache::SyncStencilPlaneReader(uint64_t plane_address, ImageId reader
 	if (owner == m_stencil_plane_depth.end()) {
 		return false;
 	}
+	t_stencil_tail = true; // KYTY_CHECK_PEEK=2 (S2b): a stencil plane reader
 	auto*      reader   = m_slot_images.try_get(reader_id);
 	// After a copy the reader holds the plane's current contents, which exist only on the GPU (stencil writes never
 	// reach guest memory). Its guest-memory state is consumed as for a GPU write; otherwise the refresh when it is
@@ -1772,6 +1797,8 @@ void Resolve(TextureCache& cache, ImageId cached_id, ImageId merged_id) {
 
 } // namespace BcAlias
 
+static thread_local bool g_overlap_alias = false; // T1b: ResolveOverlap met a block alias (FindImage resets it)
+
 TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& requested,
                                                          BindingType binding, ImageId cached_id,
                                                          ImageId merged_id) {
@@ -1796,7 +1823,9 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		}
 		return {cached_id, mip, requested.SliceOf(owner->info, mip)};
 	}
-	if (BcAlias::Matches(requested, owner->info) && !owner->IsCpuDirty()) {
+	const bool alias = BcAlias::Matches(requested, owner->info);
+	if (alias) g_overlap_alias = true; // (T1b: an alias whatever its state - the result may depend on "dirty")
+	if (alias && !owner->IsCpuDirty()) {
 		BcAlias::Resolve(*this, cached_id, merged_id);
 		return {merged_id};
 	}
@@ -2026,6 +2055,7 @@ bool TextureCache::CanDownload(const Image& image) const {
 }
 
 void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_offset) {
+	const Common::SlowFrame::Scope slow_frame_scope(Common::SlowFrame::UploadImage); // KYTY_TRACE_SLOW_FRAMES
 	auto& destination = image.depth_id ? m_slot_images[image.depth_id] : image;
 	// KYTY_FIX_STENCIL_PLANE_WRITES: the guest bytes of a stencil plane the depth image does not hold go to that
 	// plane's saved copy, not over the plane the image holds.
@@ -2899,6 +2929,7 @@ void TextureCache::OnDccMetaWrite(uint64_t address, uint64_t size) {
 }
 
 void TextureCache::RefreshImage(ImageId id) {
+	const Common::SlowFrame::Scope slow_frame_scope(Common::SlowFrame::RefreshImage); // KYTY_TRACE_SLOW_FRAMES
 	auto& image = m_slot_images[id];
 	if (image.depth_id &&
 	    (m_slot_images[image.depth_id].info.metadata.stencil_compressed ||
@@ -2986,16 +3017,45 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 // The image replay's hint: set by FindImage (LastFindImagePlain).
 static thread_local bool g_last_find_plain = false;
 
-static thread_local uint64_t g_full_searches = 0; // a draw's target memo
 
-uint64_t TextureCache::FullSearches() {
-	return g_full_searches;
+static thread_local uint64_t                g_nonrepeat = 0; // T1a
+static thread_local std::array<uint64_t, 7> g_nonrepeat_reason {};
+
+uint64_t TextureCache::NonRepeatableSearches() {
+	return g_nonrepeat;
+}
+
+const std::array<uint64_t, 7>& TextureCache::NonRepeatReasons() {
+	return g_nonrepeat_reason;
+}
+
+static void NoteNonRepeat(int reason) {
+	g_nonrepeat++;
+	g_nonrepeat_reason[static_cast<size_t>(reason)]++;
 }
 
 bool TextureCache::TakeLastFindImagePlain() {
 	const bool plain  = g_last_find_plain;
 	g_last_find_plain = false;
 	return plain;
+}
+
+uint32_t TextureCache::ImageReplayableWhy(ImageId id) const {
+	const auto* image = m_slot_images.try_get(id);
+	if (image != nullptr && image->info.data.Empty()) return 0;
+	if (image == nullptr || !image->registered) return 1;
+	if (image->depth_id || image->info.IsDepth()) return 2;
+	if (image->info.HasStencil() || !image->stencil_ids.empty()) return 3;
+	if (image->info.HasMetadata()) return 4;
+	if (image->info.bytes_per_block == 1u) return 5;
+	return 0;
+}
+
+bool TextureCache::ImageReplayableTexture(ImageId id) const {
+	const auto* image = m_slot_images.try_get(id);
+	if (image != nullptr && image->info.data.Empty()) return true;
+	return image != nullptr && image->registered && !image->depth_id && !image->info.IsDepth() && !image->info.HasStencil() &&
+	       !image->info.HasMetadata() && image->stencil_ids.empty();
 }
 
 bool TextureCache::ImageReplayable(ImageId id) const {
@@ -3059,15 +3119,17 @@ ImageId TextureCache::ReplayImageLocked(ImageId id) {
 }
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
+	const Common::SlowFrame::Scope slow_frame_scope(Common::SlowFrame::FindImage); // KYTY_TRACE_SLOW_FRAMES
 	g_last_find_plain = false;
-	g_full_searches++;
 	bool plain_source = false; // the image replay's hint: result from SameBacking
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid()) {
 		EXIT("TextureCache: image lookup requires a valid command buffer\n");
 	}
 	ValidateImageDesc(desc);
+	constexpr bool t1a = true; // (T1a/T1b: the repeatable-search counters, the target memo's validity)
 	if (desc.info.data.Empty()) {
+		if (t1a) NoteNonRepeat(0);
 		std::scoped_lock lock {m_lock};
 		const auto       id = GetNullImage(desc);
 		// The null image of a format never changes once made (m_null_images).
@@ -3077,7 +3139,10 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	const auto metadata_base_layer = desc.view_info.base_layer;
 
 	ImageId result {};
+	bool    alias_any = false, freed = false; // (T1a)
+	g_overlap_alias   = false;
 	{
+		const ChunkLead::FloorTimer floor_locked(ChunkLead::FpFindLocked); // KYTY_TRACE_PEEK_CENSUS (T1a)
 		std::scoped_lock lock {m_lock};
 		KYTY_PROFILER_BLOCK("FindImage::Locked");
 		const auto       candidates = [&] {
@@ -3108,6 +3173,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			} else if (image.SafeToDownload() &&
 			           BcAlias::Matches(desc.info, image.info)) {
 				block_alias = true;
+			} else if ((desc.type == BindingType::RenderTarget || desc.type == BindingType::DepthTarget) &&
+			           BcAlias::Matches(desc.info, image.info)) { // (T1b review: target searches only; textures are reason 1)
+				alias_any = true; // (T1a: an alias whatever its state)
 			}
 		}
 		int32_t view_mip   = -1;
@@ -3139,10 +3207,12 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			auto& resolved = m_slot_images[result];
 			if (exact_format && resolved.info.pixel_format != desc.info.pixel_format) {
 				result = {};
+				freed  = true;
 			} else if (!resolved.info.resources.Contains(desc.info.resources)) {
 				UnregisterReason reason(m_unregister_reason, "mip_growth");
 				FreeImage(result);
 				result = {};
+				freed  = true;
 			}
 		}
 		bool inserted_new = false;
@@ -3174,6 +3244,57 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		}
 		image.tick_accessed_last = m_scheduler.CurrentTick();
 		TouchImage(image);
+		if (t1a) {
+			// T1a: repeatable for a target memo (the same image again from the same registry and the same description)
+			const bool target = desc.type == BindingType::RenderTarget || desc.type == BindingType::DepthTarget;
+			// (T1b, 10.11: a result ResolveOverlap gave without changing anything - the request fits in an existing image,
+			// no alias, no view moved - is repeatable too: with the registry unchanged it gives the same image again)
+			const int  why    = !target                                          ? 1
+			                    : block_alias || alias_any || g_overlap_alias    ? 3
+			                    : freed                                          ? 4
+			                    : inserted_new                                   ? 5
+			                    : view_mip >= 0 || view_layer >= 0               ? 6
+			                                                                     : -1;
+			if (why >= 0) NoteNonRepeat(why);
+			// T1b diagnostic (KYTY_TRACE_PEEK_CENSUS): the first non-repeatable target searches in the walk, with the
+			// candidates and the first SameBacking field that differs (1 address, 2 size, 3 extent, 4 levels/layers,
+			// 5 samples, 6 bytes per block, 7 tile mode, 8 colour transform, 9 format/type, 10 exact format).
+			static uint32_t logged[6] {};
+			const int       lb = ChunkLead::t_floor_bucket;
+			if (why == 2 && ChunkLead::PeekCensusOn() && DebugPresentCount().load() > 3000u && lb >= 0 && lb < 6 && logged[lb] < 12u) {
+				logged[lb]++;
+				const auto first_diff = [&](const ImageInfo& c) {
+					const auto& q = desc.info;
+					if (c.data.address != q.data.address) return 1;
+					if (c.data.size != q.data.size) return 2;
+					if (c.extent != q.extent) return 3;
+					if (c.resources.levels < q.resources.levels || c.resources.layers < q.resources.layers) return 4;
+					if (c.samples != q.samples) return 5;
+					if (c.bytes_per_block != q.bytes_per_block) return 6;
+					if (c.tile_mode != q.tile_mode) return 7;
+					if (c.GetColorTransform() != q.GetColorTransform()) return 8;
+					if (!ImageViewOps::FormatsCompatible(c.pixel_format, q.pixel_format) || c.type != q.type) return 9;
+					if (exact_format && c.pixel_format != q.pixel_format) return 10;
+					return 0;
+				};
+				std::string text;
+				for (size_t i = 0; i < candidates.size() && i < 4u; i++) {
+					const auto& c = m_slot_images[candidates[i]].info;
+					char        buf[256];
+					std::snprintf(buf, sizeof(buf), " [cand %u addr=0x%llx size=0x%llx %ux%u fmt=%d bpb=%u tile=%u diff=%d]",
+					              static_cast<uint32_t>(candidates[i].index), static_cast<unsigned long long>(c.data.address),
+					              static_cast<unsigned long long>(c.data.size), c.extent.width, c.extent.height,
+					              static_cast<int>(c.pixel_format), c.bytes_per_block, static_cast<uint32_t>(c.tile_mode), first_diff(c));
+					text += buf;
+				}
+				std::fprintf(stderr, "T1B_NOTSAME frame=%u bucket=%d type=%u addr=0x%llx size=0x%llx %ux%u fmt=%d bpb=%u tile=%u candidates=%zu result=%u%s\n",
+				             DebugPresentCount().load(), ChunkLead::t_floor_bucket, static_cast<uint32_t>(desc.type),
+				             static_cast<unsigned long long>(desc.info.data.address), static_cast<unsigned long long>(desc.info.data.size),
+				             desc.info.extent.width, desc.info.extent.height, static_cast<int>(desc.info.pixel_format),
+				             desc.info.bytes_per_block, static_cast<uint32_t>(desc.info.tile_mode), candidates.size(),
+				             static_cast<uint32_t>(result.index), text.c_str());
+			}
+		}
 		g_last_find_plain = plain_source && !inserted_new && view_mip < 0 && view_layer < 0 && !block_alias &&
 		                    (desc.type == BindingType::Texture || desc.type == BindingType::RenderTarget) &&
 		                    desc.info.metadata.kind == ImageMetadataKind::None &&
@@ -3181,6 +3302,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	}
 	{
 		KYTY_PROFILER_BLOCK("FindImage::ColorClear");
+		const ChunkLead::FloorTimer floor_materialize(ChunkLead::FpMaterialize); // KYTY_TRACE_PEEK_CENSUS (T1a)
 		MaterializeColorClear(result, desc, metadata_base_layer);
 	}
 	if (desc.type == BindingType::VideoOut &&
@@ -3199,6 +3321,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 }
 
 void TextureCache::UpdateImage(ImageId id) {
+	const Common::SlowFrame::Scope slow_frame_scope(Common::SlowFrame::UpdImage); // KYTY_TRACE_SLOW_FRAMES
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	TouchImage(image);
@@ -3250,7 +3373,10 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 }
 
 vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
+	std::optional<Common::SlowFrame::Scope> slow_lock;
+	slow_lock.emplace(Common::SlowFrame::FtLock); // KYTY_TRACE_SLOW_FRAMES
 	std::unique_lock lock {m_lock};
+	slow_lock.reset();
 	auto& image = m_slot_images[id];
 	TouchImage(image);
 	if (!image.info.data.Empty()) {
@@ -3259,12 +3385,15 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 		}
 	}
 	const uint32_t shared_mode = SharedImageMemoryMode(); // KYTY_FIX_SHARED_IMAGE_MEMORY
+	std::optional<Common::SlowFrame::Scope> slow_sync;
+	slow_sync.emplace(Common::SlowFrame::FtSync); // KYTY_TRACE_SLOW_FRAMES
 	if (shared_mode != 0u) {
 		if (shared_mode >= 3u) ProbeSharedImageRead(id, desc.type == BindingType::Storage ? 1u : 0u);
 		SyncSharedImageMemory(id, desc.type == BindingType::Storage ? 1u : 0u);
 	} else {
 		SyncExtentAliases(id);
 	}
+	slow_sync.reset();
 	if (desc.type == BindingType::Storage) {
 		image.MarkGpuModified();
 		image.shader_write_serial = image.content_serial;
@@ -3287,17 +3416,23 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	}
 	// KYTY_FIX_IMAGE_MEMORY_OWNER: after the refresh from guest memory, the bytes other images hold (and for a storage
 	// binding, the write).
-	if (ImageMemoryOwnerMode() != 0u) OwnerSyncImage(id, desc.type == BindingType::Storage ? 1u : 0u);
+	if (ImageMemoryOwnerMode() != 0u) {
+		const Common::SlowFrame::Scope slow_owner(Common::SlowFrame::FtOwner); // KYTY_TRACE_SLOW_FRAMES
+		OwnerSyncImage(id, desc.type == BindingType::Storage ? 1u : 0u);
+	}
 	switch (desc.type) {
 		case BindingType::Texture: break;
-		case BindingType::Storage:
+		case BindingType::Storage: {
+			const Common::SlowFrame::Scope slow_storage(Common::SlowFrame::FtStorage); // KYTY_TRACE_SLOW_FRAMES
 			if (!image.info.data.Empty()) {
 				CommitGpuWrite(image);
 			}
 			ArmWrittenImage(image);
 			break;
+		}
 		default: EXIT("TextureCache: invalid texture binding\n");
 	}
+	const Common::SlowFrame::Scope slow_view(Common::SlowFrame::FtView); // KYTY_TRACE_SLOW_FRAMES
 	return image.FindView(desc.view_info);
 }
 
@@ -3431,12 +3566,23 @@ bool TextureCache::TableTexturesReadyChecks(std::span<const ImageId> ids) const 
 // - RefreshImage: no depth association, tracked over exactly its range (TrackImage returns), not maybe-CPU-dirty, not
 //   buffer-modified, not CPU-dirty (it returns before any upload).
 // The checks run under m_lock, where the fault and upload paths set those flags.
+static bool TextureReplayReady(const Image& image);
+
+vk::ImageView TextureCache::PeekTextureView(ImageId id, const ImageDesc& desc) const {
+	if (desc.type != BindingType::Texture) return nullptr;
+	const auto* image = m_slot_images.try_get(id);
+	if (image == nullptr || image->info.data.Empty() || !TextureReplayReady(*image)) return nullptr;
+	return image->FindViewExisting(desc.view_info);
+}
+
 vk::ImageView TextureCache::FindTextureReplay(ImageId id, const ImageDesc& desc) {
 	if (desc.type != BindingType::Texture) {
+		t_peek_slow++; // KYTY_CHECK_PEEK=2 (S2b)
 		return FindTexture(id, desc);
 	}
 	vk::ImageView fast_view = nullptr;
 	{
+		const Common::SlowFrame::Scope slow_ft_fast(Common::SlowFrame::FtFast); // KYTY_TRACE_SLOW_FRAMES
 		const TcReadSection lock {m_lock}; // the LRU touch and the view (lock-free readers check neither)
 		auto*               image = m_slot_images.try_get(id);
 		const bool          ready = image != nullptr && !image->info.data.Empty() && TextureReplayReady(*image);
@@ -3448,7 +3594,12 @@ vk::ImageView TextureCache::FindTextureReplay(ImageId id, const ImageDesc& desc)
 			return fast_view;
 		}
 	}
+	t_peek_slow++; // KYTY_CHECK_PEEK=2 (S2b): the full FindTexture
+	std::optional<Common::SlowFrame::Scope> slow_ft_full;
+	slow_ft_full.emplace(Common::SlowFrame::FtFull); // KYTY_TRACE_SLOW_FRAMES
 	const auto view = FindTexture(id, desc);
+	slow_ft_full.reset();
+	const Common::SlowFrame::Scope slow_ft_tail(Common::SlowFrame::FtTail); // KYTY_TRACE_SLOW_FRAMES
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	// Remember whether SyncExtentAliases has a source at this address (none: it stays a no-op while the epoch holds).
@@ -3465,6 +3616,7 @@ vk::ImageView TextureCache::FindTextureReplay(ImageId id, const ImageDesc& desc)
 }
 
 vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
+	const Common::SlowFrame::Scope slow_frame_scope(Common::SlowFrame::DepthTarget); // KYTY_TRACE_SLOW_FRAMES
 	if (desc.type != BindingType::DepthTarget) {
 		EXIT("TextureCache: invalid depth-target binding\n");
 	}
@@ -3490,7 +3642,12 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	}
 	image.info.stencil = desc.info.stencil;
 	image.info.metadata = desc.info.metadata;
-	if (desc.info.HasStencil()) m_stencil_plane_depth[desc.info.stencil.address] = image.info.data.address;
+	if (desc.info.HasStencil()) {
+		const auto [plane, inserted] = m_stencil_plane_depth.insert_or_assign(desc.info.stencil.address, image.info.data.address);
+		// An address becoming a known stencil plane bumps its page epoch, so a one-byte replay entry or set member there
+		// (kept because its resolve ran no stencil tail) is proven stale.
+		if (inserted) DrawRepeat::NoteImageRegistryChange(desc.info.stencil.address, 1);
+	}
 	if (desc.info.HasMetadata()) {
 		const auto [entry, inserted] =
 		    m_surface_metas.emplace(desc.info.metadata.range.address,
@@ -3926,8 +4083,10 @@ bool TextureCache::DownloadImageMemory(ImageId id, bool evicting, std::shared_pt
 	if (!RecordImageDownload(id, destination, offset, mapped)) {
 		return false;
 	}
+	// An unmap of these bytes waits for this publish (RenderContext::UnmapMemory).
+	auto published = m_buffer_cache.NotePendingGuestWrite(range.address, range.size);
 	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset, owner = std::move(temporary), done = std::move(done),
-	                                    cancelled = std::move(cancelled)] {
+	                                    cancelled = std::move(cancelled), published = std::move(published)] {
 		    (owner ? *owner : static_cast<Buffer&>(download)).Invalidate(offset, range.size);
 		    if (!cancelled || !cancelled->load(std::memory_order_acquire)) {
 			    LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
@@ -3935,6 +4094,7 @@ bool TextureCache::DownloadImageMemory(ImageId id, bool evicting, std::shared_pt
 		    if (done) {
 			    done->store(true, std::memory_order_release);
 		    }
+		    if (published) published->store(true, std::memory_order_release);
 	    });
 	return true;
 }
@@ -4638,6 +4798,16 @@ bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
 bool TextureCache::IsRegionRegistered(uint64_t address, uint64_t size) {
 	std::scoped_lock lock {m_lock};
 	return !FindImagesInRegion(address, size, false).empty();
+}
+
+bool TextureCache::AnyUnmapImage(uint64_t address, uint64_t size, const std::function<bool(ImageId)>& test) {
+	std::scoped_lock lock {m_lock};
+	for (const auto id: FindImagesInRegion(address, size, false)) {
+		if (test(id)) return true;
+		for (const auto association: m_slot_images[id].stencil_ids)
+			if (test(association)) return true;
+	}
+	return false;
 }
 
 void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {

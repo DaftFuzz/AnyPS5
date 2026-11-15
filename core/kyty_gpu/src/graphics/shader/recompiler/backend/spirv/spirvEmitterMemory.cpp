@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <map>
 #include <string>
@@ -2270,6 +2271,14 @@ uint32_t LoadIndirectFormattedVector(ValueEmitContext& ctx, const IndirectBuffer
 	using F = Prospero::BufferFormat;
 	static constexpr F fast[] = {F::k16_16_16_16Float, F::k8UNorm, F::k8SInt, F::k16UInt, F::k16_16Float,
 	                             F::k10_10_10_2SNorm, F::k16_16_16_16SNorm};
+	// FORMAT 0 is a case of its own giving 0 - what the format switch gives for it (an Unknown format:
+	// ConstantU32CompositeZero; the compute test checks it with the other formats). An inactive lane of a guarded call
+	// passes word 3 = 0 (IndirectCallWord3), and without the case it took the table: in the cutscene's paired 4ca0cf7e
+	// 98% of the lanes' formatted loads went through LoadIndirectFormattedTable while the active lanes took their case
+	// (census 8.11: lane_loads 119.8M, table_loads 117.8M), so every load ran the table's decode as well. GPU time per
+	// call, warm caches, run to run: 4ca0cf7e 4.48 -> 1.53 ms, c1989e05 2.18 -> 0.79, b90c32d6 1.43 -> 1.16, 91451da6
+	// 12.4 -> 10.7; unchanged shaders +-2%.
+	const uint32_t null_item = static_cast<uint32_t>(std::size(fast)) + 1u;
 	const auto cases = [&]() {
 		const auto u32  = TypeU32(state);
 		auto       pick = ConstantU32(state, 0);
@@ -2279,9 +2288,16 @@ uint32_t LoadIndirectFormattedVector(ValueEmitContext& ctx, const IndirectBuffer
 			                     ConstantU32(state, static_cast<uint32_t>(fast[k]))),
 			              ConstantU32(state, k + 1u), pick);
 		}
-		return EmitIndexSwitch(state, pick, static_cast<uint32_t>(std::size(fast)) + 1u, TypeU32Composite(state, channels),
+		pick = Select(state, u32, Binary(state, spv::OpIEqual, TypeBool(state), buffer.format, ConstantU32(state, 0)),
+		              ConstantU32(state, null_item), pick);
+		// KYTY_DIAG_INDIRECT_FORMAT_CENSUS: every invocation's load (word + 2) and those through the table (word + 3).
+		const bool census = IndirectLoadFast::CensusFor(state.program.shader_hash) && state.fault_buffer_variable != 0u;
+		if (census) (void)FaultDiagAdd(state, IndirectLoadFast::CensusMixedWord + 2u, ConstantU32(state, 1));
+		return EmitIndexSwitch(state, pick, null_item + 1u, TypeU32Composite(state, channels),
 		                       [&](uint32_t item) {
+			                       if (item == null_item) return ConstantU32CompositeZero(state, channels);
 			                       if (item == 0u) {
+				                       if (census) (void)FaultDiagAdd(state, IndirectLoadFast::CensusMixedWord + 3u, ConstantU32(state, 1));
 				                       return LoadIndirectFormattedTable(ctx, buffer, channels, selector, memory, one, d16);
 			                       }
 			                       const auto info = Format::GetFormatInfo(fast[item - 1u]);
@@ -2365,6 +2381,27 @@ uint32_t CallIndirectFormattedLoad(ValueEmitContext& ctx, const IR::Inst& inst, 
 	auto&       state  = ctx.state;
 	const auto& handle = *inst.Arg(0).ResolveInstruction();
 	const auto  word3  = ctx.Arg(handle, 3);
+	if (IndirectLoadFast::CensusFor(state.program.shader_hash) && state.fault_buffer_variable != 0u) { // KYTY_DIAG_INDIRECT_FORMAT_CENSUS
+		// Also per wave: whether every active lane reads the same FORMAT (the census sees only the elected lane's).
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniformVote);
+		const auto lane_format = EmitBitFieldUExtract(state, word3, ConstantU32(state, 12), ConstantU32(state, 7));
+		const auto uniform     = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpGroupNonUniformAllEqual, TypeBool(state), uniform, ConstantU32(state, spv::ScopeSubgroup),
+		                          lane_format);
+		const auto elected = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpGroupNonUniformElect, TypeBool(state), elected, ConstantU32(state, spv::ScopeSubgroup));
+		EmitIfCondition(state, elected, [&]() {
+			(void)FaultDiagAdd(state, IndirectLoadFast::CensusMixedWord, ConstantU32(state, 1));
+			(void)FaultDiagAdd(state, IndirectLoadFast::CensusMixedWord + 1u,
+			                   Select(state, TypeU32(state), uniform, ConstantU32(state, 0), ConstantU32(state, 1)));
+			const auto format = EmitBitFieldUExtract(state, word3, ConstantU32(state, 12), ConstantU32(state, 7));
+			const auto word   = Binary(state, spv::OpIAdd, TypeU32(state),
+			                           Binary(state, spv::OpShiftLeftLogical, TypeU32(state), format, ConstantU32(state, 2)),
+			                           ConstantU32(state, BufferCache::FAULT_DIAG_BASE + IndirectLoadFast::CensusWord + channels - 1u));
+			state.builder.AddFunction(spv::OpAtomicIAdd, TypeU32(state), state.builder.AllocateId(), FaultElementPointer(state, word),
+			                          ConstantU32(state, spv::ScopeDevice), ConstantU32(state, 0), ConstantU32(state, 1));
+		});
+	}
 	const auto  found  = state.indirect_formatted_load_functions.find(IndirectFormattedLoadKey(channels, components, d16));
 	if (found == state.indirect_formatted_load_functions.end() || found->second == 0u) {
 		return LoadIndirectFormattedVector(ctx, PrepareIndirectBuffer(ctx, inst), word3, channels, components, d16);
@@ -2458,6 +2495,17 @@ uint32_t CallIndirectFormattedLoad(ValueEmitContext& ctx, const IR::Inst& inst, 
 	    });
 }
 
+// The formatted-load functions below are marked Inline instead of DontInline in these shaders - the same code, the
+// driver expands it at the calls (as RawInlineMaxLoads for the raw loads). Measured 9.11 (cutscene after the Snake
+// fight, part 2, GPU time per call, warm caches): 91451da6 (BVH) 6.60 -> 4.35 ms, 455a480b 1.75 -> 0.99, 6c9184bb
+// 0.59 -> 0.39, 039ed97b 0.51 -> 0.45; run-to-run 3 pairs +9.3 / +6.0 / +10.5% fps. Not a rule by load count: inlined,
+// 4ca0cf7e (27 calls) went 1.47 -> 1.81 ms, c1989e05 (12 calls) 0.80 -> 0.87, e8e38335 0.36 -> 0.45.
+static bool FormattedInline(const EmitterState& state) {
+	constexpr std::array<uint64_t, 4> Inlined {0x91451da6526e1954ull, 0x455a480b7aae67dcull, 0x6c9184bb2721d580ull,
+	                                           0x039ed97b41485281ull};
+	return std::ranges::find(Inlined, state.program.shader_hash) != Inlined.end();
+}
+
 // One DontInline function per shape of the formatted loads through GPU-selected
 // descriptors that EmitLoadMemory sends to LoadIndirectFormatted and LoadIndirectFormattedX.
 void DefineIndirectFormattedLoads(ValueEmitContext& ctx) {
@@ -2492,7 +2540,8 @@ void DefineIndirectFormattedLoads(ValueEmitContext& ctx) {
 		name.append("xyzw", channels);
 		if (d16) name += "_d16";
 		state.builder.AddName(function, name.c_str());
-		state.builder.AddFunction(spv::OpFunction, result_type, function, spv::FunctionControlDontInlineMask,
+		state.builder.AddFunction(spv::OpFunction, result_type, function,
+		                          FormattedInline(state) ? spv::FunctionControlInlineMask : spv::FunctionControlDontInlineMask,
 		                          function_type);
 		const auto parameter = [&]() {
 			const auto id = state.builder.AllocateId();
@@ -2747,6 +2796,8 @@ void StoreWideShared(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compo
 
 } // namespace
 
+static_assert(BdaPageBytes == uint64_t {1} << BufferCache::CACHING_PAGEBITS);
+
 uint32_t GetBdaPointer(EmitterState& state, uint32_t address) {
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpFunctionCall, TypeU64(state), result,
@@ -2844,6 +2895,30 @@ void DefineIndirectFormattedLoadFunctions(ValueEmitContext& ctx) {
 // (bounds check + BDA translation + load) is emitted once as a non-inlined function and called per
 // component, instead of being expanded at every load. Same result; much smaller SPIR-V for shaders
 // with hundreds of such loads (driver compile time and memory).
+// In a program with at most RawInlineMaxLoads raw loads through GPU-selected descriptors, the raw-load functions are
+// marked Inline instead of DontInline - the same code, the driver expands it at the calls. Profile 8.11 (Nsight,
+// cutscene CS b0c4f2a6, one wave per dispatch, ~400 dispatches per frame, 11 such loads): 21% of its samples on
+// indirect_raw_x3's return (Branch Resolving); inlined, its GPU time per call went 20.5 -> 9.2 us and the cutscene's
+// part 2 frame 120.9 -> 110.1 and 115.9 -> 109.9 ms (two run pairs, warm caches). Inline in every program ran the
+// driver's compiler out of memory (CS fbdb4e82: 41 s, then "LLVM ERROR: out of memory"), hence the limit.
+static constexpr uint32_t RawInlineMaxLoads = 16;
+static spv::FunctionControlMask IndirectRawControl(const EmitterState& state) {
+	uint32_t loads = 0;
+	for (const auto* block: state.program.blocks) {
+		for (const auto& inst: *block) {
+			const auto op = inst.GetOpcode();
+			if (op != IR::ValueOpcode::LoadBufferU32 && op != IR::ValueOpcode::LoadBufferU32x2 &&
+			    op != IR::ValueOpcode::LoadBufferU32x3 && op != IR::ValueOpcode::LoadBufferU32x4)
+				continue;
+			const auto index = inst.Flags<IR::MemoryFlags>().index;
+			if (index >= state.program.memory_info.size()) continue;
+			const auto& mem = state.program.memory_info[index];
+			if (mem.kind == IR::ResourceKind::IndirectBuffer && !mem.formatted) ++loads;
+		}
+	}
+	return loads <= RawInlineMaxLoads ? spv::FunctionControlInlineMask : spv::FunctionControlDontInlineMask;
+}
+
 void DefineIndirectRawDword(ValueEmitContext& ctx) {
 	auto& state = ctx.state;
 	if (state.bda_pointer_function == 0u) return;
@@ -2861,7 +2936,7 @@ void DefineIndirectRawDword(ValueEmitContext& ctx) {
 		auto&      function      = coherent ? state.indirect_raw_coherent_function : state.indirect_raw_function;
 		function                 = state.builder.AllocateId();
 		state.builder.AddName(function, coherent ? "indirect_raw_dword_coherent" : "indirect_raw_dword");
-		state.builder.AddFunction(spv::OpFunction, u32, function, spv::FunctionControlDontInlineMask, function_type);
+		state.builder.AddFunction(spv::OpFunction, u32, function, IndirectRawControl(state), function_type);
 		const auto parameter = [&](uint32_t type) {
 			const auto id = state.builder.AllocateId();
 			state.builder.AddFunction(spv::OpFunctionParameter, type, id);
@@ -2940,7 +3015,7 @@ void DefineIndirectRawDword(ValueEmitContext& ctx) {
 		std::string name = "indirect_raw_x" + std::to_string(components);
 		if (coherent) name += "_coherent";
 		state.builder.AddName(function, name.c_str());
-		state.builder.AddFunction(spv::OpFunction, result_type, function, spv::FunctionControlDontInlineMask, function_type);
+		state.builder.AddFunction(spv::OpFunction, result_type, function, IndirectRawControl(state), function_type);
 		const auto parameter = [&]() {
 			const auto id = state.builder.AllocateId();
 			state.builder.AddFunction(spv::OpFunctionParameter, u32, id);
@@ -3597,8 +3672,74 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 	return result;
 }
 
+// Word `index` of the flat SRT buffer (a constant index below IR::SrtFlatWords).
+static uint32_t FlatSrtWord(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t index) {
+	auto& state = ctx.state;
+	if (state.flattened_srt_uniform_variable != 0) {
+		return LoadUniformDword(state, state.flattened_srt_uniform_variable, index);
+	}
+	if (state.flattened_srt_variable == 0) {
+		ctx.Fail(inst, "requires the flattened SRT descriptor");
+	}
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
+	                          state.flattened_srt_variable, ConstantU32(state, 0), ConstantU32(state, index));
+	return EmitNative<spv::OpLoad, IR::Type::U32>(state, pointer);
+}
+
+// KYTY_PERF_SRT_GPU_WORDS: a shader-only SRT word read from GPU memory. The flat words hold the device address the host
+// put in place of the guest address (0: the word reads zero, as the null page does). With KYTY_PERF_SRT_GPU_WORDS_VERIFY
+// the value the CPU read as before is used, and the two are compared (fault diag words FAULT_DIAG_SRT_GPU_WORDS +0
+// checks, +1 mismatches).
+static uint32_t EmitReadGpuWord(ValueEmitContext& ctx, const IR::Inst& inst, const IR::ShaderInfo::SrtGpuWord& word) {
+	auto&      state   = ctx.state;
+	const auto low     = Unary(state, spv::OpUConvert, TypeU64(state), FlatSrtWord(ctx, inst, word.slot));
+	const auto high    = Unary(state, spv::OpUConvert, TypeU64(state), FlatSrtWord(ctx, inst, word.hi));
+	const auto address = Binary(state, spv::OpBitwiseOr, TypeU64(state), low,
+	                            Binary(state, spv::OpShiftLeftLogical, TypeU64(state), high, ConstantU64(state, 32)));
+	const auto present = Binary(state, spv::OpINotEqual, TypeBool(state), address, ConstantU64(state, 0));
+	const auto value   = EmitValueOrZeroIfCondition(state, present, [&]() {
+        const auto         pointer   = BdaDwordPointer(state, address, false);
+        const auto         loaded    = state.builder.AllocateId();
+        constexpr uint32_t alignment = sizeof(uint32_t);
+        state.builder.AddFunction(spv::OpLoad, TypeU32(state), loaded, pointer, BdaDwordAccess(false), alignment);
+        return loaded;
+    });
+	if (word.verify == UINT32_MAX) return value;
+	const auto cpu     = FlatSrtWord(ctx, inst, word.verify);
+	const auto differs = Binary(state, spv::OpINotEqual, TypeBool(state), value, cpu);
+	(void)FaultDiagAdd(state, BufferCache::FAULT_DIAG_SRT_GPU_WORDS, ConstantU32(state, 1));
+	const auto one_if_differs = Select(state, TypeU32(state), differs, ConstantU32(state, 1), ConstantU32(state, 0));
+	(void)FaultDiagAdd(state, BufferCache::FAULT_DIAG_SRT_GPU_WORDS + 1, one_if_differs);
+	// The first mismatches of a fault pass, as {shader hash low, high, slot, CPU value, GPU value, device address low,
+	// high} records; other lanes store into the spare record.
+	const auto record = FaultDiagAdd(state, BufferCache::FAULT_DIAG_SRT_GPU_WORDS + 2, one_if_differs);
+	const auto stored = Binary(state, spv::OpLogicalAnd, TypeBool(state), differs,
+	                           Binary(state, spv::OpULessThan, TypeBool(state), record,
+	                                  ConstantU32(state, BufferCache::FAULT_DIAG_SRT_GPU_RECORDS)));
+	const auto slot = Select(state, TypeU32(state), stored, record, ConstantU32(state, BufferCache::FAULT_DIAG_SRT_GPU_RECORDS));
+	const uint32_t fields[] = {ConstantU32(state, static_cast<uint32_t>(state.program.shader_hash)),
+	                           ConstantU32(state, static_cast<uint32_t>(state.program.shader_hash >> 32u)),
+	                           ConstantU32(state, word.slot), cpu, value,
+	                           Unary(state, spv::OpUConvert, TypeU32(state), address),
+	                           Unary(state, spv::OpUConvert, TypeU32(state),
+	                                 Binary(state, spv::OpShiftRightLogical, TypeU64(state), address, ConstantU64(state, 32)))};
+	for (uint32_t field = 0; field < std::size(fields); ++field) {
+		FaultDiagStore(state, BufferCache::FAULT_DIAG_SRT_GPU_FIRST, slot, BufferCache::FAULT_DIAG_SRT_GPU_STRIDE, field,
+		               fields[field]);
+	}
+	return cpu;
+}
+
 uint32_t EmitReadConst(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto& state = ctx.state;
+	if (const auto& words = state.program.info.srt_gpu_words; !words.empty()) {
+		const auto slot = inst.Arg(1).Resolve();
+		if (slot.IsImmediate()) {
+			const auto found = std::ranges::find(words, slot.U32(), &IR::ShaderInfo::SrtGpuWord::slot);
+			if (found != words.end()) return EmitReadGpuWord(ctx, inst, *found);
+		}
+	}
 	if (state.flattened_srt_uniform_variable != 0) {
 		// Uniform const buffers (ShaderIR.h): the slot is an immediate below srt_reads.size() (ValidateNativeProgram),
 		// and the host's flat buffer holds at least srt_reads.size() words.

@@ -1,4 +1,6 @@
+#include "common/slowFrame.h" // KYTY_TRACE_SLOW_FRAMES (diagnostic)
 #include "graphics/host_gpu/renderer/dispatchCensus.h"
+#include "graphics/guest_gpu/chunkCensus.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "common/cacheDir.h"
 #include "common/envDefaults.h"
@@ -12,6 +14,8 @@
 #include "graphics/host_gpu/renderer/cache/bufferCacheTrace.h"
 #include "graphics/host_gpu/renderer/cache/exactTicks.h"
 #include "common/spscQueue.h"
+#include "graphics/guest_gpu/chunkLead.h"
+#include "graphics/host_gpu/renderer/cache/ringCensus.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -374,37 +378,24 @@ void BufferCache::Unregister(BufferId id) {
 
 // ---- the BDA fallback (M06) ----------------------------------------------------------------------------------
 namespace {
-// The import granule of the direct-memory backing. A granule is imported (pinned, counted as the card's shared memory)
-// only once the GPU uses it: a shader read the fault pass reports as 0, a direct download into it, or the game's
-// granule list from earlier sessions (map §3m, 3.11: one Snake cutscene used ~160 granules, ~330 MB, of the 12 GB the
-// whole backing in 256 MiB chunks pinned).
-constexpr uint64_t FallbackGranuleBytes = uint64_t {2} << 20u;
-constexpr uint64_t FallbackMaxChunks    = 1536; // 3 GB pinned at most (and Vulkan's allocation count)
+// The import granule of the direct-memory backing (pinned, counted as the card's shared memory). The general allocator's
+// pool is imported at map time in 256 MiB pieces (AGENTS 19, ~3.9 GB pinned in a game); a granule elsewhere only once
+// the GPU uses it (a shader read the fault pass reports as 0, a direct download into it), by the same worker.
+constexpr uint64_t FallbackChunkBytes = uint64_t {2} << 20u;
 
-// KYTY_FIX_BDA_FALLBACK_EAGER=<MiB> (lane v4x, AnyPS5 backend; default 0 = off, the G2 behaviour above): the exact
-// variant of the first-use zeros. Under AnyPS5 all direct memory is one section with one backing view, so the fallback
-// imports the backing in units of <MiB> (a power of two, 2 to 4096) as soon as a direct mapping reaches a unit: every
-// mapped direct page without a buffer then has its fallback entry before the GPU first reads it, and no BDA read of
-// direct memory returns zero. The units stay imported (pinned) for the session; the game's granule list is neither read
-// nor written (its indices are 2 MiB granules); a unit the driver refuses is logged, and its pages then miss as without
-// the fallback. Read once.
-uint64_t FallbackEagerUnitBytes() {
-	static const uint64_t bytes = [] {
+// KYTY_FIX_BDA_FALLBACK_EAGER=<MiB> (lane v4x, AnyPS5 backend; default 0 = off): every direct mapping, not only the
+// general allocator's pool, is imported at map time by the map-time worker (MapTimeMap), so a mapped direct page
+// without a buffer gets its fallback entry once the worker's import is installed. Under AnyPS5 all direct memory is
+// one section with one backing view. Since v0.1.6 the GPU thread never imports: the value only turns the switch on
+// (the worker imports MapTimeImportBytes pieces). Read once.
+bool FallbackEager() {
+	static const bool on = [] {
 		const char* value = std::getenv("KYTY_FIX_BDA_FALLBACK_EAGER");
-		uint64_t    mib   = value != nullptr ? std::strtoull(value, nullptr, 10) : 0;
-		if (mib == 0) return uint64_t {0};
-		mib = std::clamp<uint64_t>(std::bit_ceil(mib), 2, 4096);
-		std::fprintf(stderr, "FIX_BDA_FALLBACK_EAGER on: the direct memory backing is imported in %llu MiB units at map\n",
-		             static_cast<unsigned long long>(mib));
-		return mib << 20u;
+		const bool  e     = value != nullptr && std::strtoull(value, nullptr, 10) != 0;
+		if (e) std::fprintf(stderr, "FIX_BDA_FALLBACK_EAGER on: every direct mapping is imported at map time\n");
+		return e;
 	}();
-	return bytes;
-}
-
-// The fallback's import unit: a 2 MiB granule, or the eager unit.
-uint64_t FallbackChunkBytes() {
-	const uint64_t eager = FallbackEagerUnitBytes();
-	return eager != 0 ? eager : FallbackGranuleBytes;
+	return on;
 }
 } // namespace
 
@@ -422,6 +413,9 @@ int BufferCache::BdaEntryShareMode() {
 
 void BufferCache::QueueFallbackMap(uint64_t vaddr, uint64_t size) {
 	if (size == 0) return;
+	if (FallbackEager() || (vaddr < BdaMapTimePoolStart + BdaMapTimePoolSize && vaddr + size > BdaMapTimePoolStart)) {
+		MapTimeMap(vaddr, size);
+	}
 	std::scoped_lock lock(m_fallback_pending_mutex);
 	m_fallback_pending.emplace_back(vaddr, size);
 }
@@ -432,122 +426,258 @@ bool BufferCache::FallbackEntry(uint64_t page, vk::DeviceAddress* entry) {
 	if (!LibKernel::Memory::GuestBackingOffset(page, CACHING_PAGESIZE, &offset)) return false;
 	const uint64_t total = LibKernel::Memory::GuestBackingSize();
 	if (LibKernel::Memory::GuestBackingBase() == 0 || offset >= total) return false;
-	const size_t chunk  = static_cast<size_t>(offset / FallbackChunkBytes());
-	Buffer*      import = FallbackChunk(chunk, FallbackEagerUnitBytes() != 0); // KYTY_FIX_BDA_FALLBACK_EAGER
+	const size_t chunk  = static_cast<size_t>(offset / FallbackChunkBytes);
+	Buffer*      import = FallbackChunk(chunk, false);
 	if (import == nullptr) return false;
-	const uint64_t in_chunk = offset - static_cast<uint64_t>(chunk) * FallbackChunkBytes();
+	const uint64_t in_chunk = offset - static_cast<uint64_t>(chunk) * FallbackChunkBytes;
 	if (in_chunk + CACHING_PAGESIZE > import->Size()) return false;
 	*entry = (import->BufferDeviceAddress() + in_chunk) | vk::DeviceAddress {1};
 	return true;
 }
 
-// The game's granule list: _PipelineCache/<title id>_<version>.bda_granules, one granule index per line (the granules
-// earlier sessions used; imported when mapped, so their first reads are served too). Read once, on the GPU thread.
-void BufferCache::LoadFallbackList() {
-	m_fallback_list_loaded = true;
-	const uint64_t total   = LibKernel::Memory::GuestBackingSize();
-	const size_t   count   = static_cast<size_t>((total + FallbackChunkBytes() - 1) / FallbackChunkBytes());
-	m_fallback_chunks.resize(count);
-	m_fallback_chunk_failed.resize(count, 0);
-	m_fallback_wanted.resize(count, 0);
-	if (FallbackEagerUnitBytes() != 0) { // KYTY_FIX_BDA_FALLBACK_EAGER: every mapped unit is imported, no list
-		std::fprintf(stderr, "FIX_BDA_FALLBACK granule list not used (eager units): %zu units\n", count);
-		return;
-	}
-	std::string title, version;
-	if (!::Loader::SystemContentParamSfoGetString("TITLE_ID", &title) || title.empty() ||
-	    !std::ranges::all_of(title, [](unsigned char c) { return std::isalnum(c) != 0; }))
-		return;
-	(void)::Loader::SystemContentParamSfoGetString("APP_VER", &version);
-	std::ranges::replace_if(version, [](unsigned char c) { return std::isalnum(c) == 0; }, '_');
-	m_fallback_list_path = Common::PipelineCacheDir() / (title + "_" + version + ".bda_granules");
-	if (std::FILE* f = std::fopen(Common::PathToString(m_fallback_list_path).c_str(), "r"); f != nullptr) {
-		unsigned long long g = 0;
-		while (std::fscanf(f, "%llu", &g) == 1) {
-			if (g < count && m_fallback_wanted[g] == 0) {
-				m_fallback_wanted[g] = 1;
-				m_fallback_stats.listed++;
-			}
-		}
-		std::fclose(f);
-	}
-	std::fprintf(stderr, "FIX_BDA_FALLBACK granule list %s: %llu granules of %zu\n",
-	             Common::PathToString(m_fallback_list_path).c_str(), static_cast<unsigned long long>(m_fallback_stats.listed),
-	             count);
+// The fallback's granule table, sized once (GPU thread).
+void BufferCache::SizeFallback() {
+	m_fallback_sized     = true;
+	const uint64_t total = LibKernel::Memory::GuestBackingSize();
+	m_fallback_chunks.resize(static_cast<size_t>((total + FallbackChunkBytes - 1) / FallbackChunkBytes));
 }
 
-// The imported backing granule `chunk` (FallbackChunkBytes each). Imported when `want` (the GPU uses it now: a fault,
-// a direct download) or the game's list names it, and then added to the list; null when it is neither, or the driver
-// refuses it (remembered and counted: the granule's pages then miss as without the fallback). The direct downloads into
-// the backing take their imports from here (one import of each host range).
-Buffer* BufferCache::FallbackChunk(size_t chunk, bool want) {
+// The imported backing granule `chunk` (FallbackChunkBytes each), imported by the map-time worker (AGENTS 19); null
+// while it is not. `want` (the GPU uses it now: a read as 0 at `vaddr`, a direct download) asks the worker for it: the
+// GPU thread never imports (8.11: 70-105 ms per import while the GPU runs); until it is installed the download takes the
+// staging path and a read of the page reads 0. The direct downloads into the backing take their imports from here.
+Buffer* BufferCache::FallbackChunk(size_t chunk, bool want, uint64_t vaddr) {
 	const uint64_t base  = LibKernel::Memory::GuestBackingBase();
 	const uint64_t total = LibKernel::Memory::GuestBackingSize();
-	if (base == 0 || static_cast<uint64_t>(chunk) * FallbackChunkBytes() >= total) return nullptr;
-	if (!m_fallback_list_loaded) LoadFallbackList();
-	if (!m_fallback_chunks[chunk]) {
-		if (m_fallback_chunk_failed[chunk] != 0 || (!want && m_fallback_wanted[chunk] == 0)) return nullptr;
-		if (FallbackEagerUnitBytes() == 0 && m_fallback_stats.chunks >= FallbackMaxChunks) {
-			m_fallback_chunk_failed[chunk] = 1;
-			m_fallback_stats.failed++;
-			return nullptr;
-		}
-		if (m_fallback_wanted[chunk] == 0) {
-			m_fallback_wanted[chunk] = 1;
-			m_fallback_stats.learned++;
-			if (!m_fallback_list_path.empty()) {
-				std::error_code error;
-				std::filesystem::create_directories(m_fallback_list_path.parent_path(), error);
-				if (std::FILE* f = std::fopen(Common::PathToString(m_fallback_list_path).c_str(), "a"); f != nullptr) {
-					std::fprintf(f, "%zu\n", chunk);
-					std::fclose(f);
-				}
+	if (base == 0 || static_cast<uint64_t>(chunk) * FallbackChunkBytes >= total) return nullptr;
+	if (!m_fallback_sized) SizeFallback();
+	if (!m_fallback_chunks[chunk] && want) MapTimeRequestGranule(chunk, vaddr);
+	return m_fallback_chunks[chunk].get();
+}
+
+// The BDA map-time import (AGENTS 19): a map of the pool (game thread). The pool's backing is imported in MapTimeImportBytes pieces: the
+// first map touching a piece asks the worker to import it whole (the game maps most of the pool at start, when an import
+// costs ~0.6 ms per 2 MiB; later, while the GPU thread submits, the driver serializes imports with it: 8.11 run mt_m2,
+// 2 MiB imports on a worker took ~95 ms each and the frame rate fell to ~15 fps). Pieces stay for the session: the game
+// unmaps and maps the pool again at a load (597 granules in mt_m2) and keeps its allocation for its lifetime.
+void BufferCache::MapTimeMap(uint64_t vaddr, uint64_t size) {
+	const uint64_t total = LibKernel::Memory::GuestBackingSize();
+	if (LibKernel::Memory::GuestBackingBase() == 0 || total == 0) return;
+	bool wake = false;
+	{
+		std::scoped_lock lock(m_maptime.mutex);
+		MapTimeSize(total);
+		const bool     eager = FallbackEager(); // KYTY_FIX_BDA_FALLBACK_EAGER: the whole mapping
+		const uint64_t end   = eager ? vaddr + size : std::min(vaddr + size, BdaMapTimePoolStart + BdaMapTimePoolSize);
+		for (uint64_t page = (eager ? vaddr : std::max(vaddr, BdaMapTimePoolStart)) & ~(CACHING_PAGESIZE - 1); page < end;
+		     page += CACHING_PAGESIZE) {
+			uint64_t offset = 0;
+			if (!LibKernel::Memory::GuestBackingOffset(page, CACHING_PAGESIZE, &offset) || offset >= total) continue;
+			m_maptime.granule_vaddr[static_cast<size_t>(offset / FallbackChunkBytes)] = page - offset % FallbackChunkBytes;
+			const size_t piece = static_cast<size_t>(offset / MapTimeImportBytes);
+			if (m_maptime.requested[piece] == 0) {
+				m_maptime.requested[piece] = 1;
+				m_maptime.queue.push_back(piece);
+				wake = true;
 			}
 		}
-		const uint64_t start = static_cast<uint64_t>(chunk) * FallbackChunkBytes();
-		const uint64_t bytes = std::min(FallbackChunkBytes(), total - start) & ~uint64_t {0xfff};
-		if (bytes == 0 || !Buffer::CanImportGuestMemory(m_graphics, base + start, bytes)) {
-			m_fallback_chunk_failed[chunk] = 1;
-			m_fallback_stats.failed++;
-			std::fprintf(stderr, "FIX_BDA_FALLBACK chunk %zu (backing 0x%llx+0x%llx) cannot be imported\n", chunk,
-			             static_cast<unsigned long long>(start), static_cast<unsigned long long>(bytes));
-			return nullptr;
-		}
-		const auto t0     = std::chrono::steady_clock::now();
-		bool       failed = false;
-		auto       import = std::make_unique<Buffer>(m_graphics, m_scheduler, GuestDirectTag {&failed}, base + start, bytes);
-		const auto import_us = static_cast<uint64_t>(
-		    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
-		m_fallback_stats.import_us += import_us;
-		if (FallbackEagerUnitBytes() != 0) { // KYTY_FIX_BDA_FALLBACK_EAGER: each unit's import, as it happens
-			std::fprintf(stderr, "FIX_BDA_FALLBACK_EAGER unit %zu (backing 0x%llx+0x%llx) %s in %.1f ms (frame %u)\n", chunk,
-			             static_cast<unsigned long long>(start), static_cast<unsigned long long>(bytes),
-			             failed ? "REFUSED" : "imported", static_cast<double>(import_us) / 1000.0, DebugPresentCount().load());
-		}
-		if (failed) { // D6 step K4: the driver refused the import (e.g. no more host memory it can lock)
-			m_fallback_chunk_failed[chunk] = 1;
-			m_fallback_stats.failed++;
-			std::fprintf(stderr, "FIX_BDA_FALLBACK chunk %zu (backing 0x%llx+0x%llx) import refused by the driver\n", chunk,
-			             static_cast<unsigned long long>(start), static_cast<unsigned long long>(bytes));
-			return nullptr;
-		}
-		m_fallback_chunks[chunk] = std::move(import);
-		m_fallback_stats.chunks++;
-		m_fallback_stats.imported_bytes += bytes;
 	}
-	return m_fallback_chunks[chunk].get();
+	if (wake) m_maptime.wake.notify_one();
+}
+
+void BufferCache::MapTimeSize(uint64_t total) {
+	if (!m_maptime.requested.empty()) return;
+	m_maptime.requested.resize(static_cast<size_t>((total + MapTimeImportBytes - 1) / MapTimeImportBytes), 0);
+	m_maptime.granule_vaddr.resize(static_cast<size_t>((total + FallbackChunkBytes - 1) / FallbackChunkBytes), 0);
+	m_maptime.granule_requested.resize(m_maptime.granule_vaddr.size(), 0);
+}
+
+// A granule the GPU thread wants now (a direct download into it, or a page of it read as 0), outside the pool or before
+// its piece is installed: the worker imports it alone (or installs its piece, if asked already); `vaddr` is a page of
+// it, whose 2 MiB around get entries at the install.
+void BufferCache::MapTimeRequestGranule(size_t granule, uint64_t vaddr) {
+	const uint64_t total  = LibKernel::Memory::GuestBackingSize();
+	uint64_t       offset = 0;
+	{
+		std::scoped_lock lock(m_maptime.mutex);
+		MapTimeSize(total);
+		if (vaddr != 0 && LibKernel::Memory::GuestBackingOffset(vaddr & ~(CACHING_PAGESIZE - 1), CACHING_PAGESIZE, &offset) &&
+		    static_cast<size_t>(offset / FallbackChunkBytes) == granule) {
+			m_maptime.granule_vaddr[granule] = (vaddr & ~(CACHING_PAGESIZE - 1)) - offset % FallbackChunkBytes;
+		}
+		const size_t piece = static_cast<size_t>(static_cast<uint64_t>(granule) * FallbackChunkBytes / MapTimeImportBytes);
+		if (m_maptime.requested[piece] == 1 || m_maptime.granule_requested[granule] != 0) return; // on its way
+		m_maptime.granule_requested[granule] = 1;
+		m_maptime.queue.push_back(granule | MapTimeGranuleItem);
+	}
+	m_maptime.wake.notify_one();
+}
+
+// The worker: one import per piece, then a 2 MiB view buffer per granule of it (the fallback's granule).
+void BufferCache::MapTimeWorker() {
+	KYTY_PROFILER_THREAD("BdaMapTime");
+	const uint64_t base  = LibKernel::Memory::GuestBackingBase();
+	const uint64_t total = LibKernel::Memory::GuestBackingSize();
+	for (;;) {
+		size_t piece = 0;
+		{
+			std::unique_lock lock(m_maptime.mutex);
+			m_maptime.wake.wait(lock, [&] { return m_maptime.stop || !m_maptime.queue.empty(); });
+			if (m_maptime.stop) return;
+			piece = m_maptime.queue.front();
+			m_maptime.queue.pop_front();
+		}
+		if ((piece & MapTimeGranuleItem) != 0) { // one granule (MapTimeRequestGranule)
+			const size_t   granule = piece & ~MapTimeGranuleItem;
+			// The aligned group of 16 granules around it in one host-memory import (32 MiB; hitch study 10.11): each import holds
+			// the driver ~50 ms whatever its size and the execution thread's vkCreateImageView / vkAllocateMemory wait behind
+			// it; one granule per import after the start gave 45-80 ms hitches. ABBA on the walk replay: granule imports 35-37 ->
+			// 12-13, slow image views 7 -> 1-2, frames > 100 ms 6-11 -> 2-4, late pool pages 0 (zero=), fps the same.
+			constexpr size_t span = 16;
+			if (span > 1) {
+				const size_t   first = granule / span * span;
+				size_t         count = 0;
+				const uint64_t sstart = static_cast<uint64_t>(first) * FallbackChunkBytes;
+				const uint64_t sbytes = std::min<uint64_t>(span * FallbackChunkBytes, total - sstart) & ~uint64_t {0xfff};
+				const auto     t0     = std::chrono::steady_clock::now();
+				const auto     memory = sbytes == 0 || !Buffer::CanImportGuestMemory(m_graphics, base + sstart, sbytes)
+				                            ? vk::DeviceMemory {}
+				                            : Buffer::ImportGuestMemory(m_graphics, base + sstart, sbytes);
+				std::vector<std::pair<size_t, std::unique_ptr<Buffer>>> views;
+				if (memory) {
+					std::vector<size_t> wanted;
+					{
+						std::scoped_lock lock(m_maptime.mutex);
+						for (size_t g = first; g < first + span && static_cast<uint64_t>(g - first) * FallbackChunkBytes < sbytes; g++) {
+							if (g == granule || m_maptime.granule_requested[g] == 0) {
+								m_maptime.granule_requested[g] = 1;
+								wanted.push_back(g);
+							}
+						}
+					}
+					for (const size_t g: wanted) {
+						const uint64_t at     = static_cast<uint64_t>(g - first) * FallbackChunkBytes;
+						bool           failed = false;
+						auto view = std::make_unique<Buffer>(m_graphics, m_scheduler, GuestDirectTag {&failed, memory, at}, base + sstart + at,
+						                                     std::min(FallbackChunkBytes, sbytes - at));
+						if (!failed) views.emplace_back(g, std::move(view));
+					}
+				}
+				const auto us = static_cast<uint64_t>(
+				    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+				if (memory) {
+					std::scoped_lock lock(m_maptime.mutex);
+					m_maptime.import_us += us;
+					m_maptime.granule_imports++;
+					m_maptime.imported_bytes += sbytes;
+					m_maptime.memories.push_back(memory);
+					for (auto& view: views) {
+						m_maptime.granule_requested[view.first] = 2;
+						m_maptime.ready.push_back(std::move(view));
+						count++;
+					}
+					continue;
+				}
+				// the span could not be imported: the granule alone, as without the switch
+			}
+			const uint64_t start   = static_cast<uint64_t>(granule) * FallbackChunkBytes;
+			const uint64_t bytes   = std::min(FallbackChunkBytes, total - start) & ~uint64_t {0xfff};
+			const auto     t0      = std::chrono::steady_clock::now();
+			bool           failed  = bytes == 0 || !Buffer::CanImportGuestMemory(m_graphics, base + start, bytes);
+			std::unique_ptr<Buffer> import;
+			if (!failed) import = std::make_unique<Buffer>(m_graphics, m_scheduler, GuestDirectTag {&failed}, base + start, bytes);
+			const auto us = static_cast<uint64_t>(
+			    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+			std::scoped_lock lock(m_maptime.mutex);
+			m_maptime.import_us += us;
+			if (failed) {
+				m_maptime.refused++;
+				m_maptime.granule_requested[granule] = 2;
+				continue;
+			}
+			m_maptime.granule_imports++;
+			m_maptime.imported_bytes += bytes;
+			m_maptime.ready.emplace_back(granule, std::move(import));
+			continue;
+		}
+		const uint64_t start  = static_cast<uint64_t>(piece) * MapTimeImportBytes;
+		const uint64_t bytes  = std::min(MapTimeImportBytes, total - start) & ~uint64_t {0xfff};
+		const auto     t0     = std::chrono::steady_clock::now();
+		const auto     memory = bytes == 0 ? vk::DeviceMemory {} : Buffer::ImportGuestMemory(m_graphics, base + start, bytes);
+		std::vector<std::pair<size_t, std::unique_ptr<Buffer>>> views;
+		if (memory) {
+			for (uint64_t at = 0; at < bytes; at += FallbackChunkBytes) {
+				bool failed = false;
+				auto view   = std::make_unique<Buffer>(m_graphics, m_scheduler, GuestDirectTag {&failed, memory, at},
+                                                     base + start + at, std::min(FallbackChunkBytes, bytes - at));
+				if (!failed) views.emplace_back(static_cast<size_t>((start + at) / FallbackChunkBytes), std::move(view));
+			}
+		}
+		const auto us = static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+		std::scoped_lock lock(m_maptime.mutex);
+		m_maptime.import_us += us;
+		if (!memory) {
+			m_maptime.refused++; // the piece's pages then miss as without the fallback (counted; the fault pass imports)
+			m_maptime.requested[piece] = 2;
+			continue;
+		}
+		m_maptime.imports++;
+		m_maptime.imported_bytes += bytes;
+		m_maptime.memories.push_back(memory);
+		for (auto& view: views) m_maptime.ready.push_back(std::move(view));
+	}
+}
+
+// GPU thread: the worker's views become the granules' fallback chunks and the granules' mapped pages get entries.
+void BufferCache::MapTimeInstall() {
+	if (!m_fallback_sized) SizeFallback();
+	std::vector<std::pair<size_t, std::unique_ptr<Buffer>>> ready;
+	std::vector<uint64_t>                                   ranges;
+	{
+		std::scoped_lock lock(m_maptime.mutex);
+		if (m_maptime.ready.empty()) return;
+		ready.swap(m_maptime.ready);
+		for (auto& [granule, view]: ready) {
+			if (m_fallback_chunks[granule]) { // a direct download imported it first: its own import stays
+				m_maptime.dropped++;
+				view.reset();
+				continue;
+			}
+			if (m_maptime.granule_vaddr[granule] != 0) ranges.push_back(m_maptime.granule_vaddr[granule]);
+		}
+	}
+	for (auto& [granule, view]: ready) {
+		if (!view) continue;
+		m_fallback_stats.chunks++;
+		m_fallback_stats.imported_bytes += view->Size();
+		m_fallback_chunks[granule] = std::move(view);
+		m_maptime.installed++;
+	}
+	// Each installed granule's pages where it was mapped last (WriteFallbackRange takes every page's current backing, so
+	// a page mapped elsewhere since gets the entry of its own granule or none).
+	for (const uint64_t vaddr: ranges) {
+		WriteFallbackRange(vaddr, FallbackChunkBytes);
+	}
 }
 
 void BufferCache::WantFallback(uint64_t page) {
 	page            = page & ~(CACHING_PAGESIZE - 1);
 	uint64_t offset = 0;
 	if (!LibKernel::Memory::GuestBackingOffset(page, CACHING_PAGESIZE, &offset)) return;
-	if (FallbackChunk(static_cast<size_t>(offset / FallbackChunkBytes()), true) == nullptr) return;
+	if (InBdaMapTimePool(page)) {
+		// The pool's granules are imported at map time: a read as 0 means the import was late (the check: PERF
+		// bda_maptime zero=, must stay 0; the entries follow when the worker's import is installed).
+		NoteBdaMapTimeZero();
+		std::scoped_lock lock(m_maptime.mutex);
+		if (!m_maptime.requested.empty() && m_maptime.requested[static_cast<size_t>(offset / MapTimeImportBytes)] == 1) return;
+	}
+	if (FallbackChunk(static_cast<size_t>(offset / FallbackChunkBytes), true, page) == nullptr) return;
 	// The guest range that maps the granule where `page` maps it (WriteFallbackRange checks each page's own granule;
 	// another view of the granule gets its entries when it is mapped again or faults itself).
-	const uint64_t in_granule = offset % FallbackChunkBytes();
+	const uint64_t in_granule = offset % FallbackChunkBytes;
 	if (page < in_granule) return;
-	WriteFallbackRange(page - in_granule, FallbackChunkBytes());
+	WriteFallbackRange(page - in_granule, FallbackChunkBytes);
 }
 
 // Fallback entries for the pages of [vaddr, vaddr + size) that hold no buffer (one table write per run of pages).
@@ -585,6 +715,7 @@ bool BufferCache::WasFallbackPage(uint64_t address, uint32_t frames) const {
 }
 
 void BufferCache::ApplyFallbackMaps() {
+	MapTimeInstall();
 	std::vector<std::pair<uint64_t, uint64_t>> pending;
 	{
 		std::scoped_lock lock(m_fallback_pending_mutex);
@@ -605,15 +736,28 @@ void BufferCache::ApplyFallbackMaps() {
 			m_fallback_printed    = m_fallback_stats;
 			std::fprintf(stderr,
 			             "FIX_BDA_FALLBACK stats maps=%llu pages=%llu live=%zu replaced=%llu restored=%llu cleared=%llu chunks=%llu "
-			             "failed=%llu listed=%llu learned=%llu imported_MiB=%llu import_ms=%llu clear_fills=%llu clear_ms=%llu\n",
+			             "imported_MiB=%llu clear_fills=%llu clear_ms=%llu\n",
 			             static_cast<unsigned long long>(f.maps), static_cast<unsigned long long>(f.pages),
 			             m_fallback_pages.size(), static_cast<unsigned long long>(f.replaced),
 			             static_cast<unsigned long long>(f.restored), static_cast<unsigned long long>(f.cleared),
-			             static_cast<unsigned long long>(f.chunks), static_cast<unsigned long long>(f.failed),
-			             static_cast<unsigned long long>(f.listed), static_cast<unsigned long long>(f.learned),
-			             static_cast<unsigned long long>(f.imported_bytes >> 20u),
-			             static_cast<unsigned long long>(f.import_us / 1000u), static_cast<unsigned long long>(f.clear_fills),
+			             static_cast<unsigned long long>(f.chunks), static_cast<unsigned long long>(f.imported_bytes >> 20u),
+			             static_cast<unsigned long long>(f.clear_fills),
 			             static_cast<unsigned long long>(f.clear_us / 1000u));
+			{
+				std::scoped_lock lock(m_maptime.mutex);
+				std::fprintf(stderr,
+				             "PERF bda_maptime zero=%llu imports=%llu granule_imports=%llu imported_MiB=%llu import_ms=%llu refused=%llu installed=%llu "
+				             "dropped=%llu queued=%zu live_MiB=%llu\n",
+				             static_cast<unsigned long long>(m_maptime.zero.load()),
+				             static_cast<unsigned long long>(m_maptime.imports),
+				             static_cast<unsigned long long>(m_maptime.granule_imports),
+				             static_cast<unsigned long long>(m_maptime.imported_bytes >> 20u),
+				             static_cast<unsigned long long>(m_maptime.import_us / 1000u),
+				             static_cast<unsigned long long>(m_maptime.refused),
+				             static_cast<unsigned long long>(m_maptime.installed),
+				             static_cast<unsigned long long>(m_maptime.dropped), m_maptime.queue.size(),
+				             static_cast<unsigned long long>(m_fallback_stats.imported_bytes >> 20u));
+			}
 		}
 	}
 }
@@ -730,6 +874,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 }
 
 void BufferCache::TouchBuffer(Buffer& buffer) {
+	if (t_translator != 0) TranslatorNote(1); // project 15 S2a: a touch inside a peek
 	if (!buffer.is_deleted) {
 		// m_gc_tick only rises (RunGarbageCollector) and an LRU item's tick never drops, so a buffer
 		// touched (or registered) at this tick already holds it: Touch would return at its first check,
@@ -746,6 +891,15 @@ void BufferCache::DeleteBuffer(BufferId id) {
 		return;
 	}
 	CommitUploadBatch(BatchCommit::DeleteBuffer); // claimed uploads may target this buffer
+	static const bool trace_delete = [] { // KYTY_TRACE_BUFFER_CREATE=1 (diagnostic): every deletion
+		const char* value = std::getenv("KYTY_TRACE_BUFFER_CREATE");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (trace_delete) {
+		const auto& gone = m_slot_buffers[id];
+		std::fprintf(stderr, "BUF_DELETE frame=%u addr=0x%llx size=0x%llx\n", DebugPresentCount().load(std::memory_order_relaxed),
+		             static_cast<unsigned long long>(gone.CpuAddress()), static_cast<unsigned long long>(gone.Size()));
+	}
 	Unregister(id);
 	if (m_scheduler.Active()) {
 		m_scheduler.DeferOperation([this, id] {
@@ -838,13 +992,13 @@ bool BufferCache::PlanDownloadToBacking(uint64_t buffer_address, const std::vect
 		plan.items.push_back({vaddr, backing, copy.size});
 		// D6 step K4: the BDA fallback's import table serves the copies too, so no host range is imported twice; a granule
 		// a download needs is imported now (and so serves first reads afterwards).
-		const uint64_t granule = FallbackChunkBytes();
+		const uint64_t granule = FallbackChunkBytes;
 		for (uint64_t done = 0; done < copy.size;) {
 			const uint64_t at         = backing + done;
 			const uint64_t chunk      = at / granule;
 			const uint64_t chunk_base = chunk * granule;
 			const uint64_t bytes      = std::min(copy.size - done, chunk_base + granule - at);
-			Buffer*        target     = FallbackChunk(static_cast<size_t>(chunk), true);
+			Buffer*        target     = FallbackChunk(static_cast<size_t>(chunk), true, vaddr + done);
 			// A tail chunk is shorter (whole pages only).
 			if (target == nullptr || at + bytes > chunk_base + target->Size()) {
 				s.fallback_import.fetch_add(1, std::memory_order_relaxed);
@@ -876,8 +1030,56 @@ static bool SkipReadbackCeiling() {
 	return on;
 }
 
+// Reads of GPU-written bytes from the host mapping of device memory (BAR, write-combined VRAM over PCIe) are fast on
+// most machines (~1 GB/s for the walk's ~4 KiB reads) and very slow on some (8.11: an i9-12900K + RTX 5090 read at
+// ~19 MB/s, 4.1 s of every 5 s on the GPU thread; skipping the downloads gave 32 instead of ~10 fps). The first reads are
+// timed: below BarSlowMbps the downloads take the GPU copy into cached host memory instead (the path larger reads and
+// not yet finished writes take today; the same bytes). KYTY_BAR_READS=0 never reads the mapping, =1 always does.
+namespace {
+constexpr double   BarSlowMbps    = 100.0;
+constexpr uint64_t BarProbeCalls  = 512;
+constexpr uint64_t BarProbeBytes  = 2u << 20u;
+std::atomic<int>      g_bar_reads {-1}; // -1 measuring, 0 off (slow or KYTY_BAR_READS=0), 1 on
+std::atomic<uint64_t> g_bar_probe_calls {0};
+std::atomic<uint64_t> g_bar_probe_bytes {0};
+std::atomic<uint64_t> g_bar_probe_ns {0};
+
+bool BarReadsOn() {
+	static const int forced = [] {
+		const char* value = std::getenv("KYTY_BAR_READS");
+		if (value != nullptr && (value[0] == '0' || value[0] == '1') && value[1] == '\0') {
+			std::fprintf(stderr, "BAR_READS forced %s (KYTY_BAR_READS)\n", value[0] == '1' ? "on" : "off");
+			g_bar_reads.store(value[0] - '0', std::memory_order_relaxed);
+			return value[0] - '0';
+		}
+		return -1;
+	}();
+	(void)forced;
+	return g_bar_reads.load(std::memory_order_relaxed) != 0;
+}
+
+// Every timed BAR copy while measuring: the decision once BarProbeCalls copies and BarProbeBytes bytes were read.
+void BarReadsProbe(uint64_t bytes, uint64_t ns) {
+	if (g_bar_reads.load(std::memory_order_relaxed) != -1) return;
+	const uint64_t calls = g_bar_probe_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+	const uint64_t total = g_bar_probe_bytes.fetch_add(bytes, std::memory_order_relaxed) + bytes;
+	const uint64_t time  = g_bar_probe_ns.fetch_add(ns, std::memory_order_relaxed) + ns;
+	if (calls < BarProbeCalls || total < BarProbeBytes || time == 0) return;
+	const double mbps = static_cast<double>(total) / (1024.0 * 1024.0) / (static_cast<double>(time) / 1e9);
+	int          expected = -1;
+	if (g_bar_reads.compare_exchange_strong(expected, mbps < BarSlowMbps ? 0 : 1, std::memory_order_relaxed)) {
+		std::fprintf(stderr, "BAR_READS %s: %.0f MB/s over %llu reads (%.1f MiB)%s\n", mbps < BarSlowMbps ? "slow" : "fast",
+		             mbps, static_cast<unsigned long long>(calls), static_cast<double>(total) / (1024.0 * 1024.0),
+		             mbps < BarSlowMbps ? " - downloads go through GPU copies" : "");
+		std::fflush(stderr);
+	}
+}
+} // namespace
+
 template <bool async>
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	const Common::SlowFrame::Scope slow_frame_scope(Common::SlowFrame::Download); // KYTY_TRACE_SLOW_FRAMES
+	ChunkCensus::t_downloads++; // KYTY_TRACE_CHUNK_CENSUS (hole)
 	KYTY_PROFILER_BLOCK("BufferCache::DownloadBufferMemory");
 	WaitCopyReadbacks(vaddr, size); // KYTY_PERF_COPY_HANDBACK: a copy under way lands before this download publishes
 	if constexpr (!async) {
@@ -889,7 +1091,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 			});
 			return any;
 		}
-		if (!buffer.Mapped().empty()) {
+		if (!buffer.Mapped().empty() && BarReadsOn()) {
 			DownloadWaitTrace::g_last_bar_reason = -1;
 			if (TryBarDownload(buffer, vaddr, size) == 1) return true;
 		}
@@ -1014,7 +1216,15 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		}
 	};
 	if constexpr (async) {
-		m_scheduler.DeferPriorityOperation(std::move(publish));
+		// An unmap of these bytes waits for this publish (RenderContext::UnmapMemory).
+		if (auto published = NotePendingGuestWrite(vaddr, size)) {
+			m_scheduler.DeferPriorityOperation([publish = std::move(publish), published = std::move(published)] {
+				publish();
+				published->store(true, std::memory_order_release);
+			});
+		} else {
+			m_scheduler.DeferPriorityOperation(std::move(publish));
+		}
 	} else {
 		const auto              tick       = m_scheduler.CurrentTick();
 		const auto              wait_start = std::chrono::steady_clock::now();
@@ -1068,6 +1278,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       // The ring is only written by the CPU (sequential memcpy), so it lives in host memory like the upload ring. The GDS
       // and bindless buffers keep their placement.
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, RingSize("KYTY_STREAM_BUFFER_MB", 64) * MiB, true),
+      m_word_stream(graphics, scheduler, MemoryUsage::Stream, 8 * MiB, false, vk::BufferUsageFlagBits::eShaderDeviceAddress),
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 64 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_texture_cache(texture_cache) {
@@ -1099,6 +1310,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	    m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 16);
 	EXIT_IF(null_id != NULL_BUFFER_ID);
 	SetVulkanObjectNameF(m_graphics.device, GetBuffer(null_id).Handle(), "Kyty.NullBuffer");
+	m_maptime.worker = std::thread([this] { MapTimeWorker(); });
 	if (!m_graphics.CanReportMemoryUsage()) {
 		return;
 	}
@@ -1117,6 +1329,17 @@ BufferCache::~BufferCache() {
 	// KYTY_PERF_COPY_HANDBACK: no hand-back copy outlives the buffers.
 	for (const auto& entry: m_eager_readbacks) {
 		if (entry.copy_tick != 0) BarCopyTickWait(entry.copy_tick);
+	}
+	if (m_maptime.worker.joinable()) {
+		{
+			std::scoped_lock lock(m_maptime.mutex);
+			m_maptime.stop = true;
+		}
+		m_maptime.wake.notify_all();
+		m_maptime.worker.join();
+		m_maptime.ready.clear();
+		m_fallback_chunks.clear(); // the views before the imported pieces they are bound to
+		for (const auto memory: m_maptime.memories) m_graphics.device.freeMemory(memory, nullptr);
 	}
 	if (!m_gpu_modified_ranges.Empty()) {
 		EXIT("BufferCache: destroyed with pending GPU-modified ranges\n");
@@ -1228,7 +1451,17 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		// Today's request: runs on the GPU thread (SendCommandSync below).
 		auto request = [this, vaddr, size, is_write, reason, perf_time, call_start, timeline_call, caller_eligible,
 		                allow_defer, attempt, last_tick, defer = &defer_tick, copy_defer = &defer_copy, deferred] {
+			// KYTY_TRACE_RING_CENSUS (diagnostic): a write request's census record, inactive unless the census is on.
+			RingCensus::Request census;
+			struct CensusEnd {
+				BufferCache*         cache;
+				RingCensus::Request& request;
+				~CensusEnd() {
+					if (request.active) cache->RingCensusEnd(request);
+				}
+			} census_end {this, census};
 			const auto mark_cpu_written = [&] {
+				if (census.active) RingCensusCompare(census); // KYTY_TRACE_RING_CENSUS: before the page opens
 				CpuDirtyDeferScope defer_scope(deferred);
 				m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 			};
@@ -1328,7 +1561,11 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			// publishes) itself. Serving the request later is what the GPU thread would do if the faulting thread had
 			// been descheduled until then: the same code moves the same bytes and changes the same states, only after
 			// the GPU finished them, while the GPU thread kept translating.
-			if (caller_eligible) {
+			// A write into a data-ring page whose GPU bytes are all dead (DropDeadRingBytes below drops them without a
+			// download) waits for nothing: the caller wait would only delay the same outcome (walk 9.11: ~150 waits of
+			// ~3.4 ms per ring half every other frame, with the GPU-read SRT words).
+			const bool ring_all_dead = caller_eligible && is_write && RingBytesAllDead(vaddr);
+			if (caller_eligible && !ring_all_dead) {
 				auto plan = PlanCallerWait(vaddr, size, is_write);
 				if (plan.fallback != CallerFallback::None) {
 					m_caller_stats.fallback[static_cast<uint32_t>(plan.fallback)].fetch_add(1, std::memory_order_relaxed);
@@ -1336,6 +1573,25 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 				if (plan.tick != 0) {
 					if (attempt != 0 && plan.tick > last_tick) m_caller_stats.new_writer.fetch_add(1, std::memory_order_relaxed);
 					if (allow_defer) {
+						// KYTY_TRACE_CALLER_WAITS: the GPU-written intervals of the faulting page and their write tick.
+						static const bool page_trace = std::getenv("KYTY_TRACE_CALLER_WAITS") != nullptr;
+						if (page_trace && DebugPresentCount().load() >= 3200u) {
+							static std::atomic<uint32_t> lines {0};
+							if (lines.fetch_add(1, std::memory_order_relaxed) < 200u) {
+								std::string ranges;
+								const uint64_t page = vaddr & ~uint64_t {0xfff};
+								m_gpu_modified_ranges.ForEachInRange(page, 0x1000, [&](uint64_t start, uint64_t end) {
+									char item[48];
+									std::snprintf(item, sizeof(item), " %llx-%llx", static_cast<unsigned long long>(start),
+									              static_cast<unsigned long long>(end));
+									if (ranges.size() < 400u) ranges += item;
+								});
+								std::fprintf(stderr, "CALLER_PAGE addr=0x%llx write=%d tick=%llu cur=%llu gpu:%s\n",
+								             static_cast<unsigned long long>(vaddr), is_write ? 1 : 0,
+								             static_cast<unsigned long long>(plan.tick),
+								             static_cast<unsigned long long>(m_scheduler.CurrentTick()), ranges.c_str());
+							}
+						}
 						if (plan.tick >= m_scheduler.CurrentTick()) m_scheduler.Flush();
 						*defer                = plan.tick;
 						*copy_defer           = plan.copy_tick;
@@ -1365,9 +1621,11 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			// A write whose page's GPU bytes were just published or dropped: in place of UnmarkRegionAsGpuModified +
 			// mark_cpu_written.
 			const auto release_gpu_to_cpu = [&] {
+				if (census.active) RingCensusCompare(census); // KYTY_TRACE_RING_CENSUS: before the page opens
 				CpuDirtyDeferScope defer_scope(deferred);
 				NoteInvalidateProtectMerge(m_memory_tracker.ReleaseGpuToCpu(vaddr, size));
 			};
+			if (is_write && RingCensus::Enabled()) RingCensusBegin(census, vaddr, size); // KYTY_TRACE_RING_CENSUS
 			// A pending asynchronous copy of this window must publish before the CPU reads or
 			// writes it; it may also already make the access fault-free.
 			const bool pending = std::ranges::any_of(m_eager_readbacks, [&](const EagerReadback& entry) {
@@ -1378,6 +1636,8 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			if (!m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
 				PerfCount(pending ? PerfKind::EagerWait : PerfKind::EagerHit);
 				if (pending) ReadbackBurn(); // KYTY_DIAG_GPU_BURN_AT=readback (measurement only)
+				census.downloaded = pending && census.gpu_modified; // KYTY_TRACE_RING_CENSUS
+				census.path       = census.downloaded ? RingCensus::Path::Eager : RingCensus::Path::NotGpu;
 				if (is_write) mark_cpu_written();
 				return;
 			}
@@ -1385,6 +1645,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			// range left without GPU bytes needs nothing more.
 			if (!m_append_pools.empty() && AppendRelease(vaddr, size)) {
 				if (is_write) {
+					census.path = RingCensus::Path::Append; // KYTY_TRACE_RING_CENSUS
 					release_gpu_to_cpu();
 					return;
 				}
@@ -1395,6 +1656,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			// eager copies (which must publish first), before the read window and download planning; a page left
 			// without GPU bytes needs nothing more. Newer GPU bytes go on to the download below.
 			if (is_write && DropDeadRingBytes(vaddr)) {
+				census.path = RingCensus::Path::DeadRing; // KYTY_TRACE_RING_CENSUS
 				release_gpu_to_cpu();
 				return;
 			}
@@ -1446,7 +1708,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			if (lo < hi && lo <= vaddr && vaddr + size <= hi) {
 				PerfCount(PerfKind::SyncRead);
 
+				census.path = RingCensus::Path::WindowDl; // KYTY_TRACE_RING_CENSUS
 				if (timed_download(buffer, lo, hi - lo)) {
+					census.downloaded = true; // KYTY_TRACE_RING_CENSUS
 					if (!is_write) {
 						UnmarkWindow(lo, hi);
 						return;
@@ -1458,18 +1722,22 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 					release_gpu_to_cpu();
 					return;
 				}
+				census.path = RingCensus::Path::NoCopy; // KYTY_TRACE_RING_CENSUS
 				if (is_write) mark_cpu_written();
 				return;
 			}
 			PerfCount(PerfKind::SyncRead);
 
+			census.path = RingCensus::Path::PageDl; // KYTY_TRACE_RING_CENSUS
 			if (timed_download(buffer, vaddr, size)) {
+				census.downloaded = true; // KYTY_TRACE_RING_CENSUS
 				if (is_write) {
 					release_gpu_to_cpu();
 					return;
 				}
 				m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
 			}
+			if (!census.downloaded) census.path = RingCensus::Path::NoCopy; // KYTY_TRACE_RING_CENSUS
 			if (is_write) mark_cpu_written();
 		};
 		m_scheduler.Context().GetGpu().SendCommandSync(std::move(request));
@@ -1486,10 +1754,26 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			}
 			if (defer_copy != 0) BarCopyTickWait(defer_copy); // KYTY_PERF_COPY_HANDBACK
 		}
-		m_caller_stats.caller_wait_ns.fetch_add(
-		    static_cast<uint64_t>(
-		        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - wait_start).count()),
-		    std::memory_order_relaxed);
+		const auto caller_wait_ns = static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - wait_start).count());
+		m_caller_stats.caller_wait_ns.fetch_add(caller_wait_ns, std::memory_order_relaxed);
+		// KYTY_TRACE_CALLER_WAITS=<frame> (diagnostic): each caller wait over 200 us (first 400): the faulting address, the access,
+		// the wait and the tick (project "the GPU reads resources itself", part 2: what the game threads read).
+		// The value is the first presented frame to report.
+		static const uint32_t caller_trace_from = [] {
+			const char* v = std::getenv("KYTY_TRACE_CALLER_WAITS");
+			return v != nullptr ? std::max<uint32_t>(1u, static_cast<uint32_t>(std::strtoul(v, nullptr, 10))) : 0u;
+		}();
+		if (caller_trace_from != 0u && caller_wait_ns > 200000u && DebugPresentCount().load() >= caller_trace_from) {
+			static std::atomic<uint32_t> lines {0};
+			if (lines.fetch_add(1, std::memory_order_relaxed) < 400u) {
+				std::fprintf(stderr, "CALLER_WAIT frame=%u addr=0x%llx size=0x%llx write=%d us=%llu tick=%llu attempt=%u\n",
+				             DebugPresentCount().load(), static_cast<unsigned long long>(vaddr),
+				             static_cast<unsigned long long>(size), is_write ? 1 : 0,
+				             static_cast<unsigned long long>(caller_wait_ns / 1000u), static_cast<unsigned long long>(defer_tick),
+				             attempt);
+			}
+		}
 		m_caller_stats.retries.fetch_add(1, std::memory_order_relaxed);
 		last_tick = defer_tick;
 	}
@@ -1590,6 +1874,28 @@ BufferCache::CallerPlan BufferCache::PlanCallerWait(uint64_t vaddr, uint64_t siz
 	return plan;
 }
 
+// ---- The pending publishes of guest bytes (RenderContext::UnmapMemory waits for those into its range) ----
+std::shared_ptr<std::atomic_bool> BufferCache::NotePendingGuestWrite(uint64_t vaddr, uint64_t size) {
+	if (size == 0) return nullptr;
+	if (m_pending_guest_writes.size() >= 256u) {
+		std::erase_if(m_pending_guest_writes,
+		              [](const PendingGuestWrite& write) { return write.done->load(std::memory_order_acquire); });
+	}
+	auto done = std::make_shared<std::atomic_bool>(false);
+	m_pending_guest_writes.push_back({vaddr, vaddr + size, m_scheduler.CurrentTick(), done});
+	return done;
+}
+
+uint64_t BufferCache::PendingGuestWriteTick(uint64_t vaddr, uint64_t size) {
+	uint64_t tick = 0;
+	std::erase_if(m_pending_guest_writes, [&](const PendingGuestWrite& write) {
+		if (write.done->load(std::memory_order_acquire)) return true;
+		if (vaddr < write.end && write.start < vaddr + size) tick = std::max(tick, write.tick);
+		return false;
+	});
+	return tick;
+}
+
 // The write-through of the GPU thread's own writes of guest memory (end-of-pipe labels and
 // timestamps, WRITE_DATA, COPY_DATA of the reference clock) into a GPU-modified page no longer fault when none of the
 // written bytes is GPU-written (the GPU-dirty set is byte-exact). At the torii-gate scene the game's frame timestamps
@@ -1652,13 +1958,21 @@ void ReportDirectStats(size_t pending) {
 
 namespace {
 struct RingDeadStats {
-	std::atomic<uint64_t> faults {0}, freed {0}, dropped_bytes {0}, partial {0};
+	std::atomic<uint64_t> faults {0}, freed {0}, dropped_bytes {0}, partial {0}, caller_skips {0};
 	std::atomic<uint64_t> kept {0}, kept_bytes {0}; // KYTY_FIX_RING_DEAD_DOWNLOAD: faults (and bytes) downloaded instead
 };
-RingDeadStats g_ring_dead;
-std::array<uint64_t, 8>  g_ring_frame_ticks {}; // tick at the end of frame n (collector pass), slot n % 8
-uint64_t                 g_ring_frames = 0;
+RingDeadStats         g_ring_dead;
+std::atomic<uint64_t> g_ring_game_write_frame {0}; // game threads: the frame whose ring half the game writes now
+uint64_t              g_ring_exec_data_frame = 0;  // execution thread: the frame of the work being recorded
 } // namespace
+
+void RingGameWriteFrame(uint64_t frame) {
+	g_ring_game_write_frame.store(frame, std::memory_order_release);
+}
+
+void RingExecDataFrame(uint64_t frame) {
+	g_ring_exec_data_frame = frame;
+}
 
 bool BufferCache::TryCpWriteThrough(uint64_t address, const void* data, uint64_t size) {
 	// KYTY_PERF_DIRECT_RANGES: a command-processor write into a direct range goes into the stream (the GPU work
@@ -1878,6 +2192,8 @@ uint32_t BufferCache::DirectMode() {
 		if (Common::EnvRead::DirectRanges(&value)) {
 			if (value == nullptr || (value[0] == '1' && value[1] == '\0')) {
 				m_direct_ranges.push_back({0x2010000000ull, 0x2015E00000ull});
+				// (9.11: the pages the game and the GPU share, 0x5000000000, made the walk's game threads wait less but cost
+				// the menu half its frame rate - shaders read them from host memory in every invocation; they stay tracked.)
 			} else {
 				const char* p = value;
 				while (*p != '\0') {
@@ -1898,6 +2214,19 @@ uint32_t BufferCache::DirectMode() {
 	return mode;
 }
 
+namespace {
+// Project 15 way B W2.2: the generation of the direct ranges (odd while the execution thread changes them).
+std::atomic<uint64_t> g_direct_generation {0};
+} // namespace
+
+void BufferCache::DirectChangeBegin() {
+	if (m_direct_change_depth++ == 0) g_direct_generation.fetch_add(1, std::memory_order_acq_rel);
+}
+
+void BufferCache::DirectChangeEnd() {
+	if (--m_direct_change_depth == 0) g_direct_generation.fetch_add(1, std::memory_order_release);
+}
+
 BufferId BufferCache::DirectBufferFor(uint64_t vaddr, uint64_t size, bool* deferred) {
 	const uint32_t mode = DirectMode();
 	if (mode != m_direct_mode_seen) {
@@ -1908,6 +2237,7 @@ BufferId BufferCache::DirectBufferFor(uint64_t vaddr, uint64_t size, bool* defer
 			*deferred       = true;
 			return {};
 		}
+		const DirectChange change(*this); // (W2.2)
 		// Live A/B: off ends the active ranges (their memory is tracked again from guest memory).
 		if (mode == 0) {
 			for (auto& range: m_direct_ranges) DeactivateDirect(range);
@@ -1939,6 +2269,7 @@ BufferId BufferCache::DirectBufferFor(uint64_t vaddr, uint64_t size, bool* defer
 			return {};
 		}
 		if (grow) {
+			const DirectChange change(*this); // (W2.2)
 			// A request reaching past the range: the range grows to hold it (a direct buffer is never joined).
 			DeactivateDirect(range, false);
 			range.start = Common::AlignDown(std::min(vaddr, range.start), CACHING_PAGESIZE);
@@ -1958,6 +2289,7 @@ BufferId BufferCache::DirectBufferFor(uint64_t vaddr, uint64_t size, bool* defer
 
 void BufferCache::ActivateDirect(DirectRange& range) {
 	if (range.active || range.refused) return;
+	const DirectChange change(*this); // (W2.2)
 	const uint64_t size = range.end - range.start;
 	if (m_texture_cache.IsRegionRegistered(range.start, size)) {
 		range.refused = true;
@@ -2016,12 +2348,13 @@ void BufferCache::ActivateDirect(DirectRange& range) {
 
 void BufferCache::DeactivateDirect(DirectRange& range, bool replace) {
 	if (!range.active) return;
+	const DirectChange change(*this); // (W2.2)
 	// The GPU's writes to the range are in guest memory once it finished; the pages stay CPU-dirty, so the next
 	// ordinary buffer over them uploads guest memory.
 	m_scheduler.Finish();
 	DeleteBuffer(range.id);
 	m_memory_tracker.UntrackMemory(range.start, range.end - range.start);
-	std::erase_if(m_direct_gpu_writes, [&](const DirectGpuWrite& w) { return w.start < range.end && range.start < w.end; });
+	std::erase_if(m_direct_gpu_writes, [&](const DirectGpuWrite& w) { return w.start < range.end && range.start < w.end; }); RebuildDirectWriteSpans();
 	range.id     = {};
 	range.active = false;
 	// An ordinary buffer over the whole range at once: without one, shaders reading the range through pointers (the BDA
@@ -2042,6 +2375,30 @@ void BufferCache::ActivateWantedDirectRanges() {
 	}
 }
 
+void BufferCache::RebuildDirectWriteSpans() {
+	m_direct_write_spans.assign(m_direct_ranges.size(), {UINT64_MAX, 0});
+	m_direct_write_unspanned = false;
+	for (const auto& w: m_direct_gpu_writes) {
+		bool spanned = false;
+		for (size_t r = 0; r < m_direct_ranges.size(); r++) {
+			if (w.start < m_direct_ranges[r].end && m_direct_ranges[r].start < w.end) {
+				m_direct_write_spans[r].first  = std::min(m_direct_write_spans[r].first, w.start);
+				m_direct_write_spans[r].second = std::max(m_direct_write_spans[r].second, w.end);
+				spanned                        = true;
+			}
+		}
+		if (!spanned) m_direct_write_unspanned = true;
+	}
+}
+
+bool BufferCache::DirectWritesMayOverlap(uint64_t vaddr, uint64_t size) const {
+	if (m_direct_write_unspanned || m_direct_write_spans.size() != m_direct_ranges.size()) return true; // scan
+	for (const auto& [lo, hi]: m_direct_write_spans) {
+		if (lo < vaddr + size && vaddr < hi) return true;
+	}
+	return false;
+}
+
 bool BufferCache::InDirectRange(uint64_t vaddr, uint64_t size) const {
 	for (const auto& range: m_direct_ranges) {
 		if (range.active && vaddr < range.end && range.start < vaddr + size) return true;
@@ -2050,36 +2407,60 @@ bool BufferCache::InDirectRange(uint64_t vaddr, uint64_t size) const {
 }
 
 
-// A CPU write fault into a GPU-modified page of the data ring (two
-// halves, each reused every second frame; the game overwrites what it allocates there and never reads an older
-// frame's data) drops the page's GPU bytes written before the previous frame began instead of downloading them (and
-// waiting for their writer). Newer GPU bytes are downloaded as before. Returns true when no GPU byte is left in the page.
-// Measured (run 20261014-212758): ~290 such faults a frame, 74% with only such old bytes. The
-// frame boundary is the GPU thread's (it lags the game), which only makes the rule stricter.
-bool BufferCache::DropDeadRingBytes(uint64_t vaddr) {
-	if (vaddr < 0x2002600000ull || vaddr >= 0x2010000000ull || g_ring_frames < 3) return false;
-	const uint64_t page       = vaddr & ~uint64_t {0xfff};
-	const uint64_t prev_start = g_ring_frame_ticks[(g_ring_frames - 2) % g_ring_frame_ticks.size()];
-	std::vector<std::pair<uint64_t, uint64_t>> dead;
-	bool                                       live = false;
-	m_gpu_modified_ranges.ForEachInRange(page, 4096, [&](uint64_t start, uint64_t end) {
-		const uint64_t tick = QueryWriteTick(start, end);
-		if (tick != 0 && tick < prev_start) {
-			dead.emplace_back(start, end);
-		} else {
-			live = true;
-		}
-	});
-	// KYTY_FIX_RING_DEAD_DOWNLOAD=1 (lane v4x; the default from Common::EnvDefaults; =0 is the rule above, the G2
-	// behaviour; a KYTY_LIVE_AB switch): the
-	// exact variant: no GPU byte is dropped, the fault downloads them as on any other page (counted as kept).
+// A CPU write fault into a GPU-modified page of the data ring (two halves, each reused every second game frame; the game
+// overwrites what it allocates there and, before reusing a half, waits for the GPU work of the frame that last used
+// it) drops the page's GPU bytes written by the work of game frame W-2 or older (W: the frame whose
+// half the game writes now) instead of downloading them (and waiting for their writer). Bytes of frames W-1 and W, and
+// bytes whose frame is not known, are downloaded as before. Returns true when no GPU byte is left in the page. Frames
+// are the game's, from its submissions (GuestGpu::Enqueue); 8.11: ~99% of the ring write faults are dropped (the
+// execution-thread frame boundary used before dropped ~60% in the cutscene, ~10% walking), a long play test: image OK.
+// KYTY_FIX_RING_DEAD_DOWNLOAD=1 (lane v4x; the default from Common::EnvDefaults; =0 is the rule above, the G2
+// behaviour; a KYTY_LIVE_AB switch): the exact variant: no GPU byte is dropped, the fault downloads them as on any other
+// page (counted as kept).
+namespace {
+uint32_t RingDeadDownload() {
 	static constinit Common::OnceValue<uint32_t> download_once;
-	const uint32_t download = Common::LiveAb::Gate(Common::LiveAb::Switch::RingDeadDownload, download_once.Get([] {
+	return Common::LiveAb::Gate(Common::LiveAb::Switch::RingDeadDownload, download_once.Get([] {
 		const char*    value = Common::EnvOrDefault("KYTY_FIX_RING_DEAD_DOWNLOAD");
 		const uint32_t m     = value != nullptr && value[0] == '1' ? 1u : 0u;
 		if (m != 0) std::fprintf(stderr, "FIX_RING_DEAD_DOWNLOAD on: data-ring GPU bytes are downloaded, not dropped\n");
 		return m;
 	}));
+}
+} // namespace
+
+// DropDeadRingBytes' verdict without its changes: the page is in the data ring and it has GPU bytes, all of them dead.
+// Under KYTY_FIX_RING_DEAD_DOWNLOAD nothing is dropped (the bytes are downloaded), so the caller wait applies.
+bool BufferCache::RingBytesAllDead(uint64_t vaddr) {
+	const uint64_t write_frame = g_ring_game_write_frame.load(std::memory_order_acquire);
+	if (vaddr < 0x2002600000ull || vaddr >= 0x2010000000ull || write_frame < 2) return false;
+	if (RingDeadDownload() != 0) return false;
+	bool any = false, live = false;
+	m_gpu_modified_ranges.ForEachInRange(vaddr & ~uint64_t {0xfff}, 4096, [&](uint64_t start, uint64_t end) {
+		any                   = true;
+		const uint64_t frame1 = QueryTicks(m_write_frames, start, end); // frame + 1; 0: part of it unknown
+		if (!(frame1 != 0 && frame1 + 1u <= write_frame)) live = true;
+	});
+	if (!any || live) return false;
+	g_ring_dead.caller_skips.fetch_add(1, std::memory_order_relaxed);
+	return true;
+}
+
+bool BufferCache::DropDeadRingBytes(uint64_t vaddr) {
+	const uint64_t write_frame = g_ring_game_write_frame.load(std::memory_order_acquire);
+	if (vaddr < 0x2002600000ull || vaddr >= 0x2010000000ull || write_frame < 2) return false;
+	const uint64_t page = vaddr & ~uint64_t {0xfff};
+	std::vector<std::pair<uint64_t, uint64_t>> dead;
+	bool                                       live = false;
+	m_gpu_modified_ranges.ForEachInRange(page, 4096, [&](uint64_t start, uint64_t end) {
+		const uint64_t frame1 = QueryTicks(m_write_frames, start, end); // frame + 1; 0: part of it unknown
+		if (frame1 != 0 && frame1 + 1u <= write_frame) {
+			dead.emplace_back(start, end);
+		} else {
+			live = true;
+		}
+	});
+	const uint32_t download = RingDeadDownload(); // KYTY_FIX_RING_DEAD_DOWNLOAD
 	uint64_t bytes = 0;
 	for (const auto& [start, end]: dead) {
 		if (download == 0) GpuDirtySubtract(start, end - start);
@@ -2106,11 +2487,12 @@ bool BufferCache::DropDeadRingBytes(uint64_t vaddr) {
 	if (window_start == 0) window_start = now;
 	if (now - window_start >= 5000 && Common::EnvRead::PerfLines()) {
 		window_start = now;
-		std::fprintf(stderr, "PERF ring_dead faults=%llu freed=%llu partial=%llu dropped_KiB=%llu kept=%llu kept_KiB=%llu\n",
+		std::fprintf(stderr, "PERF ring_dead faults=%llu freed=%llu partial=%llu dropped_KiB=%llu caller_skips=%llu kept=%llu kept_KiB=%llu\n",
 		             static_cast<unsigned long long>(g_ring_dead.faults.exchange(0)),
 		             static_cast<unsigned long long>(g_ring_dead.freed.exchange(0)),
 		             static_cast<unsigned long long>(g_ring_dead.partial.exchange(0)),
 		             static_cast<unsigned long long>(g_ring_dead.dropped_bytes.exchange(0) / 1024u),
+		             static_cast<unsigned long long>(g_ring_dead.caller_skips.exchange(0)),
 		             static_cast<unsigned long long>(g_ring_dead.kept.exchange(0)),
 		             static_cast<unsigned long long>(g_ring_dead.kept_bytes.exchange(0) / 1024u));
 	}
@@ -2122,9 +2504,19 @@ void BufferCache::NoteDirectGpuWrite(uint64_t vaddr, uint64_t size, const void* 
 	if (m_direct_gpu_writes.size() >= 64u) {
 		auto& master = m_scheduler.GetMasterSemaphore();
 		master.Refresh(); // once, not per listed write
-		std::erase_if(m_direct_gpu_writes, [&](const DirectGpuWrite& w) { return master.IsFree(w.tick); });
+		std::erase_if(m_direct_gpu_writes, [&](const DirectGpuWrite& w) { return master.IsFree(w.tick); }); RebuildDirectWriteSpans();
 	}
 	auto& write = m_direct_gpu_writes.emplace_back(DirectGpuWrite {vaddr, vaddr + size, m_scheduler.CurrentTick()});
+	if (m_direct_write_spans.size() != m_direct_ranges.size()) RebuildDirectWriteSpans();
+	bool spanned = false;
+	for (size_t r = 0; r < m_direct_ranges.size(); r++) {
+		if (vaddr < m_direct_ranges[r].end && m_direct_ranges[r].start < vaddr + size) {
+			m_direct_write_spans[r].first  = std::min(m_direct_write_spans[r].first, vaddr);
+			m_direct_write_spans[r].second = std::max(m_direct_write_spans[r].second, vaddr + size);
+			spanned                        = true;
+		}
+	}
+	if (!spanned) m_direct_write_unspanned = true;
 	if (PerfEnabled()) {
 		write.noted_us = std::chrono::duration_cast<std::chrono::microseconds>(
 		                     std::chrono::steady_clock::now().time_since_epoch())
@@ -2169,9 +2561,9 @@ bool BufferCache::WaitDirectGpuWrites(uint64_t vaddr, uint64_t size, bool cp_ove
 	// ~1.2 million calls per second at the torii gate (the walker and the page checks of the read logs).
 	auto& master = m_scheduler.GetMasterSemaphore();
 	if (!m_direct_gpu_writes.empty() && master.IsFree(m_direct_gpu_writes.front().tick)) {
-		std::erase_if(m_direct_gpu_writes, [&](const DirectGpuWrite& w) { return master.IsFree(w.tick); });
+		std::erase_if(m_direct_gpu_writes, [&](const DirectGpuWrite& w) { return master.IsFree(w.tick); }); RebuildDirectWriteSpans();
 	}
-	if (m_direct_gpu_writes.empty()) return false;
+	if (m_direct_gpu_writes.empty() || !DirectWritesMayOverlap(vaddr, size)) return false;
 	g_direct_stats.checks.fetch_add(1, std::memory_order_relaxed);
 	// With the overlay, only writes of unknown bytes are waited for here.
 	uint64_t tick    = 0; // newest overlapping write
@@ -2245,7 +2637,7 @@ bool BufferCache::WaitDirectGpuWrites(uint64_t vaddr, uint64_t size, bool cp_ove
 	};
 	if (!cp_overlay) {
 		if (wait_for(tick)) {
-			std::erase_if(m_direct_gpu_writes, [&](const DirectGpuWrite& w) { return m_scheduler.IsFree(w.tick); });
+			std::erase_if(m_direct_gpu_writes, [&](const DirectGpuWrite& w) { return m_scheduler.IsFree(w.tick); }); RebuildDirectWriteSpans();
 		}
 		return false;
 	}
@@ -2510,6 +2902,7 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 }
 
 BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
+	const Common::SlowFrame::Scope slow_frame_scope(Common::SlowFrame::NewBuffer); // KYTY_TRACE_SLOW_FRAMES
 	// The upload batch: claimed uploads hold buffer pointers (the slot storage may move) and a joined buffer copies
 	// its overlaps' contents, which must include them.
 	CommitUploadBatch(BatchCommit::CreateBuffer);
@@ -2558,6 +2951,24 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	SetVulkanObjectNameF(m_graphics.device, buffer.Handle(),
 	                     "Kyty.GameBuffer[guest=0x{:016x} size=0x{:x}]", overlap.begin,
 	                     overlap.end - overlap.begin);
+	// KYTY_TRACE_BUFFER_CREATE=1 (diagnostic, 11.11: ~2 500 buffers made and ~2 100 freed in one frame at the intro's
+	// camera cut): every creation with the request, the joined span and what it joins.
+	static const bool trace_create = [] {
+		const char* value = std::getenv("KYTY_TRACE_BUFFER_CREATE");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (trace_create) {
+		uint64_t joined = 0, joined_bytes = 0;
+		for (auto it = overlap.first; it != overlap.last; ++it) {
+			joined++;
+			joined_bytes += m_slot_buffers[it->second].Size();
+		}
+		std::fprintf(stderr, "BUF_CREATE frame=%u req=0x%llx+0x%llx span=0x%llx+0x%llx joined=%llu joined_KiB=%llu leap=%d\n",
+		             DebugPresentCount().load(std::memory_order_relaxed), static_cast<unsigned long long>(vaddr),
+		             static_cast<unsigned long long>(size), static_cast<unsigned long long>(overlap.begin),
+		             static_cast<unsigned long long>(overlap.end - overlap.begin), static_cast<unsigned long long>(joined),
+		             static_cast<unsigned long long>(joined_bytes >> 10u), overlap.has_stream_leap ? 1 : 0);
+	}
 	for (auto it = overlap.first; it != overlap.last;) {
 		const auto old_id = (it++)->second;
 		JoinOverlap(id, old_id, !overlap.has_stream_leap);
@@ -2662,6 +3073,7 @@ uint64_t BufferCache::RecentlyRetiredBytes() {
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer, uint64_t* uploaded_bytes, UploadCaller caller) {
+	const Common::SlowFrame::Scope slow_frame_scope(Common::SlowFrame::SyncBuffer); // KYTY_TRACE_SLOW_FRAMES
 	if (buffer.IsDirect()) return false; // KYTY_PERF_DIRECT_RANGES: its memory is guest memory
 	if (Batch().active) {
 		// The upload batch: a plain read-only synchronization only claims its pages. A written one (its GPU marks
@@ -2690,6 +3102,8 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
 	walk_timer.reset();
 	if (source) {
+		t_obtain_work++; // KYTY_CHECK_PEEK
+		if (t_translator != 0) TranslatorNote(2);
 		if (uploaded_bytes != nullptr) {
 			*uploaded_bytes = total_size;
 		}
@@ -2747,6 +3161,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 		return false;
 	}
 	m_texture_cache.DownloadImage(image, buffer, buf_offset, copy_size, levels);
+	t_obtain_work++; // KYTY_CHECK_PEEK: a copy from an image
 	if (UploadClobberCheck()) C0Note(image.info.data.address, copy_size, C0Event::ImageCopy, image.info.data.address); // D4 K0
 	// The copy rewrites the cached buffer's bytes in the open command buffer; host-mapped reads of these granules wait for
 	// it too.
@@ -2863,6 +3278,7 @@ void BufferCache::ClaimBatchedUpload(Buffer& buffer, uint64_t vaddr, uint64_t si
 		claimed += bytes;
 	};
 	const auto regions = m_memory_tracker.ClaimUploadRanges(vaddr, size, note_range, batch.regions);
+	if (claimed != 0) t_obtain_work++; // KYTY_CHECK_PEEK
 	if (uploaded_bytes != nullptr) {
 		*uploaded_bytes = claimed;
 	}
@@ -3117,6 +3533,7 @@ constexpr size_t kObtainMemoSlots = 8192;
 ObtainMemoEntry  g_obtain_memo[kObtainMemoSlots]; // GPU thread
 struct ObtainMemoStats {
 	uint64_t hits = 0, misses = 0, stores = 0;
+	uint64_t miss[5] {}; // empty slot, other range, buffer epoch, CPU-dirty region epoch, image page sum
 };
 ObtainMemoStats              g_obtain_memo_stats_shared;
 } // namespace
@@ -3149,15 +3566,31 @@ bool ObtainMemoRegions(uint64_t vaddr, uint64_t size, uint64_t& first, uint32_t&
 const ObtainMemoEntry* ObtainMemoFind(uint64_t vaddr, uint64_t size) {
 	const ObtainMemoEntry* entry = &g_obtain_memo[ObtainMemoIndex(vaddr, size)];
 	const auto&            e     = *entry;
-	if (e.regions == 0 || e.vaddr != vaddr || e.size != size ||
-	    e.buffer_epoch != DrawRepeat::g_buffer_registry_epoch.load(std::memory_order_acquire)) {
+	auto&                  miss  = ObtainMemoStatsRef().miss;
+	if (e.regions == 0) {
+		miss[0]++;
+		return nullptr;
+	}
+	if (e.vaddr != vaddr || e.size != size) {
+		miss[1]++;
+		return nullptr;
+	}
+	if (e.buffer_epoch != DrawRepeat::g_buffer_registry_epoch.load(std::memory_order_acquire)) {
+		miss[2]++;
 		return nullptr;
 	}
 	auto* table = g_cpu_dirty_region_epochs.load(std::memory_order_acquire);
 	for (uint32_t i = 0; i < e.regions; i++) {
-		if (table[e.region + i].load(std::memory_order_acquire) != e.epochs[i]) return nullptr;
+		if (table[e.region + i].load(std::memory_order_acquire) != e.epochs[i]) {
+			miss[3]++;
+			return nullptr;
+		}
 	}
-	return DrawRepeat::ImagePageEpochSum(vaddr, size) == e.image_sum ? entry : nullptr;
+	if (DrawRepeat::ImagePageEpochSum(vaddr, size) != e.image_sum) {
+		miss[4]++;
+		return nullptr;
+	}
+	return entry;
 }
 
 void ObtainMemoStore(uint64_t vaddr, uint64_t size, const ObtainMemoEntry& fresh) {
@@ -3167,8 +3600,11 @@ void ObtainMemoStore(uint64_t vaddr, uint64_t size, const ObtainMemoEntry& fresh
 void ObtainMemoReport() {
 	auto& s = ObtainMemoStatsRef();
 	if (((s.hits + s.misses) & 0x3ffffu) != 0 || !Common::EnvRead::PerfLines()) return;
-	std::fprintf(stderr, "PERF obtain_memo hits=%llu misses=%llu stores=%llu\n", static_cast<unsigned long long>(s.hits),
-	             static_cast<unsigned long long>(s.misses), static_cast<unsigned long long>(s.stores));
+	std::fprintf(stderr, "PERF obtain_memo hits=%llu misses=%llu stores=%llu miss(empty/range/buffers/cpu/images)=%llu/%llu/%llu/%llu/%llu\n",
+	             static_cast<unsigned long long>(s.hits), static_cast<unsigned long long>(s.misses),
+	             static_cast<unsigned long long>(s.stores), static_cast<unsigned long long>(s.miss[0]),
+	             static_cast<unsigned long long>(s.miss[1]), static_cast<unsigned long long>(s.miss[2]),
+	             static_cast<unsigned long long>(s.miss[3]), static_cast<unsigned long long>(s.miss[4]));
 }
 } // namespace
 
@@ -3277,9 +3713,506 @@ void BufferCache::PrefetchObtainMemo(uint64_t vaddr, uint64_t size, bool is_writ
 	}
 }
 
-std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
-                                                       bool is_written, bool is_texel_buffer,
+// ---- Project 15 S2a: the read-only peek (n3-projekt.md section 4.1) ----------------------------------------------------
+namespace {
+struct PeekStats {
+	std::array<uint64_t, BufferCache::BufferPeek::Count> classes {}, member {}, bda {};
+	uint64_t image_granule_only = 0, bda_compared = 0, compared = 0, bad = 0, race = 0, lag_compared = 0, lag_bad = 0, lag_race = 0, injected = 0, detected = 0;
+	std::array<uint64_t, 4> image_split {}; // Image peeks: [plain found, plain not found, formatted found, formatted not found]
+	// W2.3: an Image peek with no image taken - any image starting there at all (ensure_valid off): [any, none]; the images
+	std::array<uint64_t, 2> image_any {};
+	uint64_t                image_count = 0;
+	std::array<uint64_t, 4> lag_age {};  // calls since the kept peek: <16, <128, <1024, >=1024
+	std::array<uint64_t, 3> lag_op_age {}; // operations since the kept peek: <16, <128, >=128 (N4.1)
+	std::array<std::array<uint64_t, 5>, 3> lag_fail_by_op_age {};
+	std::array<uint64_t, 5> lag_fail {}; // PeekProofFail of a kept entry that no longer holds
+	uint32_t logged = 0;
+};
+PeekStats g_peek_stats; // GPU thread
+struct PeekLagEntry {
+	uint64_t                vaddr = 0, size = 0, call = 0;
+	bool                    written = false, bda = false;
+	uint64_t                op      = 0; // t_op_index when kept
+	BufferCache::BufferPeek peek;
+};
+// The lag check keeps the oldest live peek of a range: replaced only when empty, another range, or its proof failed.
+std::vector<PeekLagEntry> g_peek_lag; // GPU thread; 65,536 entries once the check runs
+uint64_t                  g_peek_calls = 0;
+uint32_t PeekCheckMode() {
+	static const uint32_t mode = [] {
+		const char* env = std::getenv("KYTY_CHECK_PEEK");
+		const uint32_t m = env != nullptr && env[0] == '2' ? 2u : 0u;
+		if (m != 0) std::fprintf(stderr, "CHECK_PEEK=2: every ObtainBuffer peeked first; Ready answers compared\n");
+		return m;
+	}();
+	return mode;
+}
+uint64_t PeekFaultEvery() {
+	static const uint64_t every = [] {
+		const char* env = std::getenv("KYTY_CHECK_PEEK_FAULT");
+		return env != nullptr ? std::strtoull(env, nullptr, 10) : 0u;
+	}();
+	return every;
+}
+void PeekReport() {
+	auto& st = g_peek_stats;
+	if ((g_peek_calls & ((1u << 20u) - 1u)) != 0) return;
+	const char* const names[BufferCache::BufferPeek::Count] = {"ready",  "direct", "null",     "stream", "upload",
+	                                                           "create", "image",  "no_proof", "written"};
+	const auto classes = [&](const auto& a) {
+		std::string out;
+		for (uint32_t i = 0; i < BufferCache::BufferPeek::Count; i++) out += std::string(i == 0 ? "" : " ") + names[i] + "=" + std::to_string(a[i]);
+		return out;
+	};
+	const std::string text = classes(st.classes);
+	const auto join = [](const auto& a, size_t n) {
+		std::string out;
+		for (size_t i = 0; i < n; i++) out += std::string(i == 0 ? "" : "|") + std::to_string(a[i]);
+		return out;
+	};
+	std::fprintf(stderr,
+	             "PERF peek calls=%llu classes[%s] compared=%llu bad=%llu race=%llu lag_compared=%llu lag_bad=%llu lag_race=%llu "
+	             "lag_age[<16|<128|<1024|>=1024]=%s lag_fail[registry|cpu|image|class]=%s fault[injected|detected]=%llu|%llu "
+	             "translator_writes[registry|touch|upload|stream|note|image_lock]=%s\n",
+	             static_cast<unsigned long long>(g_peek_calls), text.c_str(), static_cast<unsigned long long>(st.compared),
+	             static_cast<unsigned long long>(st.bad), static_cast<unsigned long long>(st.race), static_cast<unsigned long long>(st.lag_compared),
+	             static_cast<unsigned long long>(st.lag_bad), static_cast<unsigned long long>(st.lag_race), join(st.lag_age, 4).c_str(),
+	             join(&st.lag_fail[1], 4).c_str(), static_cast<unsigned long long>(st.injected), static_cast<unsigned long long>(st.detected),
+	             join(t_translator_writes, 6).c_str());
+	std::string by_op;
+	for (uint32_t k = 0; k < 3u; k++) by_op += std::string(k == 0 ? "" : " ") + join(&st.lag_fail_by_op_age[k][1], 3);
+	std::fprintf(stderr, "PERF peek_lag_ops compared_by_op_age[<16|<128|>=128]=%s fail_by_op_age[registry|cpu|image]=%s\n",
+	             join(st.lag_op_age, 3).c_str(), by_op.c_str());
+	std::fprintf(stderr,
+	             "PERF peek_split member[%s] member_draws_by_in_order[0|1|2|3+]=%s bda[%s] bda_compared=%llu image_granule_only=%llu "
+	             "image[plain_found|plain_none|formatted_found|formatted_none]=%s member_draws=%llu plan_draws=%llu "
+	             "plan_by_in_order[0|1|2|3+]=%s image_none_any[image|nothing]=%s images=%llu\n",
+	             classes(st.member).c_str(), join(t_peek_marker_hist, 4).c_str(), classes(st.bda).c_str(),
+	             static_cast<unsigned long long>(st.bda_compared), static_cast<unsigned long long>(st.image_granule_only),
+	             join(st.image_split, 4).c_str(), static_cast<unsigned long long>(t_member_draws),
+	             static_cast<unsigned long long>(t_plan_draws), join(t_plan_marker_hist, 4).c_str(), join(st.image_any, 2).c_str(),
+	             static_cast<unsigned long long>(st.image_count));
+}
+} // namespace
+
+uint32_t BufferCache::PeekProofFail(const BufferPeek& peek, uint64_t vaddr, uint64_t size) {
+	if (peek.klass != BufferPeek::Ready && peek.klass != BufferPeek::Direct) return 4;
+	if (peek.buffer_epoch != DrawRepeat::g_buffer_registry_epoch.load(std::memory_order_acquire)) return 1;
+	if (peek.klass == BufferPeek::Direct) {
+		// W2.2: and the direct ranges as the peek saw them (the mode is checked where the answer is taken)
+		return peek.direct_gen == g_direct_generation.load(std::memory_order_acquire) ? 0 : 1;
+	}
+	auto* table = g_cpu_dirty_region_epochs.load(std::memory_order_acquire);
+	for (uint32_t i = 0; i < peek.regions; i++) {
+		if (table[peek.region + i].load(std::memory_order_acquire) != peek.epochs[i]) return 2;
+	}
+	return peek.bda || DrawRepeat::ImagePageEpochSum(vaddr, size) == peek.image_sum ? 0 : 3; // the BDA path touches no image
+}
+
+BufferCache::BufferPeek BufferCache::PeekBuffer(uint64_t vaddr, uint64_t size, bool is_written, bool is_texel_buffer, BufferId hint,
+                                                bool bda) {
+	++t_translator;
+	BufferPeek p;
+	p.bda = bda;
+	[&] {
+		if (vaddr == 0 || size == 0 || !GuestRange {vaddr, size}.Valid()) {
+			p.klass = BufferPeek::Null;
+			return;
+		}
+		// Every proof field is read before the check it covers (n3-s2a-przeglad.md 1.1): the registry epoch before the
+		// lookup, the region epochs before the dirty bits, the image page sum before the image-start count.
+		p.buffer_epoch = DrawRepeat::g_buffer_registry_epoch.load(std::memory_order_acquire);
+		const uint32_t direct_mode = DirectMode();
+		if (direct_mode != m_direct_mode_seen) {
+			p.klass = BufferPeek::Upload; // today's path ends or starts the direct ranges: in order
+			return;
+		}
+		if (direct_mode != 0) {
+			const uint64_t end = vaddr + size;
+			if (!GuestGpu::IsGpuThread()) {
+				// W2.2 (replaces N5.3's "in order"): a helper reads the ranges' fields between two equal even generations,
+				// as the loop below reads them; a range being changed or changed meanwhile: in order.
+				const uint64_t gen0 = g_direct_generation.load(std::memory_order_acquire);
+				bool           seen = false; // the request overlaps a range that is not refused
+				BufferPeek     d    = p;
+				if ((gen0 & 1u) == 0) {
+					for (const auto& range: m_direct_ranges) {
+						if (range.refused || end <= range.start || vaddr >= range.end) continue;
+						seen = true;
+						if (range.active && vaddr >= range.start && end <= range.end) {
+							d.klass      = BufferPeek::Direct;
+							d.id         = range.id;
+							d.offset     = vaddr - range.start; // (the direct buffer starts at the range's start)
+							if (const auto* direct = m_slot_buffers.try_get(range.id); direct != nullptr) d.handle = direct->Handle(); // (P1)
+							d.direct_gen = gen0;
+						} else {
+							d.klass = BufferPeek::Upload; // the range grows or activates: in order
+						}
+						break;
+					}
+				}
+				std::atomic_thread_fence(std::memory_order_acquire);
+				if ((gen0 & 1u) != 0 || g_direct_generation.load(std::memory_order_relaxed) != gen0) {
+					p.klass         = BufferPeek::Upload;
+					p.helper_direct = true; // (way B W0: the B3 split)
+					return;
+				}
+				if (seen) {
+					p               = d;
+					p.helper_direct = d.klass != BufferPeek::Direct;
+					return;
+				}
+			}
+			for (const auto& range: m_direct_ranges) {
+				if (!GuestGpu::IsGpuThread()) break; // (W2.2: a helper read the ranges above, under the generation)
+				if (range.refused || end <= range.start || vaddr >= range.end) continue;
+				if (range.active && vaddr >= range.start && end <= range.end) {
+					p.klass      = BufferPeek::Direct;
+					p.id         = range.id;
+					p.offset     = m_slot_buffers[range.id].Offset(vaddr);
+					p.handle     = m_slot_buffers[range.id].Handle(); // (P1)
+					p.direct_gen = g_direct_generation.load(std::memory_order_acquire);
+				} else {
+					p.klass = BufferPeek::Upload; // the range grows or activates: in order
+				}
+				return;
+			}
+		}
+		if (is_written) {
+			p.klass = BufferPeek::Written; // today's path marks the pages GPU-modified: in order, not compared
+			return;
+		}
+		static_cast<void>(is_texel_buffer); // a formatted read with no image at the address does nothing more today
+		const bool proof = ObtainMemoRegions(vaddr, size, p.region, p.regions, p.epochs);
+		p.image_sum      = DrawRepeat::ImagePageEpochSum(vaddr, size);
+		const bool clean = m_memory_tracker.PeekCpuClean(vaddr, size);
+		if (!bda && size <= CACHING_PAGESIZE && !clean && !m_memory_tracker.PeekGpuModified(vaddr, size)) {
+			p.klass = BufferPeek::Stream;
+			return;
+		}
+		BufferId id = hint;
+		if (IsBufferInvalid(id) || !m_slot_buffers[id].IsInBounds(vaddr, size)) id = LookupBuffer(vaddr, size);
+		if (IsBufferInvalid(id)) {
+			p.klass = BufferPeek::Create;
+			return;
+		}
+		if (!clean) {
+			p.klass = BufferPeek::Upload;
+			return;
+		}
+		if (!bda && TextureCache::ImageMayStartAt(vaddr)) {
+			if (TextureCache::ImageMayStartExactlyAt(vaddr)) {
+				p.klass = BufferPeek::Image; // today's path may copy from an image starting at the address
+				return;
+			}
+			if (PeekCheckMode() != 0) g_peek_stats.image_granule_only++; // another image starts in the granule
+		}
+		if (!proof) {
+			p.klass = BufferPeek::NoProof; // more than two tracker regions
+			return;
+		}
+		p.klass  = BufferPeek::Ready;
+		p.id     = id;
+		p.offset = m_slot_buffers[id].Offset(vaddr);
+		p.handle = m_slot_buffers[id].Handle(); // (P1)
+	}();
+	--t_translator;
+	return p;
+}
+
+// N4.2b (KYTY_CHECK_PLAN_BUFFERS=2): the plan's entry of an acquisition, checked like the lag check of S2a.
+namespace {
+struct PlanBufferStats {
+	// kinds: 0 buffer, 1 range, 2 vertex, 3 index, 4 indirect arguments, 5 indirect count (N7.2)
+	std::array<uint64_t, 6>                lookups {}, compared {}, bad {}, race {}, not_ready {};
+	std::array<std::array<uint64_t, 4>, 6> fail {};        // [kind][PeekProofFail 1..3]
+	std::array<uint64_t, 4>                by_distance {}; // compared, by distance from the chunk's opening
+	uint64_t                               unplanned = 0, injected = 0, detected = 0;
+	uint32_t                               logged    = 0;
+	// N7.1: a race (the proof held before today's path, not after) by the part that failed after it
+	// [registry|cpu|image] and whether today's path itself did work (its own change, not another thread's)
+	std::array<uint64_t, 4> race_why {};
+	uint64_t                race_own_work = 0;
+	uint32_t                race_logged   = 0;
+};
+PlanBufferStats              g_plan_buffer_stats; // GPU thread
+std::vector<PlanBuffer>*     g_plan_buffers = nullptr;
+size_t g_plan_cursor = 0; // the entry after the last one found (entries are made in the acquisitions' order)
+PlanBuffer* PlanBufferFind(uint64_t vaddr, uint64_t size, bool texel, bool bda) {
+	if (g_plan_buffers == nullptr) return nullptr;
+	auto&        entries = *g_plan_buffers;
+	const size_t n       = entries.size();
+	for (size_t k = 0; k < n; k++) {
+		const size_t i     = (g_plan_cursor + k) % n;
+		auto&        entry = entries[i];
+		if (!entry.used && entry.vaddr == vaddr && entry.size == size && entry.texel == texel && entry.bda == bda) {
+			g_plan_cursor = i + 1;
+			return &entry;
+		}
+	}
+	return nullptr;
+}
+void PlanBufferReport() {
+	auto&    s = g_plan_buffer_stats;
+	uint64_t n = 0;
+	for (const auto c: s.compared) n += c;
+	if ((n & ((1u << 18u) - 1u)) != 0) return;
+	const auto join = [](const auto& a) {
+		std::string out;
+		for (size_t i = 0; i < a.size(); i++) out += std::string(i == 0 ? "" : "|") + std::to_string(a[i]);
+		return out;
+	};
+	std::string fail;
+	for (size_t k = 0; k < 6; k++) fail += std::string(k == 0 ? "" : " ") + std::to_string(s.fail[k][1]) + "|" + std::to_string(s.fail[k][2]) + "|" + std::to_string(s.fail[k][3]);
+	std::fprintf(stderr,
+	             "PERF plan_buffers [buffer|range|vertex|index|args|count] lookups=%s compared=%s bad=%s race=%s not_ready=%s "
+	             "fail[registry|cpu|image]=%s by_distance=%s unplanned=%llu fault[injected|detected]=%llu|%llu "
+	             "race_why[-|registry|cpu|image]=%s race_own_work=%llu\n",
+	             join(s.lookups).c_str(), join(s.compared).c_str(), join(s.bad).c_str(), join(s.race).c_str(),
+	             join(s.not_ready).c_str(), fail.c_str(), join(s.by_distance).c_str(), static_cast<unsigned long long>(s.unplanned),
+	             static_cast<unsigned long long>(s.injected), static_cast<unsigned long long>(s.detected), join(s.race_why).c_str(),
+	             static_cast<unsigned long long>(s.race_own_work));
+}
+} // namespace
+
+PlanBuffer* BufferCache::PlanStageEntry(const void* program, uint32_t resource) {
+	if (g_plan_buffers == nullptr) return nullptr;
+	auto&        entries = *g_plan_buffers;
+	const size_t n       = entries.size();
+	for (size_t k = 0; k < n; k++) {
+		const size_t i     = (g_plan_cursor + k) % n;
+		auto&        entry = entries[i];
+		if (!entry.used && entry.kind == 0 && entry.program == program && entry.resource == resource) {
+			g_plan_cursor = i + 1;
+			return &entry;
+		}
+	}
+	return nullptr;
+}
+
+bool BufferCache::PlanAnswerBinding(PlanBuffer& entry, uint64_t vaddr, uint64_t size) {
+	const ChunkLead::FloorTimer floor_answer(ChunkLead::FpPlanAnswer); // KYTY_TRACE_PEEK_CENSUS
+	const bool direct = entry.peek.klass == BufferPeek::Direct && DirectMode() == m_direct_mode_seen;
+	if (!(entry.peek.klass == BufferPeek::Ready || direct) || !PeekProofHolds(entry.peek, vaddr, size)) return false;
+	entry.used = true;
+	if (!direct) TouchBuffer(m_slot_buffers[entry.peek.id]);
+	g_ahead.buffers_answered++;
+	ChunkLead::t_floor_answers++;
+	if (ChunkLead::t_floor_bucket >= 0 && ChunkLead::B3On()) ChunkLead::NoteB3(entry.kind, 0);
+	return true;
+}
+
+void BufferCache::SetPlanBuffers(std::vector<PlanBuffer>* entries) {
+	g_plan_buffers = entries;
+	g_plan_cursor  = 0;
+}
+
+
+bool BufferCache::PlanBufferCheck() {
+	static const bool on = [] {
+		const char* env = std::getenv("KYTY_CHECK_PLAN_BUFFERS");
+		const bool  m   = env != nullptr && env[0] == '2';
+		if (m) std::fprintf(stderr, "CHECK_PLAN_BUFFERS=2: every acquisition with a plan entry checked against it\n");
+		return m;
+	}();
+	return on;
+}
+
+// KYTY_CHECK_PEEK=2 (diagnostic): the peek first, then today's path; a Ready or Direct peek must name the same buffer and
+// offset, and today's path must have done nothing but touch and note (no upload, stream copy or image sync, the buffer
+// registry unchanged). The lag check: a Ready peek kept from an earlier call of the same range whose proof still holds
+// must be what today's path answers now. KYTY_CHECK_PEEK_FAULT=N: every N-th compared peek gets a wrong offset.
+template <typename Path>
+std::pair<Buffer*, uint64_t> BufferCache::PlanChecked(PlanBuffer& entry, uint64_t vaddr, uint64_t size, Path&& path) {
+	auto& s      = g_plan_buffer_stats;
+	entry.used   = true;
+	const auto k = std::min<uint32_t>(entry.kind, 5u);
+	s.lookups[k]++;
+	if (entry.peek.klass != BufferPeek::Ready && entry.peek.klass != BufferPeek::Direct) { // (W2.2: Direct compared too)
+		s.not_ready[k]++;
+		return path();
+	}
+	if (const uint32_t fail = PeekProofFail(entry.peek, vaddr, size); fail != 0) {
+		s.fail[k][fail & 3u]++;
+		return path();
+	}
+	const uint64_t epoch0 = DrawRepeat::g_buffer_registry_epoch.load(std::memory_order_acquire);
+	const uint64_t work0  = t_obtain_work;
+	const auto     result = path();
+	const bool     quiet  = t_obtain_work == work0 && DrawRepeat::g_buffer_registry_epoch.load(std::memory_order_acquire) == epoch0 &&
+	                   result.first != &Stream();
+	s.compared[k]++;
+	s.by_distance[entry.distance == 0u ? 0u : entry.distance < 16u ? 1u : entry.distance < 64u ? 2u : 3u]++;
+	uint64_t   offset = entry.peek.offset;
+	uint64_t   total  = 0;
+	for (const auto c: s.compared) total += c;
+	const bool fault = PeekFaultEvery() != 0 && total % PeekFaultEvery() == 0;
+	if (fault) {
+		offset += 16u;
+		s.injected++;
+	}
+	// (W2.2 review: try_get - today's path may have deleted the entry's buffer, e.g. a direct range ended by a mode switch)
+	const bool same = entry.peek.id && result.first == m_slot_buffers.try_get(entry.peek.id) && result.second == offset && quiet;
+	if (!same) {
+		if (fault) {
+			s.detected++;
+		} else if (const uint32_t after = PeekProofFail(entry.peek, vaddr, size); after != 0) {
+			s.race[k]++;
+			s.race_why[after & 3u]++;
+			const bool own = t_obtain_work != work0;
+			if (own) s.race_own_work++;
+			if (s.race_logged++ < 20u) {
+				std::fprintf(stderr, "CHECK_PLAN_BUFFER race kind=%u why=%u own_work=%d addr=%llx size=%llx same_buffer=%d quiet=%d\n", k,
+				             after, own ? 1 : 0, static_cast<unsigned long long>(vaddr), static_cast<unsigned long long>(size),
+				             entry.peek.id && result.first == &m_slot_buffers[entry.peek.id] ? 1 : 0, quiet ? 1 : 0);
+			}
+		} else {
+			s.bad[k]++;
+			if (s.logged++ < 20u) {
+				std::fprintf(stderr, "CHECK_PLAN_BUFFER bad kind=%u addr=%llx size=%llx quiet=%d\n", k,
+				             static_cast<unsigned long long>(vaddr), static_cast<unsigned long long>(size), quiet ? 1 : 0);
+			}
+		}
+	}
+	PlanBufferReport();
+	return result;
+}
+
+std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size, bool is_written, bool is_texel_buffer,
                                                        BufferId id, bool image_source) {
+	std::optional<ChunkLead::FloorTimer> floor_written; // KYTY_TRACE_PEEK_CENSUS (way B W0 D5w): a written range's acquisition
+	if (is_written) floor_written.emplace(ChunkLead::FpWritten);
+	if (!PlanBufferCheck() && g_plan_buffers != nullptr && !is_written && !image_source && GuestGpu::IsGpuThread()) {
+		const ChunkLead::FloorTimer floor_answer(ChunkLead::FpPlanAnswer); // KYTY_TRACE_PEEK_CENSUS (W3 P0)
+		// N4.3: the plan's answer - what today's path does for a clean, registered range with no image at its start: the touch.
+		auto* entry = PlanBufferFind(vaddr, size, is_texel_buffer, false);
+		// W2.2: a Direct entry answers as today's path does for an active direct range: the buffer and offset, no touch.
+		const bool direct = entry != nullptr && entry->peek.klass == BufferPeek::Direct && DirectMode() == m_direct_mode_seen;
+		if (entry != nullptr && (entry->peek.klass == BufferPeek::Ready || direct) && PeekProofHolds(entry->peek, vaddr, size)) {
+			entry->used  = true;
+			auto& buffer = m_slot_buffers[entry->peek.id];
+			if (!direct) TouchBuffer(buffer);
+			g_ahead.buffers_answered++;
+			ChunkLead::t_floor_answers++; // (W3 P0)
+			if (ChunkLead::t_floor_bucket >= 0 && ChunkLead::B3On()) ChunkLead::NoteB3(entry->kind, 0);
+			return {&buffer, entry->peek.offset};
+		}
+		g_ahead.buffers_today++;
+		if (ChunkLead::t_floor_bucket >= 0 && ChunkLead::B3On()) {
+			// Way B W0: why the acquisition went today's way (1 no entry, 2 a helper's direct-range span, 3 upload, 4 stream,
+			// 5 image, 6 another class, 7-9 the proof failed: registry, CPU pages, image pages)
+			int reason = 1;
+			if (entry != nullptr) {
+				const auto k = entry->peek.klass;
+				reason       = entry->peek.helper_direct      ? 2
+				               : k == BufferPeek::Upload      ? 3
+				               : k == BufferPeek::Stream      ? 4
+				               : k == BufferPeek::Image       ? 5
+				               : k != BufferPeek::Ready && k != BufferPeek::Direct ? 6 // (W2.2: a Direct entry's failed proof goes below)
+				                                              : 6 + static_cast<int>(std::min<uint32_t>(PeekProofFail(entry->peek, vaddr, size), 3u));
+			}
+			ChunkLead::NoteB3(entry != nullptr ? entry->kind : 6u, reason);
+		}
+	}
+	if (PlanBufferCheck() && g_plan_buffers != nullptr && !is_written && !image_source && GuestGpu::IsGpuThread()) {
+		if (auto* entry = PlanBufferFind(vaddr, size, is_texel_buffer, false); entry != nullptr) {
+			return PlanChecked(*entry, vaddr, size,
+			                   [&] { return ObtainBufferPath(vaddr, size, is_written, is_texel_buffer, id, image_source); });
+		}
+		g_plan_buffer_stats.unplanned++;
+	}
+	if (PeekCheckMode() == 0 || image_source || !GuestGpu::IsGpuThread()) {
+		return ObtainBufferPath(vaddr, size, is_written, is_texel_buffer, id, image_source);
+	}
+	const auto peek = PeekBuffer(vaddr, size, is_written, is_texel_buffer, id);
+	if (peek.klass == BufferPeek::Image) {
+		// Diagnostic, outside the peek: a real image at the address or a collision of the exact-start table.
+		const bool found = static_cast<bool>(m_texture_cache.FindImageFromRange(vaddr, size, true));
+		g_peek_stats.image_split[(is_texel_buffer ? 2u : 0u) + (found ? 0u : 1u)]++;
+		if (!found) g_peek_stats.image_any[static_cast<bool>(m_texture_cache.FindImageFromRange(vaddr, size, false)) ? 0u : 1u]++;
+		g_peek_stats.image_count = m_texture_cache.ImageCount();
+	}
+	return PeekChecked(peek, vaddr, size, is_written, false,
+	                   [&] { return ObtainBufferPath(vaddr, size, is_written, is_texel_buffer, id, image_source); });
+}
+
+template <typename Path>
+std::pair<Buffer*, uint64_t> BufferCache::PeekChecked(const BufferPeek& peek, uint64_t vaddr, uint64_t size, bool is_written, bool bda,
+                                                      Path&& path) {
+	auto& st = g_peek_stats;
+	(bda ? st.bda : st.classes)[peek.klass]++;
+	const bool answered = peek.klass == BufferPeek::Ready || peek.klass == BufferPeek::Direct || peek.klass == BufferPeek::Null;
+	if (t_peek_member == 1) {
+		st.member[peek.klass]++;
+		if (!answered) t_peek_markers++;
+	}
+	g_peek_calls++;
+	if (g_peek_lag.empty()) g_peek_lag.resize(65536);
+	auto& lag = g_peek_lag[((vaddr ^ (size << 7u)) * 0x9E3779B97F4A7C15ull ^ (is_written ? 1u : 0u) ^ (bda ? 2u : 0u)) >> 48u &
+	                       (g_peek_lag.size() - 1u)];
+	const bool lag_hit = lag.vaddr == vaddr && lag.size == size && lag.written == is_written && lag.bda == bda &&
+	                     (lag.peek.klass == BufferPeek::Ready || lag.peek.klass == BufferPeek::Direct);
+	const uint32_t lag_fail = lag_hit ? PeekProofFail(lag.peek, vaddr, size) : 4u;
+	const bool     lag_live = lag_hit && lag_fail == 0;
+	const uint64_t lag_ops    = t_op_index - lag.op;
+	const uint32_t lag_bucket = lag_ops < 16u ? 0u : lag_ops < 128u ? 1u : 2u;
+	if (lag_hit && !lag_live) {
+		st.lag_fail[lag_fail]++;
+		st.lag_fail_by_op_age[lag_bucket][lag_fail]++;
+	}
+	const uint64_t epoch0 = DrawRepeat::g_buffer_registry_epoch.load(std::memory_order_acquire);
+	const uint64_t work0  = t_obtain_work;
+	const auto     result = path();
+	const bool     quiet  = t_obtain_work == work0 && DrawRepeat::g_buffer_registry_epoch.load(std::memory_order_acquire) == epoch0 &&
+	                   result.first != &Stream();
+	const auto     same   = [&](const BufferPeek& p, uint64_t offset) {
+        return p.id && result.first == &m_slot_buffers[p.id] && result.second == offset && (p.klass == BufferPeek::Direct || quiet);
+	};
+	if (peek.klass == BufferPeek::Ready || peek.klass == BufferPeek::Direct) {
+		st.compared++;
+		if (bda) st.bda_compared++;
+		uint64_t   offset = peek.offset;
+		const bool fault  = PeekFaultEvery() != 0 && st.compared % PeekFaultEvery() == 0;
+		if (fault) {
+			offset += 16u;
+			st.injected++;
+		}
+		if (!same(peek, offset)) {
+			if (fault) {
+				st.detected++;
+			} else if (peek.klass == BufferPeek::Ready && !PeekProofHolds(peek, vaddr, size)) {
+				st.race++; // a game thread changed the range between the peek and today's path: the proof failed, as it must
+			} else {
+				st.bad++;
+				if (st.logged++ < 20u) {
+					std::fprintf(stderr, "CHECK_PEEK bad class=%u addr=%llx size=%llx written=%d bda=%d quiet=%d stream=%d\n", peek.klass,
+					             static_cast<unsigned long long>(vaddr), static_cast<unsigned long long>(size), is_written ? 1 : 0,
+					             bda ? 1 : 0, quiet ? 1 : 0, result.first == &Stream() ? 1 : 0);
+				}
+			}
+		}
+	}
+	if (lag_live) {
+		st.lag_compared++;
+		const uint64_t age = g_peek_calls - lag.call;
+		st.lag_age[age < 16u ? 0 : age < 128u ? 1 : age < 1024u ? 2 : 3]++;
+		st.lag_op_age[lag_bucket]++;
+		if (!same(lag.peek, lag.peek.offset)) {
+			// The proof checked again after today's path: a change during the path is a race, not a wrong answer.
+			(PeekProofHolds(lag.peek, vaddr, size) ? st.lag_bad : st.lag_race)++;
+		}
+	}
+	if ((peek.klass == BufferPeek::Ready || peek.klass == BufferPeek::Direct) && !lag_live) {
+		lag    = {vaddr, size, g_peek_calls, is_written, bda, 0, peek}; // the oldest live entry stays
+		lag.op = t_op_index;
+	}
+	PeekReport();
+	return result;
+}
+
+std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferPath(uint64_t vaddr, uint64_t size,
+                                                           bool is_written, bool is_texel_buffer,
+                                                           BufferId id, bool image_source) {
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
@@ -3321,7 +4254,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		write_memo_keep               = WriteMemoEpochs(vaddr, size, write_memo_fresh);
 	}
 	// The obtain memo: a read of a kept range (the diagnostic and approximation paths below never use it).
-	const bool memo_on = !is_written && !is_texel_buffer && !image_source;
+	const bool memo_on = !is_written && !is_texel_buffer && !image_source && PeekCheckMode() == 0 && // =2: full path
+	                     !PlanBufferCheck();
 	const ObtainMemoEntry* memo_hit = memo_on ? ObtainMemoFind(vaddr, size) : nullptr;
 	if (memo_on) {
 		auto& s = ObtainMemoStatsRef();
@@ -3347,6 +4281,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 			if (mapped != nullptr) {
 				LibKernel::Memory::ReadGuestPlain(mapped, vaddr, size);
 				Stream().Commit();
+				t_obtain_work++; // KYTY_CHECK_PEEK
+				if (t_translator != 0) TranslatorNote(3);
 				return {&Stream(), offset};
 			}
 		}
@@ -3373,6 +4309,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	bool image_sync = false;
 	if (!is_written && !is_texel_buffer && !image_source &&
 	    (image_sync = SyncBufferFromWrittenImage(buffer, vaddr, size, &image_over))) {
+		t_obtain_work++; // KYTY_CHECK_PEEK
 		static std::atomic_uint logged {0};
 		if (logged.fetch_add(1) < 32u) {
 			std::fprintf(stderr, "BUFFER_SYNC_FROM_IMAGE frame=%u addr=0x%llx size=0x%llx\n", DebugPresentCount().load(),
@@ -3407,6 +4344,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 }
 
 void BufferCache::NoteObtainedWrite(uint64_t vaddr, uint64_t size) {
+	if (t_translator != 0) TranslatorNote(4); // project 15 S2a: a write note inside a peek
 	if (!m_append_pools.empty() || !m_append_windows.empty()) AppendForeignWrite(vaddr, size); // D4b step 1 (append windows)
 	if (UploadClobberCheck()) { // D4 step K0
 		C0Note(vaddr, size, InDirectRange(vaddr, size) ? C0Event::DirectWrite : C0Event::ShaderWrite,
@@ -3418,6 +4356,7 @@ void BufferCache::NoteObtainedWrite(uint64_t vaddr, uint64_t size) {
 		if (m_gpu_write_observer) m_gpu_write_observer(vaddr, size);
 		return;
 	}
+	if (RingCensus::Enabled()) RingCensusWrite(vaddr, size, false); // KYTY_TRACE_RING_CENSUS (diagnostic)
 	{
 		const DispatchSubTimer dirty_timer(DispatchSub::OwDirtyAdd); // KYTY_TRACE_DISPATCH_CENSUS
 		GpuDirtyAdd(vaddr, size);
@@ -3425,6 +4364,7 @@ void BufferCache::NoteObtainedWrite(uint64_t vaddr, uint64_t size) {
 	std::optional<DispatchSubTimer> observer_timer(std::in_place, DispatchSub::OwObserver); // KYTY_TRACE_DISPATCH_CENSUS
 	{ // The per-range write ticks (DropDeadRingBytes, the readback queue, KYTY_TRACE_SYNC_TIMELINE).
 		NoteWriteTick(vaddr, vaddr + size, m_scheduler.CurrentTick());
+		NoteWriteFrame(vaddr, vaddr + size);
 	}
 	if (m_gpu_write_observer) m_gpu_write_observer(vaddr, size);
 	BumpHotGeneration(vaddr, size);
@@ -3441,7 +4381,9 @@ void BufferCache::NoteObtainedWriteRepeat(uint64_t vaddr, uint64_t size, bool sa
 	// As NoteObtainedWrite, without what the noted range already holds: the GPU-dirty set's range (the generation still
 	// moves, as for every GPU write) and, at the same tick, the per-range write ticks and the granule write ticks.
 	if (UploadClobberCheck()) C0Note(vaddr, size, C0Event::ShaderWrite, DebugWriterHash().load(std::memory_order_relaxed));
+	if (RingCensus::Enabled()) RingCensusWrite(vaddr, size, true); // KYTY_TRACE_RING_CENSUS (diagnostic)
 	if (!same_tick) NoteWriteTick(vaddr, vaddr + size, m_scheduler.CurrentTick());
+	NoteWriteFrame(vaddr, vaddr + size); // the same tick can hold work of two game frames
 	if (m_gpu_write_observer) m_gpu_write_observer(vaddr, size);
 	BumpHotGeneration(vaddr, size);
 	if (!same_tick) NoteGpuWriteTick(vaddr, size);
@@ -3450,8 +4392,71 @@ void BufferCache::NoteObtainedWriteRepeat(uint64_t vaddr, uint64_t size, bool sa
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBdaRange(uint64_t vaddr, uint64_t size, bool is_written,
                                                          BufferId id) {
+	if (PlanBufferCheck() && g_plan_buffers != nullptr && !is_written && GuestGpu::IsGpuThread() && GuestRange {vaddr, size}.Valid()) {
+		if (auto* entry = PlanBufferFind(vaddr, size, false, true); entry != nullptr) {
+			return PlanChecked(*entry, vaddr, size, [&] { return ObtainBdaRangePath(vaddr, size, is_written, id); });
+		}
+		g_plan_buffer_stats.unplanned++;
+	}
+	if (PeekCheckMode() == 0 || !GuestGpu::IsGpuThread() || !GuestRange {vaddr, size}.Valid()) {
+		return ObtainBdaRangePath(vaddr, size, is_written, id);
+	}
+	const auto peek = PeekBuffer(vaddr, size, is_written, false, id, true);
+	return PeekChecked(peek, vaddr, size, is_written, true, [&] { return ObtainBdaRangePath(vaddr, size, is_written, id); });
+}
+
+namespace {
+// 11.11 night batch 3 (the only path): read-only device-address ranges remembered like the
+// obtain memo (same proof - the buffer registry and the range's CPU-dirty tracker regions unchanged since a call left the
+// range CPU-clean; the BDA path has no image sync, so no image condition). A hit skips FindBuffer and SynchronizeBuffer,
+// which would claim nothing. KYTY_CHECK_BATCH3=2 runs the full path on a hit and compares the buffer and offset.
+bool BdaMemoCheck() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_CHECK_BATCH3");
+		return value != nullptr && value[0] == '2';
+	}();
+	return on;
+}
+bool BdaMemoOn() {
+	return true; // the only path (walk ABBA 11.11 with the table-set first try: 20.01/20.05 -> 20.25/20.41 fps)
+}
+constexpr size_t kBdaMemoSlots = 4096;
+ObtainMemoEntry  g_bda_memo[kBdaMemoSlots]; // GPU thread
+void BdaMemoNote(bool bad) {
+	static uint64_t compared = 0, wrong = 0;
+	compared++;
+	if (bad && ++wrong <= 8u) std::fprintf(stderr, "CHECK_BDA_MEMO bad (compare %llu)\n", static_cast<unsigned long long>(compared));
+	if ((compared & 0xfffffu) == 0u) {
+		std::fprintf(stderr, "PERF bda_memo_check compared=%llu bad=%llu\n", static_cast<unsigned long long>(compared),
+		             static_cast<unsigned long long>(wrong));
+	}
+}
+} // namespace
+
+std::pair<Buffer*, uint64_t> BufferCache::ObtainBdaRangePath(uint64_t vaddr, uint64_t size, bool is_written, BufferId id) {
 	if (m_scheduler.Current().IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: BDA range request requires a recording command buffer\n");
+	}
+	const bool bda_memo = !is_written && BdaMemoOn() && GuestGpu::IsGpuThread();
+	ObtainMemoEntry* memo_slot = nullptr;
+	const ObtainMemoEntry* memo_hit = nullptr;
+	if (bda_memo) {
+		memo_slot = &g_bda_memo[ObtainMemoIndex(vaddr, size) & (kBdaMemoSlots - 1u)];
+		const auto& e = *memo_slot;
+		bool        ok = e.regions != 0 && e.vaddr == vaddr && e.size == size &&
+		          e.buffer_epoch == DrawRepeat::g_buffer_registry_epoch.load(std::memory_order_acquire);
+		if (ok) {
+			auto* table = g_cpu_dirty_region_epochs.load(std::memory_order_acquire);
+			for (uint32_t i = 0; i < e.regions && ok; i++) ok = table[e.region + i].load(std::memory_order_acquire) == e.epochs[i];
+		}
+		if (ok && m_slot_buffers[e.id].IsInBounds(vaddr, size)) {
+			memo_hit = memo_slot;
+			if (!BdaMemoCheck()) {
+				auto& buffer = m_slot_buffers[e.id];
+				TouchBuffer(buffer);
+				return {&buffer, buffer.Offset(vaddr)};
+			}
+		}
 	}
 	if (IsBufferInvalid(id) || !m_slot_buffers[id].IsInBounds(vaddr, size)) {
 		id = FindBuffer(vaddr, size);
@@ -3460,7 +4465,23 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBdaRange(uint64_t vaddr, uint64_
 	TouchBuffer(buffer);
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, false, nullptr, UploadCaller::BdaRange);
 	if (is_written) {
+		const RingCensus::BdaRangeScope census_kind; // KYTY_TRACE_RING_CENSUS: the writer is a device-address range
 		NoteObtainedWrite(vaddr, size);
+	}
+	if (memo_hit != nullptr) BdaMemoNote(memo_hit->id != id || memo_hit->vaddr != vaddr); // =2: the hit's buffer is today's
+	if (bda_memo) {
+		// Kept: the range left CPU-clean (epochs read after the sync, so a mark during it makes the entry stale at once).
+		ObtainMemoEntry fresh;
+		if (ObtainMemoRegions(vaddr, size, fresh.region, fresh.regions, fresh.epochs) &&
+		    !m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
+			fresh.vaddr        = vaddr;
+			fresh.size         = size;
+			fresh.buffer_epoch = DrawRepeat::g_buffer_registry_epoch.load(std::memory_order_acquire);
+			fresh.id           = id;
+			*memo_slot         = fresh;
+		} else {
+			memo_slot->regions = 0;
+		}
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }
@@ -3895,6 +4916,11 @@ void BufferCache::NoteWriteTick(uint64_t start, uint64_t end, uint64_t tick) {
 	InsertTickRangeJoined(m_write_ticks, start, end, tick);
 }
 
+void BufferCache::NoteWriteFrame(uint64_t start, uint64_t end) {
+	if (end <= 0x2002600000ull || start >= 0x2010000000ull) return;
+	InsertTickRangeJoined(m_write_frames, start, end, g_ring_exec_data_frame + 1u);
+}
+
 void BufferCache::InsertTickRangeJoined(std::map<uint64_t, WriteTick>& ticks, uint64_t start, uint64_t end, uint64_t tick) {
 	if (start >= end) return;
 	// An entry already holding [start, end) at this tick: the insert would leave the same answers.
@@ -4105,6 +5131,7 @@ void CopyFromWriteCombined(uint8_t* dst, const uint8_t* src, uint64_t size) {
 	g_bar_copy_calls.fetch_add(1, std::memory_order_relaxed);
 	g_bar_copy_bytes.fetch_add(size, std::memory_order_relaxed);
 	g_bar_copy_ns.fetch_add(ns, std::memory_order_relaxed);
+	BarReadsProbe(size, ns);
 	const size_t bucket = size < 4096u ? 0u : size < 65536u ? 1u : size < 1048576u ? 2u : 3u;
 	g_bar_size_calls[bucket].fetch_add(1, std::memory_order_relaxed);
 	g_bar_size_bytes[bucket].fetch_add(size, std::memory_order_relaxed);
@@ -4873,6 +5900,46 @@ void BufferCache::VerifyCopyReadback(const std::vector<std::pair<uint64_t, uint6
 	c.mismatched += mismatched;
 }
 
+// ReadRange's servable question (7.11: the full scan per candidate range was ~3% of the GPU thread in the town walk;
+// 6.3 million answers checked against the scan, 0 different; +3.6% fps, two live A/B runs).
+bool BufferCache::BarServable(Buffer& buffer, uint64_t vaddr, uint64_t size, uint64_t ready_tick) {
+	// The scan's answer is false at the first page without a write tick or outside the buffer, once the bytes exceed
+	// BarMaxBytes, or once a write tick (or the ready tick) is not before the current tick; pages of one granule share
+	// its write tick (WriteTickKey), so a granule that passed is not asked again.
+	const uint64_t current = m_scheduler.CurrentTick();
+	if (ready_tick >= current) return false;
+	const auto base     = buffer.CpuAddress();
+	const auto limit    = base + buffer.Size();
+	bool       fail     = false;
+	bool       any      = false;
+	uint64_t   total    = 0;
+	uint64_t   last_key = ~uint64_t {0};
+	m_memory_tracker.ForEachDownloadRange<false>(vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
+		if (fail) return;
+		m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
+			if (fail) return;
+			if (start < base || end > limit) {
+				fail = true;
+				return;
+			}
+			for (uint64_t page = start & ~uint64_t {TRACKER_PAGE_SIZE - 1}; page < end; page += TRACKER_PAGE_SIZE) {
+				const uint64_t key = WriteTickKey(page);
+				if (key == last_key) continue;
+				const auto tick = GranuleWriteTick(key);
+				if (!tick || *tick >= current) {
+					fail = true;
+					return;
+				}
+				last_key = key;
+			}
+			any = true;
+			total += end - start;
+			if (total > BarReadMaxBytes(BarMaxBytes)) fail = true; // KYTY_PERF_BAR_GPU_LARGE
+		});
+	});
+	return !fail && any;
+}
+
 // The read window, unless the host mapping cannot serve it at once (more than BarMaxBytes GPU-dirty, or written by work
 // not finished) while the pages of the access can: then those pages, so the read waits for their writes only and not
 // for the whole queue (frame timeline 2.11: a 4-byte SRT read at the start of a frame took a 1.36 MB window and waited
@@ -4884,15 +5951,10 @@ std::pair<uint64_t, uint64_t> BufferCache::ReadRange(Buffer& buffer, uint64_t va
 	const uint64_t lo    = std::max(start, vaddr > ReadWindowBytes ? (vaddr - ReadWindowBytes) & ~0xfffull : 0ull);
 	const uint64_t hi    = std::min(end, (vaddr + size + ReadWindowBytes + 0xfffull) & ~0xfffull);
 	if (!(lo < hi && lo <= vaddr && vaddr + size <= hi)) return {vaddr, vaddr + size};
-	if (buffer.Mapped().empty()) return {lo, hi};
+	if (buffer.Mapped().empty() || !BarReadsOn()) return {lo, hi}; // no mapping reads: the window, as without a mapping
 	const auto ready = m_buffer_ready_tick.find(reinterpret_cast<uint64_t>(static_cast<VkBuffer>(buffer.Handle())));
 	if (ready == m_buffer_ready_tick.end()) return {lo, hi};
-	const auto servable = [&](uint64_t a, uint64_t b) {
-		std::vector<std::pair<uint64_t, uint64_t>> intervals;
-		uint64_t                                   newest = 0, total = 0;
-		if (ScanBarDownload(buffer, a, b - a, intervals, newest, total) >= 0) return false;
-		return total <= BarReadMaxBytes(BarMaxBytes) && std::max(newest, ready->second) < m_scheduler.CurrentTick();
-	};
+	const auto servable = [&](uint64_t a, uint64_t b) { return BarServable(buffer, a, b - a, ready->second); };
 	if (servable(lo, hi)) return {lo, hi};
 	const uint64_t p_lo = std::max(start, vaddr & ~0xfffull);
 	const uint64_t p_hi = std::min(end, (vaddr + size + 0xfffull) & ~0xfffull);
@@ -5587,11 +6649,9 @@ void BufferCache::RunGarbageCollector() {
 			             static_cast<unsigned long long>(m_rk_incomplete));
 		}
 	}
-	// Frame boundaries in ticks (DropDeadRingBytes).
-	g_ring_frame_ticks[g_ring_frames % g_ring_frame_ticks.size()] = m_scheduler.CurrentTick();
-	g_ring_frames++;
 	for (auto& range: m_direct_ranges) { // KYTY_PERF_DIRECT_RANGES: an image in a direct range ends it
 		if (range.active && m_texture_cache.IsRegionRegistered(range.start, range.end - range.start)) {
+			const DirectChange change(*this); // (W2.2)
 			std::fprintf(stderr, "PERF_DIRECT_RANGES 0x%llx-0x%llx ended: an image was registered in it\n",
 			             static_cast<unsigned long long>(range.start), static_cast<unsigned long long>(range.end));
 			m_texture_cache.DescribeImagesInRegion(range.start, range.end - range.start, 16);

@@ -72,7 +72,8 @@ public:
 	[[nodiscard]] uint64_t TakeSequence() noexcept { return ++m_emitted; }
 	[[nodiscard]] uint64_t NextSequence() const noexcept { return m_emitted + 1; }
 	// The operation `sequence` and everything before it executed when this returns: their snapshots are free.
-	void WaitForSnapshot(uint64_t sequence);
+	// True when it waited.
+	bool WaitForSnapshot(uint64_t sequence);
 
 	// The journal of writes that are not in guest memory yet, for the reads the stream decides on. Oldest first; the
 	// thread that makes the operations owns it. Based on TheCruZ/KytyPS5-GTA 12ec19890 (graphicsRun.h, graphicsRun.cpp),
@@ -99,6 +100,10 @@ public:
 	                        bool* covered = nullptr);
 	// The writes of the operations not executed yet into the range are in guest memory when this returns.
 	void WaitForPendingWrites(uint64_t address, uint64_t size, bool unknown_only);
+	// KYTY_PERF_SRT_GPU_WORDS_VERIFY (diagnostic, GPU thread): a value not yet in guest memory covers the dword at
+	// `address`: 1 a deferred end-of-pipe label (KYTY_FIX_LABEL_AT_COMPLETION), 2 a command-processor write the host GPU
+	// has not run (KYTY_PERF_DIRECT_RANGES); 0 none.
+	[[nodiscard]] static uint32_t PendingWriteKind(uint64_t address);
 
 private:
 	static constexpr uint32_t ComputePipeCount     = 7;
@@ -121,6 +126,7 @@ private:
 		bool                      constant_complete = false;
 		bool                      blocked           = false;
 		uint64_t                  flip_request_id   = 0;
+		uint64_t                  ring_frame        = 0; // the game frame whose data-ring half this work writes (DropDeadRingBytes)
 	};
 
 	void              Enqueue(Submission submission);
@@ -129,6 +135,11 @@ private:
 	void              BecomeRendererOwner();
 	void              ExecutionThread();
 	void              ResolveThread();
+	// Project 15 N2.2: the resolve helper (KYTY_PERF_RESOLVE_HELPERS=1 or KYTY_CHECK_RESOLVE=2) and the execution
+	// thread's claim of an operation's resolution before it executes (waits for a running one, steals a pending one).
+	void              ResolveHelperThread(uint32_t index);
+	// busy(context, true) before a wait for the helper, (context, false) after it: the caller's work scopes.
+	void              ClaimResolved(GpuOperation& operation, void (*busy)(void* context, bool waiting), void* busy_context);
 	// Execution thread: runs the queued commands, then lets the blocked queues try again.
 	void              RunCommands();
 	// Execution thread with no operation: waits for work; false when the GPU stops.
@@ -175,6 +186,11 @@ private:
 
 	uint64_t        m_submit_id = 0;
 	std::atomic_int m_done_num  = 0;
+	// The game frame of each submission (Enqueue, m_queue_mutex): SuspendPoints enqueued, and a SuspendPoint whose
+	// graphics submission is not enqueued yet. The frame last announced to the execution thread (Process, CP thread).
+	uint64_t        m_ring_sp_count  = 0;
+	bool            m_ring_after_sp  = false;
+	uint64_t        m_ring_announced = ~uint64_t {0};
 	uint64_t        m_emitted   = 0;
 	Common::ProgressCounter m_executed;
 	// The pipeline: operations ring from the command processor thread to the resolve thread and from there to the execution
@@ -219,8 +235,29 @@ private:
 	// GPU thread, the queue waits guard: when a slice last ran a packet, and whether the current slice did.
 	std::chrono::steady_clock::time_point m_last_progress {};
 	bool                                  m_slice_progressed = false;
+	// Project 15 N2.2: the resolve thread's tasks for the helper (each task holds a slot of the 320-slot ring, so 512 never
+	// fill), the tasks pushed (resolve thread) and finished (helper), and the counters of PERF resolve_helper.
+	Common::SpscQueue<RenderExecutor::ResolveTask> m_tasks {512};
+	Common::SpscQueue<RenderExecutor::ResolveTask> m_tasks2 {512}; // N5.2: the second helper's
+	uint32_t                                       m_deal_turn = 0; // N5.2: the tasks dealt in the current turn
+	uint64_t                                       m_tasks_pushed = 0;
+	std::atomic<uint64_t>                          m_tasks_finished {0};
+	std::atomic<uint64_t>                          m_tasks_claimed {0}; // N5.3: operations with a resolution the execution thread began
+	struct HelperStats {
+		std::atomic<uint64_t> tasks {0}, done {0}, empty {0}, stolen {0}, skipped {0}, ready {0}, running {0}, pending {0};
+		std::atomic<uint64_t> plans {0}, plans_short {0}; // N5.3: plans built; member draws without (lead below the margin)
+		std::atomic<uint64_t> waits {0}, wait_ns {0}, wait_cmd_ns {0}, wait_max_ns {0}, wait_commands {0};
+		// The waits by length (<5, <20, <100, <500, <2000, >=2000 us: count and ns).
+		std::array<std::atomic<uint64_t>, 6> hist_n {}, hist_ns {};
+		// KYTY_CHECK_RESOLVE=2: both empty, refused, reads differ, compared, bad; the fault test: injected, injected and
+		// compared, detected.
+		std::atomic<uint64_t> both_empty {0}, refused {0}, reads_differ {0}, compared {0}, bad {0};
+		std::atomic<uint64_t> injected {0}, injected_compared {0}, detected {0};
+	} m_helper_stats;
 	std::jthread    m_executor;
 	std::jthread    m_resolver;
+	std::jthread    m_resolve_helper;
+	std::jthread    m_resolve_helper2; // N5.2
 	std::jthread    m_thread;
 
 	friend class CommandProcessor;

@@ -148,6 +148,12 @@ public:
 	[[nodiscard]] vk::ImageView FindTexture(ImageId id, const ImageDesc& desc);
 	// FindTexture for a sampled binding, skipping its alias sync and refresh when both are known no-ops (textureCache.cpp).
 	[[nodiscard]] vk::ImageView FindTextureReplay(ImageId id, const ImageDesc& desc);
+	// Project 15 S2b: the view FindTextureReplay returns on its fast path, without the touch (null: not ready, not a
+	// sampled texture, or the view not created yet: today's call in order). Lock-free, as the other checks.
+	[[nodiscard]] vk::ImageView PeekTextureView(ImageId id, const ImageDesc& desc) const;
+	// Project 15 S2b: the read section of the cache's lock around a stage's peek (counted as a lock, no write).
+	void LockPeekRead() noexcept { m_lock.lock(false); }
+	void UnlockPeekRead() noexcept { m_lock.unlock(); }
 	// The image replay (pipeline\descriptors.cpp): whether this thread's last FindImage found an existing image by
 	// the plain search and did nothing else; and FindImage's work for an image a caller proved it would find again: the
 	// LRU touch and access tick (null id when it is gone).
@@ -155,13 +161,26 @@ public:
 	// no stencil plane or association, no metadata, not 1-byte texels).
 	[[nodiscard]] static bool TakeLastFindImagePlain();
 	// This thread's FindImage calls that went past the found-only answers (a full search; a draw's target memo).
-	[[nodiscard]] static uint64_t FullSearches();
+	// T1a (way B, KYTY_TRACE_PEEK_CENSUS, measurement): the searches that were not repeatable for a target memo, and the first
+	// reason each (0 null image, 1 not a target type, 2 not by SameBacking, 3 another candidate is a block alias, 4 freed or
+	// exact-format reset, 5 inserted, 6 the view moved to another mip or layer).
+	[[nodiscard]] static uint64_t NonRepeatableSearches();
+	// T1b: a target memo hit's colour-clear materialization, as FindImage does it after the search (the description's view
+	// as the search left it: a repeatable search moves no view).
+	void MaterializeTargetClear(ImageId id, const ImageDesc& desc) { MaterializeColorClear(id, desc, desc.view_info.base_layer); }
+	[[nodiscard]] static const std::array<uint64_t, 7>& NonRepeatReasons();
 	[[nodiscard]] uint64_t        GcTick() const noexcept { return m_gc_tick; }
 	[[nodiscard]] ImageId     ReplayImage(ImageId id);
 	// Bindless table refresh events: what ReplayImage does to each registered, non-null image (access tick, LRU touch),
 	// for a table's unchanged slots, under one lock.
 	void TouchTableImages(std::span<const ImageId> ids);
 	[[nodiscard]] bool        ImageReplayable(ImageId id) const;
+	// ImageReplayable for a sampled texture whose resolve ran no stencil tail (the caller knows that): one byte per block
+	// does not exclude it (project 15, n3-s2b-one-byte.md; checked 10.11: 17.1 M one-byte answers equal to the full resolve).
+	[[nodiscard]] bool        ImageReplayableTexture(ImageId id) const;
+	// Project 15 S2b (diagnostic): why ImageReplayable refuses (0 it accepts, 1 gone or unregistered, 2 depth, 3 stencil,
+	// 4 metadata, 5 one byte per block).
+	[[nodiscard]] uint32_t    ImageReplayableWhy(ImageId id) const;
 	// The table sets (pipeline\descriptors.cpp): FindImage / FindTexture work of a stage image set, all or none.
 	[[nodiscard]] bool TableReplayStage(std::span<const ImageId> ids);
 	[[nodiscard]] bool TableTexturesReady(std::span<const ImageId> ids);
@@ -183,6 +202,16 @@ public:
 	void               InvalidateMemory(uint64_t address, uint64_t size);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
 	[[nodiscard]] bool IsRegionRegistered(uint64_t address, uint64_t size);
+	// Project 15 way B W2.3 (diagnostic): the registered images.
+	[[nodiscard]] size_t ImageCount() const noexcept { return m_slot_images.size(); }
+	// Whether a registered image may start in the address's 64 KiB granule (lock-free, writes nothing; a hash collision
+	// only answers true). Project 15 S2a: today's buffer path touches an image only when this is true.
+	[[nodiscard]] static bool ImageMayStartAt(uint64_t address);
+	// The same for the exact first byte (a hash collision only answers true).
+	[[nodiscard]] static bool ImageMayStartExactlyAt(uint64_t address);
+	// RenderContext::UnmapMemory's wait: whether `test` holds for an image an unmap of the range frees (UnmapMemory: the images
+	// over it and their stencil associations).
+	[[nodiscard]] bool AnyUnmapImage(uint64_t address, uint64_t size, const std::function<bool(ImageId)>& test);
 	// KYTY_PERF_DIRECT_RANGES diagnostics: one stderr line per image registered in the region (at most max_lines).
 	void DescribeImagesInRegion(uint64_t address, uint64_t size, uint32_t max_lines);
 

@@ -2,12 +2,14 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_BUFFERCACHE_H_
 
 #include "common/abi.h"
+#include "common/spscQueue.h"
 #include "common/common.h"
 #include "common/lruCache.h"
 #include "common/slotVector.h"
 #include "common/uniqueFunction.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
+#include "graphics/host_gpu/translatorGuard.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
@@ -15,8 +17,11 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <filesystem>
+#include <thread>
 #include <functional>
 #include <map>
 #include <optional>
@@ -40,12 +45,23 @@ class TextureCache;
 using BufferId = Common::SlotId;
 inline constexpr BufferId NULL_BUFFER_ID {0};
 
+namespace RingCensus {
+struct Request; // KYTY_TRACE_RING_CENSUS (ringCensus.h)
+} // namespace RingCensus
+
+// The game frame whose data-ring half the game writes now (game threads, at each submission) and the one the GPU work
+// being recorded writes (execution thread, in stream order); BufferCache::DropDeadRingBytes.
+void RingGameWriteFrame(uint64_t frame);
+void RingExecDataFrame(uint64_t frame);
+
 // Counters of one SynchronizeBuffersInRange call (the BDA region pass's statistics).
 struct BufferSyncStats {
 	uint64_t buffers = 0;  // buffers visited
 	uint64_t uploads = 0;  // buffers that issued a copy
 	uint64_t bytes   = 0;  // bytes copied
 };
+
+struct PlanBuffer;
 
 class BufferCache {
 public:
@@ -99,13 +115,79 @@ public:
 	// when it would create one), writing nothing; the buffer registry epoch it saw is DrawRepeat::g_buffer_registry_epoch,
 	// read under the same lock. GPU thread: the registry's page table and slots change only under this lock.
 	[[nodiscard]] bool     TryLockLookup() noexcept { return m_lookup_lock.try_lock(); }
+	// Project 15 way B W2.1: a helper's plan peek tries the lookup lock 4 times, 64 pauses apart (as the resolve's source
+	// build does): a single try lost every entry of the stage while the other helper held it (~8% of the acquisitions).
+	[[nodiscard]] bool     TryLockLookupSpin() noexcept {
+        for (uint32_t attempt = 0; attempt < 4u; attempt++) {
+            if (m_lookup_lock.try_lock()) return true;
+            for (uint32_t spin = 0; spin < 64u; spin++) Common::SpinPause();
+        }
+        return false;
+	}
 	void                   UnlockLookup() noexcept { m_lookup_lock.unlock(); }
 	[[nodiscard]] BufferId LookupBuffer(uint64_t vaddr, uint64_t size) const;
+	// Project 15 S2a (N3, the read-only translator; design: the analysis session's n3-projekt.md section 4.1): what
+	// ObtainBuffer would answer, writing nothing. Ready: a registered buffer holds the range, it is CPU-clean and no image
+	// is registered over it - ObtainBuffer has nothing to upload or sync and only touches (its writes' notes, for a
+	// written binding, are the commit's); the proof is the obtain memo's (buffer registry epoch, the 4 MiB regions'
+	// CPU-dirty epochs, the image page epochs). Direct: an active direct range holds it. Null: nothing to bind. The rest
+	// are marks "in order" (the commit obtains that binding itself): Stream (a small CPU-dirty read the stream ring would
+	// copy), Upload (CPU-dirty, or not proven clean), Create (no buffer holds the range), Texel (an image over it).
+	struct BufferPeek {
+		enum Class : uint8_t { Ready, Direct, Null, Stream, Upload, Create, Image, NoProof, Written, Count };
+		Class    klass = Create;
+		BufferId id {};
+		uint64_t offset       = 0;
+		uint64_t buffer_epoch = 0, image_sum = 0, region = 0;
+		uint32_t epochs[2] {};
+		uint32_t regions = 0;
+		bool     bda     = false; // ObtainBdaRange's peek: no image in the proof
+		bool     helper_direct = false; // way B W0: a helper's peek of a range overlapping a direct range (Upload, in order)
+		uint64_t direct_gen    = 0;     // W2.2: a Direct answer's generation of the direct ranges (g_direct_generation)
+		vk::Buffer handle {};           // P1: the buffer's handle (Ready, Direct)
+	};
+	// bda: ObtainBdaRange's peek (no direct ranges, no stream copy, no image copy).
+	[[nodiscard]] BufferPeek PeekBuffer(uint64_t vaddr, uint64_t size, bool is_written, bool is_texel_buffer, BufferId hint,
+	                                    bool bda = false);
+	// KYTY_CHECK_PEEK=2: today's path after the peek, compared (bufferCache.cpp).
+	template <typename Path>
+	std::pair<Buffer*, uint64_t> PlanChecked(PlanBuffer& entry, uint64_t vaddr, uint64_t size, Path&& path);
+	template <typename Path>
+	std::pair<Buffer*, uint64_t> PeekChecked(const BufferPeek& peek, uint64_t vaddr, uint64_t size, bool is_written, bool bda, Path&& path);
+	// Whether a Ready or Direct peek's proof still holds (the obtain memo's check); PeekProofFail names the failed part
+	// (0 holds, 1 buffer registry, 2 CPU-dirty region epochs, 3 image pages, 4 not a proved class).
+	[[nodiscard]] static uint32_t PeekProofFail(const BufferPeek& peek, uint64_t vaddr, uint64_t size);
+	[[nodiscard]] static bool     PeekProofHolds(const BufferPeek& peek, uint64_t vaddr, uint64_t size) {
+        return PeekProofFail(peek, vaddr, size) == 0;
+	}
+	// The translator guard (KYTY_CHECK_PEEK=2, translatorGuard.h): writes noted inside a peek (expected 0).
+	static void TranslatorNote(int site) { TranslatorNoteSite(site); }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,
 	                                                        BufferId id              = {},
 	                                                        bool     image_source    = false);
+	// ObtainBuffer's work (ObtainBuffer adds KYTY_CHECK_PEEK=2 around it).
+	// N4.2b (KYTY_CHECK_PLAN_BUFFERS=2, diagnostic): the running draw's plan entries; every acquisition with an entry of
+	// its key is checked against it (the entry's proof, today's path quiet and with the same buffer and offset).
+	static void SetPlanBuffers(std::vector<PlanBuffer>* entries);
+	[[nodiscard]] static bool PlanBufferCheck();
+	// Project 15 way B P1: the running draw's plan entry of a stage's read-only buffer resource (the first unused one of that
+	// program and resource from the shared cursor; null without a plan). The only path since batch 1 (10.11).
+	[[nodiscard]] static PlanBuffer* PlanStageEntry(const void* program, uint32_t resource);
+	// Batch 1: a direct-range word no listed GPU write may cover (WaitDirectGpuWrites would return at once with no overlay):
+	// read plainly. False: today's wait and overlay.
+	[[nodiscard]] bool DirectWordQuiet(uint64_t vaddr) const { return m_direct_gpu_writes.empty() || !DirectWritesMayOverlap(vaddr, 4); }
+	// P1: the plan's answer for a binding (the same condition and work as ObtainBuffer's plan branch: the proof, Direct's
+	// mode, the touch of a Ready buffer); true when it answered.
+	[[nodiscard]] bool PlanAnswerBinding(PlanBuffer& entry, uint64_t vaddr, uint64_t size);
+	// Project 15 N4.3/N5: a draw with a plan is committed from it (its pipeline, table sets and buffer entries: an
+	// acquisition whose entry is Ready and whose proof holds only touches the buffer). Only path since 10.11 (checkpoint 2:
+	// +2.8% fps, the execution thread -1.6 ms/frame); the checks that compare against today's way turn it off.
+	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferPath(uint64_t vaddr, uint64_t size, bool is_written, bool is_texel_buffer,
+	                                                            BufferId id, bool image_source);
+	// KYTY_CHECK_PEEK=2: ObtainBufferPath's work that a Ready peek promised away (uploads, stream copies, image syncs).
+	inline static thread_local uint64_t t_obtain_work = 0;
 	// Asks the CPU to fetch the memo entry a later ObtainBuffer of this binding reads (the write memo's for a written one on
 	// the GPU thread, the obtain memo's for a read that is not texel), so their cache misses overlap instead of following
 	// each other. Changes no data.
@@ -118,6 +200,7 @@ public:
 	// page table does not map), its CPU-modified bytes uploaded, and when written GPU-modified from now on, like a
 	// written storage buffer.
 	std::pair<Buffer*, uint64_t> ObtainBdaRange(uint64_t vaddr, uint64_t size, bool is_written, BufferId id = {});
+	std::pair<Buffer*, uint64_t> ObtainBdaRangePath(uint64_t vaddr, uint64_t size, bool is_written, BufferId id);
 	[[nodiscard]] StreamBuffer&                GetUtilityBuffer(MemoryUsage usage) noexcept {
 		switch (usage) {
 			case MemoryUsage::Upload: return Staging();
@@ -228,6 +311,11 @@ public:
 	// PERF d6_c0 counts pages checked, pages and bytes clobbered, pages without a copy (unchecked).
 	[[nodiscard]] static bool UploadClobberCheck() { return D6C0Mode() >= 2u; }
 	void                      NoteGuestWriteFault(uint64_t vaddr);
+	// KYTY_DIAG_GPU_DELAY_HASHES=<hex,...> KYTY_DIAG_GPU_DELAY_COPIES=<n> (measurement only, sensitivity test): after each
+	// dispatch of a listed compute shader, n copies of 128 MiB (KYTY_DIAG_GPU_DELAY_KB=<size of one copy>) inside a scratch device buffer, ordered after the dispatch
+	// and before everything recorded later - pure extra GPU time at that place; the game's data is not touched.
+	void DiagGpuDelayAfter(vk::CommandBuffer cmd, uint64_t shader_hash);
+	std::unique_ptr<Buffer> m_diag_delay_buffer;
 	// D6 step C0: a written record-keyed range of the frames first..last lies on the 16 KiB store page and no call of
 	// those frames (or later) had an incomplete listing; false when the frames are no longer kept.
 	[[nodiscard]] bool BdaStoreListed(uint64_t page_address, uint64_t first_frame, uint64_t last_frame) const;
@@ -289,14 +377,39 @@ public:
 	// The BDA fallback (M06): a mapped direct-memory page without a buffer gets a BDA table entry into the imported
 	// direct-memory backing (bit 0 set = fallback), so a shader reads and writes the guest's real bytes instead of zeros /
 	// a dropped store; the shader still reports the page (BDA_FAULT), and the fault pass gives it a device-local buffer as
-	// before. Only the 2 MiB granules of the backing the GPU used are imported (on the first read of one, which reads 0,
-	// or a direct download into it), and the game's granule list keeps them for the next session.
+	// before. The general allocator's pool is imported when mapped (the map-time import below); other 2 MiB granules of
+	// the backing on the first read of one (which reads 0) or a direct download into it.
 	// KYTY_PERF_BDA_ENTRY_SHARE (0 off, 1 on, 2 verify; spirvEmitterMemory.cpp LoadBdaDwordShared): a scalar load through
 	// a GPU-built V# reuses the page-table entry of the invocation's previous such load when the page is the same.
 	// Verify counts checks / mismatches in fault-buffer diag words FAULT_DIAG_ENTRY_SHARE (+0, +1).
 	[[nodiscard]] static int BdaEntryShareMode();
 	static constexpr uint32_t FAULT_DIAG_ENTRY_SHARE = 4;
-	// (Words 8, 9, 12 and 13 are free.)
+	// (Words 8, 9 and 13 are free.)
+	// KYTY_PERF_SRT_GPU_WORDS_VERIFY (SrtTape.cpp PlanSrtGpuWords, spirvEmitterMemory.cpp EmitReadGpuWord): shader-only SRT
+	// words read from GPU memory compared with the CPU's value: checks / mismatches in diag words +0, +1.
+	static constexpr uint32_t FAULT_DIAG_SRT_GPU_WORDS = 12;
+	// +2: mismatch records taken; records of FAULT_DIAG_SRT_GPU_STRIDE words from FAULT_DIAG_SRT_GPU_FIRST (record
+	// FAULT_DIAG_SRT_GPU_RECORDS is the spare one other lanes store into; all below FAULT_DIAG_TRIP_FIRST).
+	static constexpr uint32_t FAULT_DIAG_SRT_GPU_FIRST   = 20;
+	static constexpr uint32_t FAULT_DIAG_SRT_GPU_STRIDE  = 7;
+	static constexpr uint32_t FAULT_DIAG_SRT_GPU_RECORDS = 5;
+	static_assert(FAULT_DIAG_SRT_GPU_FIRST + (FAULT_DIAG_SRT_GPU_RECORDS + 1) * FAULT_DIAG_SRT_GPU_STRIDE <= FAULT_DIAG_TRIP_FIRST);
+	// The guest addresses of the last GPU-word device addresses RebindBuffers bound (verify mode; any thread reads).
+	static inline std::array<std::atomic<uint64_t>, (1u << 20u)> s_gpu_word_device {};
+	static inline std::array<std::atomic<uint64_t>, (1u << 20u)> s_gpu_word_guest {};
+	static inline std::atomic<uint32_t>                   s_gpu_word_next {0};
+	static void NoteGpuWordBind(uint64_t device, uint64_t guest) {
+		const uint32_t i = s_gpu_word_next.fetch_add(1, std::memory_order_relaxed) % s_gpu_word_device.size();
+		s_gpu_word_device[i].store(device, std::memory_order_relaxed);
+		s_gpu_word_guest[i].store(guest, std::memory_order_relaxed);
+	}
+	[[nodiscard]] static uint64_t GpuWordGuest(uint64_t device) {
+		for (size_t i = 0; i < s_gpu_word_device.size(); ++i) {
+			if (s_gpu_word_device[i].load(std::memory_order_relaxed) == device)
+				return s_gpu_word_guest[i].load(std::memory_order_relaxed);
+		}
+		return 0;
+	}
 	void QueueFallbackMap(uint64_t vaddr, uint64_t size); // any thread (RenderContext::MapMemory)
 	void ApplyFallbackMaps();                             // GPU thread (RenderContext::PrepareBda)
 	void ClearFallback(uint64_t vaddr, uint64_t size);    // GPU thread (unmap, after InvalidateMemory)
@@ -306,9 +419,23 @@ public:
 	// D6 step K4: the page had a fallback entry until a buffer replaced it at most `frames` frames ago (a miss the fault
 	// pass reports later was then served by the entry, not read as 0).
 	[[nodiscard]] bool WasFallbackPage(uint64_t address, uint32_t frames) const;
-	// The fault pass: `page` (backing memory) was read as 0 because its granule is not imported yet: import it, add it to
-	// the game's granule list and give the granule's pages around `page` their fallback entries.
+	// The fault pass: `page` (backing memory) was read as 0 because its granule is not imported yet: the worker imports it
+	// (MapTimeRequestGranule) and the install gives the granule's pages their fallback entries.
 	void WantFallback(uint64_t page);
+	// The BDA map-time import (AGENTS 19, notes\PROJEKT-BDA-2026-11-08.md): the game's general GPU allocator (fixed
+	// 2 MiB maps at 0x80_..., prot 0xD3; 626 of 632 fallback reads of an entry into the game) is visible to the GPU from
+	// the moment it is mapped, as on the console: the first map of a 256 MiB piece of its backing has a worker import the
+	// piece whole (2 MiB view buffers = the fallback's granules); the GPU thread only installs them and writes their
+	// entries. Pieces stay for the session (the game keeps the allocation and maps it again at loads). The check: the
+	// pool's pages the fault pass saw read as 0 (PERF bda_maptime zero=, must stay 0).
+	[[nodiscard]] static bool InBdaMapTimePool(uint64_t vaddr) {
+		return vaddr >= BdaMapTimePoolStart && vaddr < BdaMapTimePoolStart + BdaMapTimePoolSize;
+	}
+	static constexpr uint64_t BdaMapTimePoolStart = 0x8000000000ull;
+	static constexpr uint64_t BdaMapTimePoolSize  = uint64_t {16} << 30u; // the allocator holds ~3.9 GiB on a base PS5
+	static constexpr uint64_t MapTimeImportBytes  = uint64_t {256} << 20u; // one import per piece of the pool's backing
+	static constexpr size_t   MapTimeGranuleItem  = size_t {1} << 62u;     // a worker queue item: one granule, not a piece
+	void NoteBdaMapTimeZero() { m_maptime.zero.fetch_add(1, std::memory_order_relaxed); }
 
 	// KYTY_TRACE_PERF: the PERF fault_wait_on_caller line (the caller wait's counters).
 	void ReportCallerWaitPerf();
@@ -416,8 +543,21 @@ public:
 	};
 	// KYTY_TRACE_PERF: the PERF protect_batch line.
 	void ReportProtectPerf();
+	// GPU thread: an asynchronous publish of guest bytes [vaddr, vaddr + size), a priority operation queued at the current
+	// tick (this cache's and the texture cache's download publishes, the only priority operations that write guest memory
+	// on the priority thread). The publish sets the returned flag when it ended (RenderContext::UnmapMemory waits for it).
+	[[nodiscard]] std::shared_ptr<std::atomic_bool> NotePendingGuestWrite(uint64_t vaddr, uint64_t size);
+	// GPU thread: the newest tick of an unfinished publish into [vaddr, vaddr + size), 0 when none (finished ones go).
+	[[nodiscard]] uint64_t PendingGuestWriteTick(uint64_t vaddr, uint64_t size);
 
 private:
+	struct PendingGuestWrite {
+		uint64_t                          start = 0;
+		uint64_t                          end   = 0;
+		uint64_t                          tick  = 0;
+		std::shared_ptr<std::atomic_bool> done;
+	};
+	std::vector<PendingGuestWrite> m_pending_guest_writes; // RenderContext::UnmapMemory's wait, GPU thread
 	// The join tick: a host-mapped read waits for the buffer's creation tick too (see TryBarDownload).
 	enum class CpWriteDecline : uint32_t { Overlap, Pending, Merge, Image, NoBuffer, Shape, Count };
 	// The write-through itself, once the page is known GPU-modified: Count when written, else the reason it is not.
@@ -647,6 +787,12 @@ private:
 	// The write memo: NoteObtainedWrite of a range noted at this tick with nothing undone since (the GPU-dirty set,
 	// the write ticks and the granule ticks already hold it): only its notifications.
 	void NoteObtainedWriteRepeat(uint64_t vaddr, uint64_t size, bool same_tick);
+	// KYTY_TRACE_RING_CENSUS (diagnostic, bufferCacheRingCensus.cpp; execution thread): the writer of a range a draw or
+	// dispatch is about to write; a write request's start, its byte compare (before the page is released) and its record.
+	void RingCensusWrite(uint64_t vaddr, uint64_t size, bool repeat);
+	void RingCensusBegin(RingCensus::Request& request, uint64_t vaddr, uint64_t size);
+	void RingCensusCompare(RingCensus::Request& request);
+	void RingCensusEnd(RingCensus::Request& request);
 	// KYTY_PERF_DIRECT_RANGES (see InDirectRange).
 	struct DirectRange {
 		uint64_t start   = 0;
@@ -671,11 +817,30 @@ private:
 	};
 	std::vector<DirectRange>    m_direct_ranges;
 	std::vector<DirectGpuWrite> m_direct_gpu_writes;
+	// Per direct range: the span of its listed GPU writes (a superset after removals; rebuilt with them), so a read outside
+	// every span needs no scan of the list (WaitDirectGpuWrites, ~1 M calls per second).
+	std::vector<std::pair<uint64_t, uint64_t>> m_direct_write_spans;
+	bool                                     m_direct_write_unspanned = false; // a listed write in no range: scan
+	void                                     RebuildDirectWriteSpans();
+	[[nodiscard]] bool                       DirectWritesMayOverlap(uint64_t vaddr, uint64_t size) const;
 	// The pending command-processor writes the last WaitDirectGpuWrites left to the reader.
 	std::vector<DirectGpuWrite> m_direct_cp_overlay;
 	uint32_t                    m_direct_mode_seen = 0;
 	bool                        m_direct_parsed    = false;
 	bool                        m_direct_wanted    = false; // a range is wanted, or a live A/B switch waits
+	// W2.2: the execution thread's changes of the direct ranges' fields (start, end, id, active, refused) and of the mode
+	// seen, nested: the outermost bumps the generation to odd before and to even after (a helper reads the fields between
+	// two equal even generations; a Direct plan answer holds while the generation is the one it saw).
+	uint32_t m_direct_change_depth = 0;
+	void     DirectChangeBegin();
+	void     DirectChangeEnd();
+	struct DirectChange {
+		BufferCache& cache;
+		explicit DirectChange(BufferCache& c): cache(c) { cache.DirectChangeBegin(); }
+		~DirectChange() { cache.DirectChangeEnd(); }
+		DirectChange(const DirectChange&)            = delete;
+		DirectChange& operator=(const DirectChange&) = delete;
+	};
 	[[nodiscard]] uint32_t DirectMode();
 	// The active direct buffer holding [vaddr, vaddr + size) (activating or growing its range), else a null id.
 	// `deferred` (non-null: the caller is a deferred operation, which must not wait): a range that would have to be
@@ -685,6 +850,7 @@ private:
 	void                   DeactivateDirect(DirectRange& range, bool replace = true);
 	void                   NoteDirectGpuWrite(uint64_t vaddr, uint64_t size, const void* cp_data = nullptr);
 	[[nodiscard]] bool     DropDeadRingBytes(uint64_t vaddr);
+	[[nodiscard]] bool     RingBytesAllDead(uint64_t vaddr); // its verdict without the changes
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
@@ -750,23 +916,40 @@ private:
 	// the BDA fallback (M06)
 	bool    FallbackEntry(uint64_t page, vk::DeviceAddress* entry);
 	// The imported backing granule (null: not imported, refused, or not wanted and `want` false); also the direct downloads'
-	Buffer* FallbackChunk(size_t chunk, bool want);
-	void    LoadFallbackList();
+	Buffer* FallbackChunk(size_t chunk, bool want, uint64_t vaddr = 0);
+	void    SizeFallback();
 	void    WriteFallbackRange(uint64_t vaddr, uint64_t size);
+	// BDA map-time import (AGENTS 19): the pool's pages (granule + 1 per 16 KiB page, 0: not mapped), mapped pages per granule, the
+	// granules asked of the worker, the worker's queue and its finished imports.
+	void MapTimeMap(uint64_t vaddr, uint64_t size);   // RenderContext::MapMemory (game threads)
+	void MapTimeInstall();                            // GPU thread (ApplyFallbackMaps)
+	void MapTimeRequestGranule(size_t granule, uint64_t vaddr); // GPU thread: a download or a read as 0 wants it
+	void MapTimeSize(uint64_t total);                           // under m_maptime.mutex: the tables' first sizing
+	void MapTimeWorker();
+	struct MapTimeState {
+		std::mutex                                           mutex;
+		std::condition_variable                              wake;
+		std::vector<uint64_t>                                granule_vaddr; // where a page of the granule was mapped last
+		std::vector<uint8_t>                                 requested; // per piece: 1 asked or imported, 2 refused
+		std::vector<uint8_t>                                 granule_requested; // single granules (outside the pool)
+		std::deque<size_t>                                   queue;
+		std::vector<vk::DeviceMemory>                        memories; // the imported pieces (freed at the end)
+		std::vector<std::pair<size_t, std::unique_ptr<Buffer>>> ready;
+		std::thread                                          worker;
+		bool                                                 stop = false;
+		std::atomic<uint64_t>                                zero {0};
+		uint64_t imports = 0, granule_imports = 0, imported_bytes = 0, import_us = 0, refused = 0, installed = 0, dropped = 0;
+	} m_maptime;
 	std::vector<std::unique_ptr<Buffer>>              m_fallback_chunks; // imported backing per granule, null: not yet
-	std::vector<uint8_t>                              m_fallback_chunk_failed;
-	std::vector<uint8_t>                              m_fallback_wanted; // granules the GPU used (now or in the list)
-	std::filesystem::path                             m_fallback_list_path; // the game's granule list (empty: none)
-	bool                                              m_fallback_list_loaded = false;
+	bool                                              m_fallback_sized = false;
 	std::mutex                                        m_fallback_pending_mutex;
 	std::vector<std::pair<uint64_t, uint64_t>>        m_fallback_pending;
 	std::unordered_set<uint64_t>                      m_fallback_pages; // 16 KiB guest pages with a fallback entry
 	std::unordered_map<uint64_t, uint32_t>            m_fallback_replaced; // page -> frame a buffer replaced its entry
 	uint32_t m_fallback_replaced_pruned = ~0u; // present count of the last pruning of m_fallback_replaced
 	struct FallbackStats {
-		uint64_t maps = 0, pages = 0, replaced = 0, restored = 0, cleared = 0, chunks = 0, failed = 0, applies = 0;
-		uint64_t listed = 0, learned = 0; // granules named by the game's list at start; granules added to it now
-		uint64_t import_us = 0, imported_bytes = 0; // D6 step K4 (PERF bda_fallback)
+		uint64_t maps = 0, pages = 0, replaced = 0, restored = 0, cleared = 0, chunks = 0, applies = 0;
+		uint64_t imported_bytes = 0;
 		// D6b: ClearFallback's Fill calls, its GPU-thread time.
 		uint64_t clear_fills = 0, clear_us = 0;
 		bool operator==(const FallbackStats&) const = default;
@@ -809,7 +992,10 @@ private:
 	// The GPU thread's guard for one registry change.
 	class LookupWriteGuard {
 	public:
-		explicit LookupWriteGuard(BufferCache& cache): m_cache(cache) { m_cache.m_lookup_lock.lock(); }
+		explicit LookupWriteGuard(BufferCache& cache): m_cache(cache) {
+			if (t_translator != 0) TranslatorNote(0); // project 15 S2a: a registry change inside a peek
+			m_cache.m_lookup_lock.lock();
+		}
 		~LookupWriteGuard() { m_cache.m_lookup_lock.unlock(); }
 		LookupWriteGuard(const LookupWriteGuard&)            = delete;
 		LookupWriteGuard& operator=(const LookupWriteGuard&) = delete;
@@ -820,11 +1006,19 @@ private:
 	MemoryTracker                                     m_memory_tracker;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
+	// KYTY_PERF_SRT_GPU_WORDS: device-local ring with a device address for the values of GPU-read SRT words that lie in a
+	// direct range (host memory): shaders read them from here instead of host memory over the bus in every invocation.
+	StreamBuffer                                      m_word_stream;
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;
 	bool                                              m_device_tables_cleared = false; // ClearDeviceTablesOnce
 	[[nodiscard]] StreamBuffer& Staging() noexcept { return m_staging_buffer; }
 	[[nodiscard]] StreamBuffer& Stream() noexcept { return m_stream_buffer; }
+
+public:
+	[[nodiscard]] StreamBuffer& WordStream() noexcept { return m_word_stream; }
+
+private:
 	TextureCache&                                     m_texture_cache;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
@@ -853,12 +1047,14 @@ private:
 	void NoteGpuWriteTick(uint64_t vaddr, uint64_t size);
 	// The submission tick of the newest GPU write of each byte range (interval map).
 	void                   NoteWriteTick(uint64_t start, uint64_t end, uint64_t tick);
+	void                   NoteWriteFrame(uint64_t start, uint64_t end); // data ring only: the recorded work's game frame
 	[[nodiscard]] uint64_t QueryWriteTick(uint64_t start, uint64_t end) const; // 0: part of it unknown
 	struct WriteTick {
 		uint64_t end;
 		uint64_t tick;
 	};
 	std::map<uint64_t, WriteTick> m_write_ticks;
+	std::map<uint64_t, WriteTick> m_write_frames; // data ring: game frame + 1 of the newest GPU write of each byte range
 	static void InsertTickRange(std::map<uint64_t, WriteTick>& ticks, uint64_t start, uint64_t end, uint64_t tick);
 	// The same answers with fewer entries (an insert already held is skipped, equal-tick neighbours are joined).
 	static void InsertTickRangeJoined(std::map<uint64_t, WriteTick>& ticks, uint64_t start, uint64_t end, uint64_t tick);
@@ -913,6 +1109,10 @@ private:
 	// 6 nothing GPU-written (TryBarDownload's outcomes).
 	int ScanBarDownload(Buffer& buffer, uint64_t vaddr, uint64_t size, std::vector<std::pair<uint64_t, uint64_t>>& intervals,
 	                    uint64_t& newest, uint64_t& total);
+	// ReadRange's question (7.11): ScanBarDownload usable, at most BarMaxBytes and its newest write tick
+	// (and `ready_tick`) before the current tick - answered without the intervals, stopping at the first fact that makes
+	// it false, one write-tick question per 64 KiB granule.
+	[[nodiscard]] bool BarServable(Buffer& buffer, uint64_t vaddr, uint64_t size, uint64_t ready_tick);
 	// The GPU-written bytes a read takes from the host mapping (BAR, uncached PCIe reads, ~0.66 GB/s measured 18.10 with PERF
 	// bar_copy) at most; more go through the GPU copy into cached host memory (the copy path), which is faster for them.
 	// Only how the same bytes are copied changes.
@@ -973,6 +1173,26 @@ private:
 	GranuleTickTable m_granule_ticks;
 	std::unordered_map<uint64_t, uint64_t> m_buffer_ready_tick;
 	uint64_t                   m_hot_clock = 0;
+};
+
+// Project 15 N4.2b: one buffer acquisition a draw's plan peeked ahead (PeekBuffer), keyed by the acquisition's arguments:
+// kind 0 a stage buffer, 1 a record-keyed range (BDA), 2 a merged vertex range, 3 the index buffer.
+struct PlanBuffer {
+	uint64_t                vaddr = 0, size = 0;
+	bool                    texel = false, bda = false, used = false;
+	uint8_t                 kind     = 0;
+	uint32_t                distance = 0;
+	BufferCache::BufferPeek peek;
+	// P1 (kind 0): the stage's program and resource, and the binding computed on the helper (ready: the storage range's
+	// limits hold) - StorageBufferRange's aligned offset and range, the offset byte, the record stride
+	const void* program  = nullptr;
+	uint32_t    resource = UINT32_MAX;
+	bool        ready    = false;
+	uint64_t    bind_offset = 0, bind_range = 0;
+	uint32_t    memory_offset = 0, stride = 0;
+	// P1.2: the resolve record's source (its buffer id and the epochs BufferSourceHolds checks)
+	BufferId    source_id {};
+	uint64_t    source_epoch = 0, ranges_generation = 0;
 };
 
 } // namespace Libs::Graphics

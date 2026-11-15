@@ -1,6 +1,11 @@
+#include "common/slowFrame.h" // KYTY_TRACE_SLOW_FRAMES (diagnostic)
+#include "graphics/guest_gpu/chunkCensus.h"
+#include "graphics/guest_gpu/chunkLead.h"
 #include "graphics/host_gpu/renderer/debugSample.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
+#include "graphics/host_gpu/renderer/drawCoverage.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorsTrace.h"
+#include "graphics/host_gpu/translatorGuard.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pendingClearCheck.h"
 
@@ -10,6 +15,7 @@
 #include "common/emulatorConfig.h"
 #include "common/envDefaults.h"
 #include "common/envRead.h"
+#include "common/liveAb.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/onceValue.h"
@@ -31,6 +37,7 @@
 #include "graphics/host_gpu/renderer/drawRepeat.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
+#include "graphics/host_gpu/renderer/cache/ringCensus.h"
 #include "graphics/host_gpu/renderer/perfCounters.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/recordPackets.h"
@@ -79,6 +86,9 @@ namespace Libs::Graphics {
 
 thread_local std::vector<uint32_t> RenderExecutor::m_bindless_srt;
 thread_local std::vector<uint32_t> RenderExecutor::m_uniform_words;
+thread_local std::vector<std::pair<uint32_t, uint32_t>> RenderExecutor::m_gpu_word_patches;
+thread_local std::vector<std::pair<uint64_t, uint32_t>> RenderExecutor::m_gpu_word_addresses;
+thread_local std::vector<std::tuple<uint32_t, uint32_t, uint64_t>> RenderExecutor::m_gpu_word_values;
 
 namespace {
 
@@ -1032,6 +1042,27 @@ static TextureDescribe DescribeTexture(const ShaderRecompiler::IR::ImageResource
 	// above them, their pages not even reserved) still has every viewed level inside reserved memory; the whole-chain
 	// test dropped it (the distant terrain's snow mask: transparent black, no snow on Mount Yotei). Single-layer 2D only.
 	// The image is then described as those levels alone (StreamedViewSubChain) when their layout allows it.
+	// KYTY_DIAG_TEXTURE_SKIP_MIPS=N (diagnostic, default off; idea of cosmo, the Kyty developer, 10.11): a sampled
+	// single-layer 2D texture with more than N viewed levels is viewed from N levels down (1/4^N of the texels); the
+	// streamed sub-chain path below then describes and uploads only those levels. Blurry textures: a ceiling for the
+	// texture uploads behind the stutters in motion and at scene changes, not a mode to play.
+	static const uint32_t diag_skip_mips = [] {
+		const char* value = std::getenv("KYTY_DIAG_TEXTURE_SKIP_MIPS");
+		const auto  skip  = value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+		if (skip != 0u) std::fprintf(stderr, "DIAG_TEXTURE_SKIP_MIPS %u (sampled 2D textures viewed %u levels down)\n", skip, skip);
+		return skip;
+	}();
+	// (Not for a resource whose shader picks the mip itself: its mip views are counted from the descriptor's levels.)
+	if (diag_skip_mips != 0u && !storage && !(!resource.r128 && descriptor.MetaCompress()) &&
+	    resource.mip_mode != ShaderRecompiler::IR::ImageMipMode::Dynamic &&
+	    // Only block-compressed (BC1-BC7) textures - the art; data textures (terrain maps, masks, tables) are read texel
+	    // by texel and broke the first try (the game then drew 974 instead of ~1800-3600 draws per frame).
+	    static_cast<int>(pixel_format) >= static_cast<int>(vk::Format::eBc1RgbUnormBlock) &&
+	    static_cast<int>(pixel_format) <= static_cast<int>(vk::Format::eBc7SrgbBlock) &&
+	    desc.info.resources.layers == 1u && !volume && view_levels > diag_skip_mips) {
+		view_base += diag_skip_mips;
+		view_levels -= diag_skip_mips;
+	}
 	uint64_t reserved_needed = desc.info.data.size;
 	if (view_base != 0u && desc.info.resources.layers == 1u && !volume) {
 		uint64_t end = 0;
@@ -1321,7 +1352,13 @@ void BuildBufferSources(RenderContext& renderer, const ShaderRecompiler::IR::Res
 			size       = std::min({size, uint64_t {256} * 1024 * 1024, sentinel_limit});
 		}
 		uint64_t generation = 0;
-		if (Libs::LibKernel::Memory::ClampRangeSizeAhead(address, size, &generation) != size) {
+		uint64_t clamped    = 0;
+		{
+			const ChunkLead::PartTimer clamp_timer(ChunkLead::RpClamp); // KYTY_TRACE_CHUNK_LEAD (N2.0)
+			ChunkLead::t_part_buffers++;
+			clamped = Libs::LibKernel::Memory::ClampRangeSizeAhead(address, size, &generation);
+		}
+		if (clamped != size) {
 			b.outcome = BufferOutcome::Clamped;
 			continue;
 		}
@@ -1339,7 +1376,8 @@ void BuildBufferSources(RenderContext& renderer, const ShaderRecompiler::IR::Res
 		g.range_size      = range.size;
 		g.written         = range.written;
 		uint64_t generation = 0;
-		if (Libs::LibKernel::Memory::ClampRangeSizeAhead(range.address, range.size, &generation) != range.size) {
+		const auto clamped_range = Libs::LibKernel::Memory::ClampRangeSizeAhead(range.address, range.size, &generation);
+		if (clamped_range != range.size) {
 			g.outcome = BufferOutcome::Clamped;
 			continue;
 		}
@@ -1403,33 +1441,51 @@ bool BufferSourceHolds(const ResolveRecord::BufferSource& source) {
 		return false;
 	}
 	NoteBufferUse(BufferUse::Used);
+	// KYTY_CHECK_CLAMP_SEQLOCK=2 (project 15, the narrow generation): an accepted source's clamp is the one the ranges
+	// give now (proof that protection, names and reserved ranges, which no longer change the generation, change nothing).
+	static const bool check = [] {
+		const char* env = std::getenv("KYTY_CHECK_CLAMP_SEQLOCK");
+		return env != nullptr && env[0] == '2';
+	}();
+	if (check) {
+		static uint64_t accepted = 0, different = 0;
+		accepted++;
+		uint64_t now_generation = 0; // the locked search (never exits or logs, unlike ClampRangeSize)
+		if (source.size != 0 && Libs::LibKernel::Memory::ClampRangeSizeAhead(source.address, source.size, &now_generation) != source.size) different++;
+		if ((accepted & ((1u << 20u) - 1u)) == 0) {
+			std::fprintf(stderr, "PERF clamp_accepted accepted=%llu different=%llu\n", static_cast<unsigned long long>(accepted),
+			             static_cast<unsigned long long>(different));
+		}
+	}
 	return true;
 }
 
 // The resolve thread's source of snapshot buffer `resource` (V# `value`, bound read-only unless `written`) when it still holds;
 // null (counted by reason) otherwise.
+// count false (project 15 N4.2b, the plan's builder): the same answer without the use counters.
 const ResolveRecord::BufferSource* BufferSourceAhead(const ResolveRecord* record, uint32_t resource,
-                                                     const ShaderRecompiler::IR::DescriptorValue& value, bool written) {
+                                                     const ShaderRecompiler::IR::DescriptorValue& value, bool written,
+                                                     bool count = true) {
 	if (record == nullptr) {
-		NoteBufferUse(BufferUse::NoRecord);
+		if (count) NoteBufferUse(BufferUse::NoRecord);
 		return nullptr;
 	}
 	if (resource >= record->buffer_count) {
-		NoteBufferUse(BufferUse::NotAhead);
+		if (count) NoteBufferUse(BufferUse::NotAhead);
 		return nullptr;
 	}
 	const auto& source = record->buffers[resource];
 	if (source.outcome != BufferOutcome::Found) {
-		NoteBufferMiss(source.outcome);
+		if (count) NoteBufferMiss(source.outcome);
 		return nullptr;
 	}
 	if (value.dword_count < source.words.size() ||
 	    !std::equal(source.words.begin(), source.words.end(), value.dwords.begin())) {
-		NoteBufferUse(BufferUse::Words);
+		if (count) NoteBufferUse(BufferUse::Words);
 		return nullptr;
 	}
 	if (source.sentinel && written) {
-		NoteBufferUse(BufferUse::Written);
+		if (count) NoteBufferUse(BufferUse::Written);
 		return nullptr;
 	}
 	return BufferSourceHolds(source) ? &source : nullptr;
@@ -1437,22 +1493,22 @@ const ResolveRecord::BufferSource* BufferSourceAhead(const ResolveRecord* record
 
 // The resolve thread's source of record-keyed range `index` when it still holds; null (counted by reason) otherwise.
 const ResolveRecord::BufferSource* RangeSourceAhead(const ResolveRecord* record, uint32_t index,
-                                                    const ShaderRecompiler::IR::IndirectRange& range) {
+                                                    const ShaderRecompiler::IR::IndirectRange& range, bool count = true) {
 	if (record == nullptr) {
-		NoteBufferUse(BufferUse::NoRecord);
+		if (count) NoteBufferUse(BufferUse::NoRecord);
 		return nullptr;
 	}
 	if (index >= record->range_count) {
-		NoteBufferUse(BufferUse::NotAhead);
+		if (count) NoteBufferUse(BufferUse::NotAhead);
 		return nullptr;
 	}
 	const auto& source = record->ranges[index];
 	if (source.outcome != BufferOutcome::Found) {
-		NoteBufferMiss(source.outcome);
+		if (count) NoteBufferMiss(source.outcome);
 		return nullptr;
 	}
 	if (source.address != range.address || source.range_size != range.size || source.written != range.written) {
-		NoteBufferUse(BufferUse::Words);
+		if (count) NoteBufferUse(BufferUse::Words);
 		return nullptr;
 	}
 	return BufferSourceHolds(source) ? &source : nullptr;
@@ -1556,6 +1612,7 @@ TextureBinding RenderExecutor::FindResolvedTexture(const ShaderRecompiler::IR::I
 	if (stencil_alias_copy && !stencil_plane_synced && !stencil_association && !storage &&
 	    image->info.bytes_per_block == 1u && !image->info.IsDepth()) {
 		if (const auto association = texture_cache.FindStencilAssociationAt(address)) {
+			t_stencil_tail      = true; // KYTY_CHECK_PEEK=2 (S2b): an association under the address
 			const auto depth_id = texture_cache.GetImage(association).depth_id;
 			if (depth_id && depth_id != id) {
 				texture_cache.EnsureStencilPlane(depth_id, address);
@@ -1848,6 +1905,7 @@ void RenderExecutor::BindImage(ImageId id, bool storage) {
 }
 
 void RenderExecutor::BindRenderTarget(ImageId id) {
+	if (m_bind_suppressed) return; // (T1b check: the comparison search)
 	auto&          image = m_context.GetTextureCache().GetImage(id);
 	const uint64_t mix   = (static_cast<uint64_t>(id.index) << 2u) | 2u;
 	if (auto* prep = PrepFlags(); prep != nullptr) { // the plan flags
@@ -2405,6 +2463,8 @@ struct BindlessSplit {
 
 void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
                                           PreparedBindings& prepared) {
+	const Common::SlowFrame::Scope slow_frame_scope(Common::SlowFrame::Bindless); // KYTY_TRACE_SLOW_FRAMES
+	const ChunkLead::FloorTimer floor_bindless(ChunkLead::FpBindless); // KYTY_TRACE_PEEK_CENSUS (N3.0)
 	BindlessSplit      bsplit; // KYTY_TRACE_LONG_PREP
 	prepared.bindless_patches.clear();
 	prepared.bindless_images.clear();
@@ -2689,12 +2749,14 @@ bool RenderExecutor::PrepareBindlessTable(uint64_t shader_hash, const ShaderReco
 	// KYTY_DIAG_TABLES_ASSUME_UNCHANGED=1 (ceiling test only, map 5.11 "ruch przez miasto": the bindless tables were ~20%
 	// of the GPU thread in the town): a table with a translation of the same size and fields is taken as unchanged - no
 	// read, hash, translation or slot refresh (stale textures may show; the draws per frame must stay). Read once.
-	static const bool assume_unchanged = [] {
+	// Live A/B toggles it per use (a table skipped in one phase is checked at its next use in the other).
+	static const uint32_t assume_fixed = [] {
 		const char* value = std::getenv("KYTY_DIAG_TABLES_ASSUME_UNCHANGED");
 		const bool  set   = value != nullptr && value[0] == '1';
 		if (set) std::fprintf(stderr, "DIAG_TABLES_ASSUME_UNCHANGED ceiling: table checks skipped""\n");
-		return set;
+		return set ? 1u : 0u;
 	}();
+	const bool assume_unchanged = Common::LiveAb::Gate(Common::LiveAb::Switch::DiagTablesAssume, assume_fixed) != 0u;
 	const bool skip_check = assume_unchanged && table.region != 0 && covered == table.covered && !fields_changed &&
 	                        !retranslate;
 	const bool check_due = !skip_check && (table.checked_tick != tick || covered != table.covered || fields_changed ||
@@ -2817,7 +2879,10 @@ bool RenderExecutor::PrepareBindlessTable(uint64_t shader_hash, const ShaderReco
 	}
 	// This draw reads a translation that still names a dead slot (dropped in this
 	// tick after the table's one translation of the tick).
-	if (table.generation != bindless.TableGeneration()) stats.dead_slot_reads++;
+	if (table.generation != bindless.TableGeneration()) {
+		stats.dead_slot_reads++;
+		bindless.NoteDeadSlotRead(table); // a guest unmap's deferred drop read early (PERF unmap_image_defer)
+	}
 	const auto first = static_cast<uint32_t>((use.base - table_base) / 4u);
 	const auto total = table.covered / 4u;
 	if (first >= total) return fallback(Fallback::NoLayout);
@@ -2897,9 +2962,172 @@ void RenderExecutor::LearnBindlessClass(uint64_t shader_hash, const ShaderRecomp
 // Gate 22.10: one 93,840-byte table alternates with 23,184 bytes every frame (two full translations per frame).
 static std::atomic<uint64_t> g_ttd_translations {0}, g_ttd_entries {0}, g_ttd_reused {0};
 
-bool RenderExecutor::TranslateBindlessTable(BindlessTable::Table& table, uint32_t covered, uint64_t hash,
-                                            uint64_t frame, uint64_t shader_hash) {
+namespace {
+// The difference translation: the fields a translation named the entries with.
+uint64_t TableFieldsSignature(const BindlessTable::Table& table) {
+	uint64_t h = 0x9E3779B97F4A7C15ull ^ table.fields.size();
+	for (const auto& field: table.fields)
+		h = (h ^ ((uint64_t {field.stride} << 42u) ^ (uint64_t {field.offset} << 21u) ^ field.end)) * 0x100000001B3ull;
+	return h;
+}
+
+} // namespace
+
+bool RenderExecutor::TranslateBindlessTable(BindlessTable::Table& table, uint32_t covered, uint64_t hash, uint64_t frame,
+                                            uint64_t shader_hash) {
+	// A table over 1 MiB translates by difference from its last translation when it can (6.11, checked against
+	// the entry-by-entry translation: 2,559 translations of the town walk, 0 different values, slots and field tallies;
+	// walk +4.6% fps, two runs); every other translation entry by entry.
+	if (covered > TableMaxBytes) {
+		const int result = TranslateTableDiff(table, covered, hash, frame);
+		if (result >= 0) return result == 1;
+	}
+	return TranslateBindlessTableFull(table, covered, hash, frame, shader_hash);
+}
+
+// The bindless binder lock is taken only off the GPU thread: its users all run on the GPU thread (the preparation worker it
+// kept out is gone; 8.11 town walk: no entry from another thread). An entry from another thread still locks and is
+// reported once. (8.11, with the dense slot dedup and the kept-owner skip below: +0.3% / +1.5% fps phases in two
+// live A/B runs, pairs +0.5% / +0.4% median; exact.)
+class BinderLock {
+public:
+	explicit BinderLock(std::mutex& mutex) {
+		if (GuestGpu::IsGpuThread()) return;
+		static std::atomic_bool reported {false};
+		if (!reported.exchange(true)) std::fprintf(stderr, "BINDER_LOCK taken off the GPU thread\n");
+		m_lock = std::unique_lock<std::mutex>(mutex);
+	}
+
+private:
+	std::unique_lock<std::mutex> m_lock;
+};
+
+int RenderExecutor::TranslateTableDiff(BindlessTable::Table& table, uint32_t covered, uint64_t hash, uint64_t frame) {
+	auto&      bindless = m_context.GetBindlessTable();
+	const auto fail     = [](int /*why: 1 not ready, 2 size, 3 fields, 4 prune, 5 no owners, 6 generation*/) { return -1; };
+	if (!table.diff_ready) return fail(1);
+	const uint32_t entries = covered / 4u;
+	if (covered != table.covered || covered != table.src_covered || table.values.size() != entries ||
+	    table.src_values.size() != entries || table.src_words.size() != entries || m_table_words.size() < entries)
+		return fail(2);
+	if (TableFieldsSignature(table) != table.diff_signature || table.diff_entries.size() != table.diff_fields.size())
+		return fail(3);
+	const bool classes = bindless.ClassesEnabled();
+	if (classes && table.field_frames.size() == table.fields.size()) {
+		// The full translation would let unasked fields go (another set of named entries).
+		for (const auto field_frame: table.field_frames)
+			if (field_frame + 64u <= frame) return fail(4);
+	}
+	if (!bindless.SlotOwnersOn()) return fail(5);
+	const bool     timed             = PerfEnabled();
+	const auto     start             = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+	auto&          stats             = bindless.GetTableStats();
+	const uint32_t descriptor_dwords = (table.view.flags & 1u) != 0u ? 4u : 8u; // R128: words 4..7 read as zero
+	const bool     integer           = BindlessTable::IntegerClass(table.view.numeric_class);
+	const bool     tallies           = classes && !integer && table.field_tallies.size() == table.fields.size();
+	const uint32_t binding           = table.view.binding;
+	// The slots that died since the last translation: their entries resolve again (the full translation's taken slot test
+	// fails for them: not live, or live again with another key).
+	const size_t capacity = bindless.TableSlotCount(binding);
+	m_diff_dead.assign(capacity, 0);
+	for (const auto slot: table.dead_list)
+		if (slot < capacity) m_diff_dead[slot] = 1;
+	const uint64_t generation = bindless.TableGeneration();
+	m_diff_new.clear();
+	for (size_t i = 0; i < table.diff_entries.size(); i++) {
+		const uint32_t  entry         = table.diff_entries[i];
+		const uint32_t* now           = m_table_words.data() + entry;
+		uint32_t*       src           = table.src_words.data() + entry;
+		const bool      words_changed = !std::equal(now, now + descriptor_dwords, src);
+		const uint32_t  old_slot      = table.values[entry];
+		const bool      slot_dead     = old_slot < capacity && m_diff_dead[old_slot] != 0;
+		if (!words_changed && !slot_dead) continue; // the full translation takes the previous slot (same words, live)
+		std::array<uint32_t, 8> words {};
+		std::copy_n(now, descriptor_dwords, words.begin());
+		if (words_changed && tallies) {
+			// The field's tally without the old record and with the new one (the full translation counts every record).
+			auto&                                   tally = table.field_tallies[table.diff_fields[i]];
+			ShaderRecompiler::IR::BindlessFieldTally before {}, after {};
+			ShaderRecompiler::IR::TallyBindlessFieldDescriptor(src, descriptor_dwords == 4u, binding, before);
+			ShaderRecompiler::IR::TallyBindlessFieldDescriptor(words.data(), descriptor_dwords == 4u, binding, after);
+			tally.uint_count += after.uint_count - before.uint_count;
+			tally.sint_count += after.sint_count - before.sint_count;
+			tally.float_count += after.float_count - before.float_count;
+			tally.float_tiny += after.float_tiny - before.float_tiny;
+			tally.other += after.other - before.other;
+		}
+		const uint32_t slot     = ResolveTableDescriptor(table, words, frame);
+		table.values[entry]     = slot;
+		table.src_values[entry] = slot;
+		if (!bindless.IsPlaceholderSlot(slot)) m_diff_new.push_back(slot);
+		std::copy_n(now, descriptor_dwords, src);
+		stats.fields++;
+	}
+	// The distinct slots in naming order, as the full translation lists them.
+	if (++m_table_stamp == 0u) m_table_stamp = 1u;
+	m_diff_slots.clear();
+	// A slot already listed is skipped by its dense mark (the stamps of earlier translations are older) before its record
+	// is read (the record's stamp is set by this loop only, so the list is the same).
+	if (m_diff_seen.size() < capacity) m_diff_seen.resize(capacity, 0u);
+	for (const uint32_t entry: table.diff_entries) {
+		const uint32_t slot = table.values[entry];
+		if (bindless.IsPlaceholderSlot(slot)) continue;
+		if (slot < capacity) {
+			if (m_diff_seen[slot] == m_table_stamp) continue;
+			m_diff_seen[slot] = m_table_stamp;
+		}
+		auto& info = bindless.GetTableSlot(binding, slot);
+		if (info.stamp == m_table_stamp) continue;
+		info.stamp = m_table_stamp;
+		m_diff_slots.emplace_back(slot, info.generation);
+	}
+	// A lookup dropped an image meanwhile (the full translation's second round): entry by entry then.
+	if (bindless.TableGeneration() != generation) {
+		for (const auto& [slot, slot_generation]: m_diff_slots) {
+			const auto& info = bindless.GetTableSlot(binding, slot);
+			if (!info.live || info.generation != slot_generation) return fail(6);
+		}
+	}
+	m_table_old_slots.assign(table.slots.begin(), table.slots.end());
+	table.slots.swap(m_diff_slots);
+	bindless.UpdateTableOwners(table, m_table_old_slots, m_table_stamp, true);
+	table.dead_list.clear();
+	table.src_frame       = frame;
+	table.covered         = covered;
+	table.hash            = hash;
+	table.translated_tick = m_context.GetCommandScheduler().CurrentTick();
+	if (bindless.TableSlotsAliveFast(table)) table.generation = bindless.TableGeneration();
+	if (table.fast_list && table.refreshed_frame != 0) {
+		// A listed table (differential tables step 2; 7.11 town walk: 4,702 checked full refreshes, 209 million slots, none left due
+		// and none GPU-written off the list; +1.5% fps, two live A/B runs): the slots it took are refreshed at the next
+		// refresh (RefreshTableSlots, as the full pass after a translation refreshes them) and the slots that left go from
+		// the table's lists (the full pass rebuilds both lists from the table's slots, stamped by this translation).
+		for (const uint32_t slot: m_diff_new) table.diff_new_slots.emplace_back(slot, bindless.GetTableSlot(binding, slot).generation);
+		const auto left = [&](const std::pair<uint32_t, uint32_t>& e) {
+			const auto& info = bindless.GetTableSlot(binding, e.first);
+			return info.stamp != m_table_stamp || info.generation != e.second;
+		};
+		std::erase_if(table.fast_slots, left);
+		std::erase_if(table.gpu_slots, left);
+	} else {
+		table.refreshed_frame = 0; // its slots are looked up and its images listed before the draw
+	}
+	stats.translated++;
+	const bool stored = bindless.StoreTableRegion(table);
+	if (!stored) {
+		table.hash         = 0;
+		table.checked_tick = 0;
+	}
+	if (timed)
+		stats.translate_ns += static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+	return stored ? 1 : 0;
+}
+
+bool RenderExecutor::TranslateBindlessTableFull(BindlessTable::Table& table, uint32_t covered, uint64_t hash,
+                                                uint64_t frame, uint64_t shader_hash) {
 	auto&          bindless = m_context.GetBindlessTable();
+	const bool     large    = covered > TableMaxBytes; // its entries are listed for the difference translation
 	auto&          stats    = bindless.GetTableStats();
 	const bool     timed    = PerfEnabled();
 	const auto     start    = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
@@ -2943,6 +3171,8 @@ bool RenderExecutor::TranslateBindlessTable(BindlessTable::Table& table, uint32_
 		if (++m_table_stamp == 0u) m_table_stamp = 1u;
 		table.values.assign(entries, unnamed);
 		table.slots.clear();
+		table.diff_entries.clear();
+		table.diff_fields.clear();
 		if (classes) table.field_tallies.assign(table.fields.size(), {});
 		descriptors  = 0;
 		placeholders = 0;
@@ -2979,6 +3209,10 @@ bool RenderExecutor::TranslateBindlessTable(BindlessTable::Table& table, uint32_
 					slot = ResolveTableDescriptor(table, words, frame);
 				}
 				table.values[entry] = slot;
+				if (large) {
+					table.diff_entries.push_back(entry);
+					table.diff_fields.push_back(static_cast<uint16_t>(index));
+				}
 				stats.fields++;
 				descriptors++;
 				if (bindless.IsPlaceholderSlot(slot)) {
@@ -2999,11 +3233,21 @@ bool RenderExecutor::TranslateBindlessTable(BindlessTable::Table& table, uint32_
 	if (bindless.SlotOwnersOn()) bindless.UpdateTableOwners(table, m_table_old_slots, m_table_stamp);
 	// The source for the next translation (the larger one wins within two frames, so a table that alternates between two
 	// sizes keeps the large one).
+	bool src_taken = false;
 	if (covered >= table.src_covered || table.src_frame + 2u <= frame) {
 		table.src_words.assign(m_table_words.begin(), m_table_words.begin() + entries);
 		table.src_values  = table.values;
 		table.src_covered = covered;
 		table.src_frame   = frame;
+		src_taken         = true;
+	}
+	// The next translation may go by difference from this one.
+	table.diff_ready     = large && src_taken && table.fields.size() < 65536u;
+	table.diff_signature = TableFieldsSignature(table);
+	table.dead_list.clear();
+	if (!large) {
+		table.diff_entries.clear();
+		table.diff_fields.clear();
 	}
 	const uint64_t translations = g_ttd_translations.fetch_add(1, std::memory_order_relaxed) + 1u;
 	g_ttd_entries.fetch_add(entries, std::memory_order_relaxed);
@@ -3181,8 +3425,8 @@ void RenderExecutor::ListTableImagesByEvents(BindlessTable::Table& table, std::v
 		if (!table.walked || table.walked_hash != table.images_hash || table.layout_log_pos < log.base) {
 			// The set changed (or the log was trimmed past this table): every image once.
 			list.insert(list.end(), table.images.begin(), table.images.end());
-			table.image_set.clear();
-			for (const auto id: table.images) table.image_set.insert(key(id));
+			table.image_set.Clear(table.images.size());
+			for (const auto id: table.images) table.image_set.Insert(key(id));
 			table.unwatched.assign(table.images.begin(), table.images.end());
 			table.walked         = true;
 			table.walked_hash    = table.images_hash;
@@ -3192,7 +3436,7 @@ void RenderExecutor::ListTableImagesByEvents(BindlessTable::Table& table, std::v
 		}
 		for (uint64_t pos = table.layout_log_pos; pos < end; pos++) {
 			const auto id = log.ids[pos - log.base];
-			if (table.image_set.contains(key(id))) list.push_back(id);
+			if (table.image_set.Contains(key(id))) list.push_back(id);
 		}
 		table.layout_log_pos = end;
 	}
@@ -3247,7 +3491,7 @@ void RenderExecutor::RefreshTableSlots(BindlessTable::Table& table, uint64_t fra
 	const bool list_gpu    = full || table.gpu_epoch != bindless.TableGpuEpoch();
 	// The slot journal: the images again only when one of its own slots changed image or died.
 	const bool list_images = table.images_dirty;
-	if (!list_gpu && !list_images && table.gpu_slots.empty()) return;
+	if (!list_gpu && !list_images && table.gpu_slots.empty() && table.diff_new_slots.empty()) return;
 	const bool timed    = PerfEnabled();
 	const auto start    = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 	bool       remapped = false;
@@ -3297,6 +3541,41 @@ void RenderExecutor::RefreshTableSlots(BindlessTable::Table& table, uint64_t fra
 		stats.refresh_event_skips++;
 		return true;
 	};
+	// differential tables step 2: the slots the last difference translation took, each as the full pass after a
+	// translation handles it (due unless refreshed in this frame; the trusted skip, else the check, else a refresh; a
+	// skipped one is touched), then on the table's lists as that pass lists them.
+	m_diff_touch.clear();
+	if (!table.diff_new_slots.empty()) {
+		for (const auto& [slot, generation]: table.diff_new_slots) {
+			auto& info = bindless.GetTableSlot(table.view.binding, slot);
+			if (!info.live || info.generation != generation) continue;
+			if (info.refreshed_frame != frame) {
+				if (g_table_slot_journal_pending.load(std::memory_order_acquire)) bindless.DrainSlotJournal();
+				bool skipped = true;
+				if (!trusted(info, generation)) {
+					stats.journal_checked++;
+					if (!unchanged(info, generation)) {
+						remapped = refresh_slot(slot) || remapped;
+						skipped  = false;
+					} else {
+						info.journal_named = false;
+					}
+				}
+				if (skipped) {
+					info.refreshed_frame = frame;
+					info.refreshed_draw  = m_bindless_draw;
+					stats.refresh_event_skips++;
+					m_diff_touch.push_back(info.image);
+				}
+			}
+			if (!info.live || info.generation != generation) continue;
+			if (!trusted(info, generation)) table.fast_slots.emplace_back(slot, generation);
+			const std::pair<uint32_t, uint32_t> entry {slot, generation};
+			if (info.gpu_written && std::find(table.gpu_slots.begin(), table.gpu_slots.end(), entry) == table.gpu_slots.end())
+				table.gpu_slots.push_back(entry);
+		}
+		table.diff_new_slots.clear();
+	}
 	if (list_gpu && on_list) {
 		// The list and the GPU-written slots; the slots the list path leaves alone get no touch (FastTouchKeeps).
 		const auto     loop_start = large_timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
@@ -3407,6 +3686,11 @@ void RenderExecutor::RefreshTableSlots(BindlessTable::Table& table, uint64_t fra
 			stats.large_list_ns += large_since(list_start);
 			stats.large_lists++;
 		}
+	}
+	if (!m_diff_touch.empty()) {
+		batch.Release(); // it holds the cache's lock; the touches take it themselves
+		texture_cache.TouchTableImages(m_diff_touch);
+		m_diff_touch.clear();
 	}
 	if (timed)
 		bindless.GetTableStats().refresh_ns += static_cast<uint64_t>(
@@ -3576,7 +3860,16 @@ struct ImageReplaySlot {
 	std::array<uint32_t, 8> words {};
 	ImageId                 id;
 	TextureCache::ImageDesc desc;
+	// Project 15 S2b (diagnostic): why the last resolve kept no entry (0 kept; 1 not a sampled texture; 2 not plain with
+	// metadata in the description; 3 not plain otherwise; 4 + ImageReplayableWhy - 1 (4 gone, 5 depth, 6 stencil,
+	// 7 metadata, 8 one byte); 9 the registry moved during the resolve).
+	uint8_t why = 0;
 };
+// The image replay slots of this thread (ResolveTextureReplay; project 15 S2b peeks them without inserting).
+std::unordered_map<uint64_t, ImageReplaySlot>& ImageReplaySlots() {
+	static thread_local std::unordered_map<uint64_t, ImageReplaySlot> slots;
+	return slots;
+}
 } // namespace
 
 // The table sets: whether the last image binding of this thread is one a stage set may stand for (an image
@@ -3587,8 +3880,7 @@ template <typename Resolve>
 static TextureBinding ResolveTextureReplay(TextureCache& cache, bool soft, const ShaderRecompiler::IR::CompiledShaderInfo& program,
                                            uint32_t slot, const ShaderRecompiler::IR::DescriptorValue& value,
                                            uint32_t compare_funcs, Resolve&& resolve) {
-	static thread_local std::unordered_map<uint64_t, ImageReplaySlot> slots;
-	auto&      memo = slots[reinterpret_cast<uint64_t>(&program) * 64u + slot];
+	auto&      memo = ImageReplaySlots()[reinterpret_cast<uint64_t>(&program) * 64u + slot];
 	const bool same = memo.valid && memo.shader_hash == program.shader_hash && memo.dword_count == value.dword_count &&
 	                  memo.words == value.dwords && memo.compare_funcs == compare_funcs && memo.soft == soft &&
 	                  memo.page_sum == DrawRepeat::ImagePageEpochSum(memo.desc.info.data.address, memo.desc.info.data.size);
@@ -3600,11 +3892,18 @@ static TextureBinding ResolveTextureReplay(TextureCache& cache, bool soft, const
 	}
 	const auto epoch = DrawRepeat::g_image_registry_epoch.load(std::memory_order_acquire);
 	(void)TextureCache::TakeLastFindImagePlain();
+	t_stencil_tail     = false;
 	auto       binding = resolve();
 	const bool plain   = TextureCache::TakeLastFindImagePlain();
 	memo.valid         = false;
-	g_slot_exact       = plain && binding.desc.type == TextureCache::BindingType::Texture && cache.ImageReplayable(binding.image_id);
-	if (plain && binding.desc.type == TextureCache::BindingType::Texture && cache.ImageReplayable(binding.image_id)) {
+	// A one-byte texture whose resolve ran a stencil tail (a plane reader or an association) stays out of the replay.
+	const bool replayable = cache.ImageReplayableTexture(binding.image_id) && !t_stencil_tail;
+	g_slot_exact       = plain && binding.desc.type == TextureCache::BindingType::Texture && replayable;
+	memo.why           = binding.desc.type != TextureCache::BindingType::Texture ? 1u
+	                     : !plain ? (binding.desc.info.metadata.kind != ImageMetadataKind::None ? 2u : 3u)
+	                              : static_cast<uint8_t>(cache.ImageReplayable(binding.image_id) ? 9u : 3u + cache.ImageReplayableWhy(binding.image_id));
+	if (memo.why == 8u && t_stencil_tail) memo.why = 10u; // a one-byte stencil reader (n3-s2b-one-byte.md)
+	if (plain && binding.desc.type == TextureCache::BindingType::Texture && replayable) {
 		const auto page_sum = DrawRepeat::ImagePageEpochSum(binding.desc.info.data.address, binding.desc.info.data.size);
 		if (DrawRepeat::g_image_registry_epoch.load(std::memory_order_acquire) == epoch) {
 			memo.valid         = true;
@@ -3616,6 +3915,7 @@ static TextureBinding ResolveTextureReplay(TextureCache& cache, bool soft, const
 			memo.words         = value.dwords;
 			memo.id            = binding.image_id;
 			memo.desc          = binding.desc;
+			memo.why           = 0;
 		}
 	}
 	return binding;
@@ -3798,6 +4098,27 @@ static uint64_t TableSetSnapshotHash(const ShaderRecompiler::IR::CompiledShaderI
 static size_t TableSetFindHashed(const ShaderRecompiler::IR::CompiledShaderInfo& program,
                                  const ShaderRecompiler::IR::ResourceSnapshot& snapshot, bool soft, const TableSetList& list) {
 	if (list.empty()) return list.size();
+	// 11.11 night batch 3 (the only path): the first set (the last one found) is tried before the hash; the
+	// first match in list order is index 0 when it matches, so the answer is the same. KYTY_CHECK_BATCH3=2: both, compared.
+	static const int batch3 = [] {
+		const char* check = std::getenv("KYTY_CHECK_BATCH3");
+		if (check != nullptr && check[0] == '2') return 2;
+		return 1; // the only path (walk ABBA 11.11: +1.5%, with the BDA read memo)
+	}();
+	if (batch3 != 0 && TableSetMatches(program, snapshot, soft, list[0]->words)) {
+		if (batch3 == 1) return 0;
+		const uint64_t h = TableSetSnapshotHash(program, snapshot, soft);
+		size_t         k = 0;
+		while (k < list.size() && !(list[k]->key_hash == h && TableSetMatches(program, snapshot, soft, list[k]->words))) k++;
+		static uint64_t compared = 0, bad = 0;
+		compared++;
+		if (k != 0 && ++bad <= 8u) std::fprintf(stderr, "CHECK_BATCH3 table set bad (index %zu)\n", k);
+		if ((compared & 0xfffffu) == 0u) {
+			std::fprintf(stderr, "PERF batch3_table_check compared=%llu bad=%llu\n", static_cast<unsigned long long>(compared),
+			             static_cast<unsigned long long>(bad));
+		}
+		return 0;
+	}
 	const uint64_t hash = TableSetSnapshotHash(program, snapshot, soft);
 	for (size_t k = 0; k < list.size(); k++) {
 		if (list[k]->key_hash == hash && TableSetMatches(program, snapshot, soft, list[k]->words)) return k;
@@ -3900,8 +4221,282 @@ void Report() {
 }
 } // namespace BindReplay
 
+// Project 15 S2b (KYTY_CHECK_PEEK=2, diagnostic): a stage's image bindings and samplers answered without a write before
+// PrepareBindings, compared with what RebindImages leaves (execution thread).
+namespace PeekImages {
+enum Slot : uint8_t { SetSlot, Replay, NotTexture, ReplayMiss, ViewMissing, NullImage, Count };
+struct Stage: PeekStageImagesResult {
+	bool                  has_ahead      = false; // N4.1: the peek made for this stage when the chunk opened
+	uint32_t              ahead_distance = 0;
+	PeekStageImagesResult ahead;
+};
+struct Stats {
+	std::array<uint64_t, Count> slots {};
+	// replay_miss by cause: 0 no entry, 1-9 the entry's why, 10 other words or compare functions, 11 page sum, 12 image
+	// gone, 13 a one-byte stencil reader (out of one_byte, index 8)
+	std::array<uint64_t, 14>    miss {}, member_miss {};
+	uint64_t stages = 0, all_slots = 0, samplers = 0, answered = 0, member_stages = 0, member_answered = 0;
+	uint64_t compared = 0, bad = 0, moved = 0, stale_ready = 0, sampler_bad = 0, unchecked = 0, injected = 0, detected = 0;
+	uint32_t logged = 0;
+};
+Stats g_stats;
+std::unordered_map<const void*, Stage>& Pending() {
+	static std::unordered_map<const void*, Stage> pending; // execution thread
+	return pending;
+}
+bool Check() {
+	static const bool on = [] {
+		const char* env = std::getenv("KYTY_CHECK_PEEK");
+		return env != nullptr && env[0] == '2';
+	}();
+	return on;
+}
+uint64_t FaultEvery() {
+	static const uint64_t every = [] {
+		const char* env = std::getenv("KYTY_CHECK_PEEK_FAULT");
+		return env != nullptr ? std::strtoull(env, nullptr, 10) : 0u;
+	}();
+	return every;
+}
+void Report() {
+	auto& st = g_stats;
+	if ((st.stages & ((1u << 18u) - 1u)) != 0) return;
+	std::string slots;
+	for (size_t i = 0; i < st.slots.size(); i++) slots += std::string(i == 0 ? "" : "|") + std::to_string(st.slots[i]);
+	std::fprintf(stderr,
+	             "PERF peek_images stages=%llu all_slots=%llu samplers=%llu answered=%llu member[stages|answered]=%llu|%llu "
+	             "slots[set|replay|not_texture|replay_miss|view_missing|null]=%s compared=%llu bad=%llu moved=%llu stale_ready=%llu sampler_bad=%llu "
+	             "unchecked=%llu fault[injected|detected]=%llu|%llu\n",
+	             static_cast<unsigned long long>(st.stages), static_cast<unsigned long long>(st.all_slots),
+	             static_cast<unsigned long long>(st.samplers), static_cast<unsigned long long>(st.answered),
+	             static_cast<unsigned long long>(st.member_stages), static_cast<unsigned long long>(st.member_answered), slots.c_str(),
+	             static_cast<unsigned long long>(st.compared), static_cast<unsigned long long>(st.bad),
+	             static_cast<unsigned long long>(st.moved), static_cast<unsigned long long>(st.stale_ready),
+	             static_cast<unsigned long long>(st.sampler_bad),
+	             static_cast<unsigned long long>(st.unchecked), static_cast<unsigned long long>(st.injected),
+	             static_cast<unsigned long long>(st.detected));
+	const auto join = [](const auto& a) {
+		std::string out;
+		for (size_t i = 0; i < a.size(); i++) out += std::string(i == 0 ? "" : "|") + std::to_string(a[i]);
+		return out;
+	};
+	std::fprintf(stderr,
+	             "PERF peek_images_miss[none|not_texture|meta_desc|not_plain|gone|depth|stencil|metadata|one_byte|moved|words|pages|"
+	             "image_gone|one_byte_stencil_reader]=%s member=%s\n",
+	             join(st.miss).c_str(), join(st.member_miss).c_str());
+}
+vk::ImageView Shifted(vk::ImageView view) {
+	return vk::ImageView(reinterpret_cast<VkImageView>(reinterpret_cast<uintptr_t>(static_cast<VkImageView>(view)) + 1u));
+}
+} // namespace PeekImages
+
+// Project 15 N4.2b: the plan entries of a stage's read buffer bindings and read record-keyed ranges, from the resolve's
+// record (no V# decoded: a binding whose source is not in the record has no entry) and PeekBuffer.
+void RenderExecutor::PeekStageBuffers(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                                      const ShaderRecompiler::IR::ResourceSnapshot& snapshot, const StageF::ResolveRecord* record,
+                                      uint32_t distance, std::vector<PlanBuffer>& out) {
+	auto& cache = m_context.GetBufferCache();
+	// N5.1: off the execution thread the registry is read under the lookup lock, tried (busy: no entries).
+	const bool helper = !GuestGpu::IsGpuThread();
+	if (helper && !cache.TryLockLookupSpin()) {
+		t_ahead_helper.lookup_busy++; // (a helper's own row, PERF helper_plan_outcome)
+		return;
+	}
+	struct Unlock {
+		BufferCache* cache;
+		~Unlock() {
+			if (cache != nullptr) cache->UnlockLookup();
+		}
+	} const unlock {helper ? &cache : nullptr};
+	for (uint32_t index = 0; !t_peek_slim && index < snapshot.indirect_ranges.size(); index++) {
+		const auto& range = snapshot.indirect_ranges[index];
+		if (range.written) continue;
+		const auto* ahead = StageF::RangeSourceAhead(record, index, range, false);
+		if (ahead == nullptr || ahead->size == 0u) continue;
+		auto& entry    = out.emplace_back();
+		entry.vaddr    = range.address;
+		entry.size     = ahead->size;
+		entry.bda      = true;
+		entry.kind     = 1;
+		entry.distance = distance;
+		entry.peek     = cache.PeekBuffer(range.address, ahead->size, false, false, ahead->id, true);
+	}
+	for (uint32_t resource = 0; resource < program.info.buffers.size(); ++resource) {
+		const auto& metadata = program.info.buffers[resource];
+		if (metadata.descriptor_index == UINT32_MAX || metadata.written) continue;
+		const auto* ahead = StageF::BufferSourceAhead(record, resource, snapshot.buffers[resource], false, false);
+		if (ahead == nullptr || ahead->address == 0 || ahead->size == 0) continue;
+		const bool texel = metadata.formatted || (metadata.read && Config::SyncRawImageBuffersEnabled());
+		auto&      entry = out.emplace_back();
+		entry.vaddr      = ahead->address;
+		entry.size       = ahead->size;
+		entry.texel      = texel;
+		entry.kind       = 0;
+		entry.distance   = distance;
+		entry.peek       = cache.PeekBuffer(ahead->address, ahead->size, false, texel, ahead->id);
+		// P1: the binding RebindBuffers would compute (StorageBufferRange without its EXIT: a limit off - not ready, today's
+		// path meets it - and the record stride)
+		entry.program           = &program;
+		entry.resource          = resource;
+		entry.source_id         = ahead->id; // (P1.2)
+		entry.source_epoch      = ahead->buffer_epoch;
+		entry.ranges_generation = ahead->ranges_generation;
+		if ((entry.peek.klass == BufferCache::BufferPeek::Ready || entry.peek.klass == BufferCache::BufferPeek::Direct) && entry.peek.handle) {
+			const auto& graphics       = m_context.GetGraphics();
+			const auto  alignment      = graphics.StorageMinAlignment();
+			const auto  max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
+			const auto  offset         = entry.peek.offset;
+			const auto  aligned_offset = Common::AlignDown(offset, alignment);
+			const auto  adjustment     = offset - aligned_offset;
+			if (entry.size <= max_range && adjustment < 256 && entry.size <= max_range - adjustment) {
+				const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[resource]);
+				entry.ready           = true;
+				entry.bind_offset     = aligned_offset;
+				entry.bind_range      = entry.size + adjustment;
+				entry.memory_offset   = static_cast<uint32_t>(adjustment);
+				entry.stride          = descriptor.Type() == 0u ? descriptor.Stride() : 0u;
+			}
+		}
+	}
+}
+
+// Project 15 S2b: a stage's images and samplers without a write (no set moved, no replay slot inserted, no view created,
+// no touch), under the cache's read section and inside the translator section. N4.1 calls it for draws ahead too
+// (count false: today's statistics and the operation's plan are left alone).
+bool RenderExecutor::PeekStageImages(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                                     const ShaderRecompiler::IR::ResourceSnapshot& snapshot, bool soft, PeekStageImagesResult& peek,
+                                     bool count) {
+	++t_translator;
+	auto&       cache = m_context.GetTextureCache();
+	cache.LockPeekRead();
+	PeekImages::Stats  scratch;
+	auto&       st    = count ? PeekImages::g_stats : scratch;
+	const auto  slot_count = program.info.images.size();
+	peek.pending  = true;
+	peek.epoch    = DrawRepeat::g_image_registry_epoch.load(std::memory_order_acquire);
+	peek.klass.assign(slot_count, PeekImages::ReplayMiss);
+	peek.stale.assign(slot_count, 0u);
+	peek.ids.assign(slot_count, ImageId {});
+	peek.views.assign(slot_count, nullptr);
+	peek.mips.assign(slot_count, {});
+	const TableSet* set = nullptr;
+	if ((!program.info.images.empty() || !program.info.samplers.empty()) && TableSetsUsable()) {
+		const auto& sets = TableSets();
+		if (const auto it = sets.find(&program); it != sets.end()) {
+			const auto& list  = it->second;
+			const size_t found = TableSetFindHashed(program, snapshot, soft, list);
+			const TableSet* candidate = found < list.size() ? list[found].get() : nullptr;
+			if (candidate != nullptr && candidate->views_ready) {
+				bool   pages  = true;
+				size_t member = 0;
+				for (size_t i = 0; i < candidate->images.size() && pages; i++) {
+					if (candidate->memo[i] == 0u) continue;
+					const auto& data = candidate->images[i].desc.info.data;
+					pages = DrawRepeat::ImagePageEpochSum(data.address, data.size) == candidate->page_sums[member++];
+				}
+				if (pages && cache.TableReplayStageChecks(candidate->member_ids) &&
+				    cache.TableTexturesReadyChecks(candidate->member_ids)) {
+					set = candidate;
+				}
+			}
+		}
+	}
+	if (t_peek_slim && !count) {
+		// N5.0, the slim builder: the plan needs the set's identity only (the commit proves pages and readiness).
+		peek.set_version       = set != nullptr ? set->version : 0u;
+		peek.samplers_answered = set != nullptr || program.info.samplers.empty();
+		cache.UnlockPeekRead();
+		--t_translator;
+		return set != nullptr;
+	}
+	bool all = true;
+	for (uint32_t i = 0; i < slot_count; i++) {
+		auto& klass = peek.klass[i];
+		if (set != nullptr && set->memo[i] != 0u) {
+			klass         = PeekImages::SetSlot;
+			peek.ids[i]   = set->images[i].image_id;
+			peek.views[i] = set->images[i].image_view;
+			peek.mips[i]  = set->images[i].mip_views;
+			st.slots[klass]++;
+			continue;
+		}
+		const uint32_t compare_funcs = ImageCompareFuncs(program, snapshot, i);
+		const auto&    slots         = ImageReplaySlots();
+		const auto     it            = slots.find(reinterpret_cast<uint64_t>(&program) * 64u + i);
+		const auto&    value         = snapshot.images[i];
+		const bool     same = it != slots.end() && it->second.valid && it->second.shader_hash == program.shader_hash &&
+		                  it->second.dword_count == value.dword_count && it->second.words == value.dwords &&
+		                  it->second.compare_funcs == compare_funcs && it->second.soft == soft &&
+		                  it->second.page_sum == DrawRepeat::ImagePageEpochSum(it->second.desc.info.data.address, it->second.desc.info.data.size);
+		const ImageId id = same ? cache.ReplayImageCheck(it->second.id) : ImageId {};
+		if (!id) {
+			klass = PeekImages::ReplayMiss;
+			uint32_t cause = 12;
+			if (it == slots.end()) {
+				cause = 0;
+			} else if (!it->second.valid) {
+				cause = it->second.why == 10u ? 13u : std::min<uint32_t>(it->second.why, 9u);
+			} else if (it->second.shader_hash != program.shader_hash || it->second.dword_count != value.dword_count ||
+			           it->second.words != value.dwords || it->second.compare_funcs != compare_funcs ||
+			           it->second.soft != soft) {
+				cause = 10;
+			} else if (!same) {
+				cause = 11;
+			}
+			st.miss[cause]++;
+			if (count && t_peek_member == 1) st.member_miss[cause]++;
+		} else if (it->second.desc.type != TextureCache::BindingType::Texture) {
+			klass = PeekImages::NotTexture;
+		} else if (it->second.desc.info.data.Empty()) {
+			klass = PeekImages::NullImage;
+		} else {
+			const auto& desc     = it->second.desc;
+			const auto& resource = program.info.images[i];
+			bool        views    = true;
+			if (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::Dynamic) {
+				views = resource.mip_count != 0u && resource.mip_count == desc.view_info.level_count;
+				for (uint32_t mip = 0; views && mip < resource.mip_count; mip++) {
+					auto mip_desc = desc;
+					mip_desc.view_info.base_level += mip;
+					mip_desc.view_info.level_count = 1;
+					mip_desc.view_info.min_lod     = 0;
+					const auto view = cache.PeekTextureView(id, mip_desc);
+					views           = static_cast<bool>(view);
+					peek.mips[i].push_back(view);
+				}
+				if (views) peek.views[i] = peek.mips[i].front();
+			} else {
+				peek.views[i] = cache.PeekTextureView(id, desc);
+				views         = static_cast<bool>(peek.views[i]);
+			}
+			klass       = views ? PeekImages::Replay : PeekImages::ViewMissing;
+			peek.ids[i] = id;
+		}
+		all = all && klass == PeekImages::Replay;
+		st.slots[klass]++;
+	}
+	peek.samplers_answered = set != nullptr || program.info.samplers.empty();
+	peek.set_version       = set != nullptr ? set->version : 0u;
+	if (set != nullptr) peek.samplers = set->samplers;
+	cache.UnlockPeekRead();
+	--t_translator;
+	st.stages++;
+	if (all) st.all_slots++;
+	if (peek.samplers_answered) st.samplers++;
+	const bool answered = all && peek.samplers_answered;
+	if (answered) st.answered++;
+	if (count && t_peek_member == 1) {
+		st.member_stages++;
+		if (answered) st.member_answered++;
+		if (!answered) t_peek_markers++; // an image stage in order (the operation's plan)
+	}
+	if (count) PeekImages::Report();
+	return answered;
+}
+
 void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
                                      PreparedBindings& prepared) {
+	const ChunkLead::FloorTimer floor_stage_bind(ChunkLead::FpStageBind); // KYTY_TRACE_PEEK_CENSUS (way B W0 A5)
 	if (!BindReplay::On() || !GuestGpu::IsGpuThread() || !runtime.resources->indirect_ranges.empty()) {
 		if (BindReplay::On()) BindReplay::GetStats().skipped++;
 		PrepareBindingsToday(runtime, prepared);
@@ -3939,8 +4534,8 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 			if (snapshot.bindless_heaps.empty() || !m_context.GetBindlessTable().Enabled()) {
 				PrepareBindlessHeaps(runtime, prepared);
 			} else {
-				auto&           bindless_table = m_context.GetBindlessTable();
-				std::lock_guard binder_lock(bindless_table.BinderMutex());
+				auto&            bindless_table = m_context.GetBindlessTable();
+				const BinderLock binder_lock(bindless_table.BinderMutex());
 				PrepareBindlessHeaps(runtime, prepared);
 			}
 			BindReplay::Report();
@@ -3960,6 +4555,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 
 void RenderExecutor::PrepareBindingsToday(const ShaderStageRuntime& runtime,
                                           PreparedBindings& prepared) {
+	const Common::SlowFrame::Scope slow_frame_scope(Common::SlowFrame::PrepToday); // KYTY_TRACE_SLOW_FRAMES
 	BindSplit bind_split; // KYTY_TRACE_LONG_PREP
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(!runtime);
@@ -4006,12 +4602,15 @@ void RenderExecutor::PrepareBindingsToday(const ShaderStageRuntime& runtime,
 	static thread_local std::vector<uint8_t> table_exact;
 	table_exact.assign(program.info.images.size(), 0u);
 	const auto table_loop_epoch = DrawRepeat::g_image_registry_epoch.load(std::memory_order_acquire);
+	PeekImages::Stage* peek_entry = nullptr; // KYTY_CHECK_PEEK=2 (S2b): this stage's peek
 	// One image binding of today's path (for the slots a table set does not serve).
 	const auto prepare_image_slot = [&](uint32_t i) {
+		const uint64_t slow0 = t_peek_slow;
 		DebugDepthStorageNulled() = false;
 		KYTY_PROFILER_BLOCK("PrepareBindings::Image");
 		const uint32_t compare_funcs = ImageCompareFuncs(program, snapshot, i);
 		const auto     resolve       = [&] {
+			t_peek_slow++; // KYTY_CHECK_PEEK=2 (S2b): the full image search
 			return ResolveTexture(program.info.images[i], snapshot.images[i], compare_funcs);
 		};
 		TextureBinding binding = ResolveTextureReplay(m_context.GetTextureCache(), m_soft_texture_resolve, program, i,
@@ -4033,7 +4632,18 @@ void RenderExecutor::PrepareBindingsToday(const ShaderStageRuntime& runtime,
 		binding.mip_views.swap(prepared.images[i].mip_views);
 		binding.mip_views.clear();
 		prepared.images[i] = std::move(binding);
+		if (peek_entry != nullptr && t_peek_slow != slow0 && i < peek_entry->stale.size()) peek_entry->stale[i] = 1u;
 	};
+	if (PeekImages::Check() && GuestGpu::IsGpuThread()) {
+		// KYTY_CHECK_PEEK=2 (S2b): the stage's images and samplers without a write (no set moved, no replay slot inserted,
+		// no view created, no touch).
+		auto& peek = PeekImages::Pending()[&prepared];
+		peek_entry = &peek;
+		peek       = {};
+		(void)PeekStageImages(program, snapshot, m_soft_texture_resolve, peek, true);
+		// N4.1: the peek made for this stage ahead, when the chunk opened (its program: the predicted one).
+		peek.has_ahead = TakeAheadImages(&program, peek.ahead, peek.ahead_distance);
+	}
 	// The stage's table set and its PrepareBindings proof.
 	const bool table_sets = (!program.info.images.empty() || !program.info.samplers.empty()) && TableSetsUsable();
 	TableSet* table_set = nullptr; // the set stored under this stage's key
@@ -4046,7 +4656,18 @@ void RenderExecutor::PrepareBindingsToday(const ShaderStageRuntime& runtime,
 		TableStats().stages++;
 		table_list = &TableSetListCached(&program);
 		auto&        list  = *table_list;
-		const size_t found = TableSetFindHashed(program, snapshot, m_soft_texture_resolve, list);
+		// N4.2a: a plan names its set by version (unique per store; equal words while it lives), found without the hash.
+		size_t found = list.size();
+		if (m_plan_set_version != 0) {
+			for (size_t k = 0; k < list.size(); k++) {
+				if (list[k]->version == m_plan_set_version) {
+					found = k;
+					break;
+				}
+			}
+			(found < list.size() ? g_ahead.set_hint : g_ahead.set_hint_missed)++;
+		}
+		if (found == list.size()) found = TableSetFindHashed(program, snapshot, m_soft_texture_resolve, list);
 		if (found < list.size()) {
 			if (found != 0u) std::swap(list[0], list[found]); // the last found first (sets stay where they are)
 			table_set = list[0].get();
@@ -4141,7 +4762,7 @@ void RenderExecutor::PrepareBindingsToday(const ShaderStageRuntime& runtime,
 				for (size_t i = 0; i < prepared.images.size(); i++) {
 					const auto& binding = prepared.images[i];
 					const bool  memo    = table_exact[i] != 0u && binding.desc.type == TextureCache::BindingType::Texture &&
-					                  (binding.desc.info.data.Empty() || cache.ImageReplayable(binding.image_id));
+					                  (binding.desc.info.data.Empty() || cache.ImageReplayableTexture(binding.image_id));
 					if (!memo) continue;
 					table_set->memo[i] = 1u;
 					table_set->page_sums.push_back(
@@ -4166,8 +4787,8 @@ void RenderExecutor::PrepareBindingsToday(const ShaderStageRuntime& runtime,
 		PrepareBindlessHeaps(runtime, prepared);
 	} else {
 		KYTY_PROFILER_BLOCK("PrepareBindings::Bindless");
-		auto&           bindless_table = m_context.GetBindlessTable();
-		std::lock_guard binder_lock(bindless_table.BinderMutex());
+		auto&            bindless_table = m_context.GetBindlessTable();
+		const BinderLock binder_lock(bindless_table.BinderMutex());
 		const DispatchSubTimer heaps_timer(DispatchSub::BindlessHeaps); // KYTY_TRACE_DISPATCH_CENSUS
 		PrepareBindlessHeaps(runtime, prepared);
 	}
@@ -4224,7 +4845,30 @@ static std::optional<std::pair<uint64_t, uint64_t>> VSharpRange(RenderContext&  
 	return std::pair {address, size};
 }
 
+// Project 15 way B P1.2 (KYTY_CHECK_PLAN_BUFFERS=2): an entry's source against today's (address, size, buffer id).
+static void PlanSourceCheck(const PlanBuffer& entry, const PreparedBindings::BufferSource& today) {
+	static uint64_t compared = 0, bad = 0, logged = 0;
+	static auto     window   = std::chrono::steady_clock::now();
+	compared++;
+	if (entry.vaddr != today.address || entry.size != today.size || entry.source_id != today.id) {
+		bad++;
+		if (logged++ < 16u) {
+			std::fprintf(stderr, "CHECK_PLAN_SOURCE bad addr=%llx/%llx size=%llx/%llx id=%u/%u\n",
+			             static_cast<unsigned long long>(entry.vaddr), static_cast<unsigned long long>(today.address),
+			             static_cast<unsigned long long>(entry.size), static_cast<unsigned long long>(today.size),
+			             static_cast<uint32_t>(entry.source_id.index), static_cast<uint32_t>(today.id.index));
+		}
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (now - window < std::chrono::seconds(5)) return;
+	window = now;
+	std::fprintf(stderr, "PERF plan_source_check compared=%llu bad=%llu\n", static_cast<unsigned long long>(compared),
+	             static_cast<unsigned long long>(bad));
+}
+
 void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
+	const Common::SlowFrame::Scope slow_frame_scope(Common::SlowFrame::FindBuf); // KYTY_TRACE_SLOW_FRAMES
+	const ChunkLead::FloorTimer floor_find(ChunkLead::FpFindBuffers); // KYTY_TRACE_PEEK_CENSUS (W3 P0)
 	KYTY_PROFILER_FUNCTION();
 	auto& cache = m_context.GetBufferCache();
 	// Each storage-buffer binding's memo entry is fetched now, for the ObtainBuffer of this stage's RebindBuffers (once per call).
@@ -4289,19 +4933,38 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 		}
 		const auto& layout = program.bindings;
 		prepared.buffer_sources.resize(layout.BufferBindings());
+		prepared.plan_entries.assign(layout.BufferBindings(), nullptr);
 		if (layout.BufferBindings() == 0) {
 			continue;
 		}
+		// P1.2: a read-only binding with a plan entry whose record source still holds (the
+		// registry and the virtual ranges unchanged - BufferSourceHolds' checks; the helper checked the words on the same
+		// record) takes its source from the entry; KYTY_CHECK_PLAN_BUFFERS=2 compares it with today's source.
 		for (uint32_t resource = 0; resource < program.info.buffers.size(); ++resource) {
 			const auto& metadata = program.info.buffers[resource];
 			if (metadata.descriptor_index == UINT32_MAX) continue;
 			auto& source = prepared.buffer_sources[metadata.descriptor_index];
+			PlanBuffer* plan_entry = nullptr;
+			if (!metadata.written) {
+				plan_entry = BufferCache::PlanStageEntry(&program, resource);
+				if (plan_entry != nullptr &&
+				    (plan_entry->source_epoch != DrawRepeat::g_buffer_registry_epoch.load(std::memory_order_relaxed) ||
+				     plan_entry->ranges_generation != Libs::LibKernel::Memory::RangesGeneration())) {
+					plan_entry = nullptr;
+				}
+				if (plan_entry != nullptr && !BufferCache::PlanBufferCheck()) {
+					source = {plan_entry->vaddr, plan_entry->size, plan_entry->source_id};
+					prepared.plan_entries[metadata.descriptor_index] = plan_entry;
+					continue;
+				}
+			}
 			// The resolve thread's source when it still holds.
 			if (const auto* ahead = StageF::BufferSourceAhead(lookup_record, resource, snapshot.buffers[resource],
 			                                                  metadata.written);
 			    ahead != nullptr) {
 				source = {ahead->address, ahead->size, ahead->id};
 				prefetch_memo(source, metadata);
+				if (plan_entry != nullptr) PlanSourceCheck(*plan_entry, source);
 				continue;
 			}
 			const auto range = VSharpRange(m_context, program, resource, snapshot.buffers[resource], [&](auto&& read) {
@@ -4318,6 +4981,7 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 			const auto [address, size] = *range;
 			source = {address, size, cache.FindBuffer(address, size)};
 			prefetch_memo(source, metadata);
+			if (plan_entry != nullptr) PlanSourceCheck(*plan_entry, source);
 		}
 	}
 }
@@ -4329,7 +4993,58 @@ static void CollectAppendBindings(const PreparedBindings& prepared, std::vector<
                                   std::vector<BufferCache::AppendBinding>*             bindings,
                                   std::vector<std::pair<uint64_t, uint64_t>>*           unqualified);
 
+// Project 15 way B P1.1 (KYTY_CHECK_PLAN_BUFFERS=2): the helper's binding against today's (handle, aligned offset, range,
+// offset byte, record stride), when the entry's proof still holds after today's path; every 997th comparison with a copy's
+// offset changed by 16 (detected = injected).
+static void PlanBindingCheck(const PlanBuffer& entry, const vk::DescriptorBufferInfo& today, uint32_t today_offset,
+                             const ShaderRecompiler::IR::ResourceSnapshot& snapshot, uint32_t resource, bool stride_word) {
+	struct Stats {
+		uint64_t compared = 0, bad = 0, race = 0, injected = 0, detected = 0;
+		uint32_t logged   = 0;
+		std::chrono::steady_clock::time_point window = std::chrono::steady_clock::now();
+	};
+	static Stats s; // execution thread
+	if (!BufferCache::PeekProofHolds(entry.peek, entry.vaddr, entry.size)) {
+		s.race++;
+	} else {
+		s.compared++;
+		auto copy = entry;
+		const bool fault = s.compared % 997u == 0u;
+		if (fault) {
+			copy.bind_offset += 16u;
+			s.injected++;
+		}
+		const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[resource]);
+		const uint32_t stride = descriptor.Type() == 0u ? descriptor.Stride() : 0u;
+		const bool same = copy.peek.handle == today.buffer && copy.bind_offset == today.offset && copy.bind_range == today.range &&
+		                  copy.memory_offset == today_offset &&
+		                  (!stride_word || copy.stride == stride);
+		if (!same) {
+			if (fault) {
+				s.detected++;
+			} else {
+				s.bad++;
+				if (s.logged++ < 16u) {
+					std::fprintf(stderr, "CHECK_PLAN_BINDING bad addr=%llx size=%llx offset=%llu/%llu range=%llu/%llu byte=%u/%u\n",
+					             static_cast<unsigned long long>(entry.vaddr), static_cast<unsigned long long>(entry.size),
+					             static_cast<unsigned long long>(entry.bind_offset), static_cast<unsigned long long>(today.offset),
+					             static_cast<unsigned long long>(entry.bind_range), static_cast<unsigned long long>(today.range),
+					             entry.memory_offset, today_offset);
+				}
+			}
+		}
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (now - s.window < std::chrono::seconds(5)) return;
+	s.window = now;
+	std::fprintf(stderr, "PERF plan_binding_check compared=%llu bad=%llu race=%llu fault[injected|detected]=%llu|%llu\n",
+	             static_cast<unsigned long long>(s.compared), static_cast<unsigned long long>(s.bad),
+	             static_cast<unsigned long long>(s.race), static_cast<unsigned long long>(s.injected),
+	             static_cast<unsigned long long>(s.detected));
+}
+
 void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
+	const Common::SlowFrame::Scope slow_frame_scope(Common::SlowFrame::RebindBuf); // KYTY_TRACE_SLOW_FRAMES
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
 	const auto& program   = *prepared.runtime->program;
@@ -4368,6 +5083,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	// buffer-cache operation that must see the uploads commits the batch itself.
 	const BufferCache::UploadBatchScope upload_batch(m_context.GetBufferCache());
 	std::optional<DispatchSubTimer>     sub_timer(std::in_place, DispatchSub::BdaRanges); // KYTY_TRACE_DISPATCH_CENSUS
+	std::optional<ChunkLead::FloorTimer> floor_part(std::in_place, ChunkLead::FpVRanges); // KYTY_TRACE_PEEK_CENSUS (W3 P0)
 	// Record-keyed V#s: resident and synchronized before the shader reaches them through BDA, and written
 	// ranges GPU-modified, like the written storage buffers below (NativeStorageBuffer). First, so that a read-only
 	// binding of the same bytes cannot take a stream copy of what the shader writes through BDA.
@@ -4389,7 +5105,99 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 				m_context.GetBufferCache().NoteRecordKeyedWrite(range.address, range.resident);
 		}
 	}
+	// KYTY_PERF_SRT_GPU_WORDS: the shader reads its shader-only SRT words from GPU memory. Each word's guest address
+	// (the flat words the materialization wrote) becomes the device address of the cached buffer that holds it:
+	// ObtainBdaRange finds or creates that buffer and uploads its CPU-modified bytes, so the shader reads the bytes
+	// guest memory holds for it when it runs (GPU writes in place, CPU writes uploaded), as the walker did after waiting.
+	// Before the other bindings, like the record-keyed ranges: a buffer this creates cannot replace one they named.
+	floor_part.emplace(ChunkLead::FpSrtWords); // (W3 P0)
+	m_gpu_word_patches.clear();
+	prepared.gpu_words_key = 0;
+	const bool gw_key = ChunkCensus::CheckOn() && ChunkCensus::t_member; // KYTY_CHECK_CHUNKS
+	const auto gw_mix = [&](uint64_t a, uint64_t b) {
+		prepared.gpu_words_key = (prepared.gpu_words_key ^ (a * 0x9E3779B97F4A7C15ull) ^ (b + 0x632BE59BD9B4E019ull)) * 0x100000001B3ull;
+	};
+	if (const auto& words = program.info.srt_gpu_words; !words.empty()) {
+		const auto& flat = snapshot.flattened_srt;
+		auto&       cache = m_context.GetBufferCache();
+		m_gpu_word_addresses.clear();
+		m_gpu_word_values.clear();
+		const bool  quiet_words = !BufferCache::PlanBufferCheck(); // (batch 1: the fast path; the check run takes today's path)
+		for (const auto& word: words) {
+			EXIT_IF(word.slot >= flat.size() || word.hi >= flat.size());
+			const uint64_t address = (uint64_t {flat[word.hi]} << 32u) | flat[word.slot];
+			if (address == 0u) continue;
+			const auto index = static_cast<uint32_t>(&word - words.data());
+			if (cache.InDirectRange(address, sizeof(uint32_t))) {
+				// A word in a direct range (host memory; written by the CPU and the command processor, never waited for):
+				// read here as the walker did - GPU writes waited for, pending command-processor writes put over it - and
+				// given to the shader from device-local memory (walk 9.11: read from host memory in every invocation, the
+				// menu's GPU time went 14.6 -> 33.4 ms per frame).
+				uint32_t value = 0;
+				if (quiet_words && cache.DirectWordQuiet(address)) {
+					// Batch 1: no listed GPU write may cover the word - today's wait would return at once with an empty overlay
+					LibKernel::Memory::ReadGuestPlain(&value, address, sizeof(uint32_t));
+				} else {
+					(void)cache.WaitDirectGpuWrites(address, sizeof(uint32_t), true);
+					LibKernel::Memory::ReadGuestPlain(&value, address, sizeof(uint32_t));
+					cache.ApplyDirectCpWrites(address, &value, sizeof(uint32_t));
+				}
+				m_gpu_word_values.emplace_back(index, value, address);
+				if (gw_key) gw_mix((uint64_t {index} << 32u) | value, address);
+				continue;
+			}
+			m_gpu_word_addresses.emplace_back(address, index);
+		}
+		if (!m_gpu_word_values.empty()) {
+			auto&      stream            = cache.WordStream();
+			const auto bytes             = m_gpu_word_values.size() * sizeof(uint32_t);
+			const auto [mapped, offset] = stream.Map(bytes, 16);
+			EXIT_IF(mapped == nullptr);
+			const vk::DeviceAddress base = stream.BufferDeviceAddress() + offset;
+			for (size_t i = 0; i < m_gpu_word_values.size(); ++i) {
+				const auto [index, value, guest] = m_gpu_word_values[i];
+				std::memcpy(mapped + i * sizeof(uint32_t), &value, sizeof(uint32_t));
+				const auto& word = words[index];
+				const auto  host = base + i * sizeof(uint32_t);
+				if (word.verify != UINT32_MAX) BufferCache::NoteGpuWordBind(host, guest);
+				m_gpu_word_patches.emplace_back(word.slot, static_cast<uint32_t>(host));
+				m_gpu_word_patches.emplace_back(word.hi, static_cast<uint32_t>(host >> 32u));
+			}
+			stream.Commit();
+		}
+		if (!std::ranges::is_sorted(m_gpu_word_addresses)) std::ranges::sort(m_gpu_word_addresses); // usually in order
+		for (size_t first = 0; first < m_gpu_word_addresses.size();) {
+			// One range per run of words no more than 256 bytes apart inside one 64 KiB block.
+			const uint64_t start = m_gpu_word_addresses[first].first;
+			size_t         last  = first;
+			while (last + 1u < m_gpu_word_addresses.size() &&
+			       m_gpu_word_addresses[last + 1u].first <= m_gpu_word_addresses[last].first + 4u + 256u &&
+			       (m_gpu_word_addresses[last + 1u].first >> 16u) == (start >> 16u)) {
+				++last;
+			}
+			const uint64_t end              = m_gpu_word_addresses[last].first + sizeof(uint32_t);
+			const auto [buffer, offset]     = cache.ObtainBdaRange(start, end - start, false);
+			const vk::DeviceAddress device = buffer->BufferDeviceAddress() + offset;
+			for (size_t i = first; i <= last; ++i) {
+				const auto& word = words[m_gpu_word_addresses[i].second];
+				const auto  host = device + (m_gpu_word_addresses[i].first - start);
+				if (word.verify != UINT32_MAX) {
+					// Bits 56..: what was over the word when it was bound (1 deferred label, 2 pending CP write, 4 GPU-modified
+					// page, 8 GPU-dirty bytes).
+					const uint64_t guest = m_gpu_word_addresses[i].first;
+					uint64_t       flags = GuestGpu::PendingWriteKind(guest);
+					if (cache.IsRegionGpuModified(guest, 4u)) flags |= 4u | (cache.HasGpuDirtyBytes(guest, 4u) ? 8u : 0u);
+					BufferCache::NoteGpuWordBind(host, guest | (flags << 56u));
+				}
+				m_gpu_word_patches.emplace_back(word.slot, static_cast<uint32_t>(host));
+				m_gpu_word_patches.emplace_back(word.hi, static_cast<uint32_t>(host >> 32u));
+				if (gw_key) gw_mix(word.slot, host);
+			}
+			first = last + 1u;
+		}
+	}
 	sub_timer.reset();
+	floor_part.emplace(ChunkLead::FpBufLoop); // (W3 P0: from here to the end of the buffer loop)
 	EXIT_IF(prepared.shader_data.size() != layout.ShaderDataDwords());
 	std::fill(prepared.shader_data.begin() + layout.memory_offset_dword,
 	          prepared.shader_data.end(), 0);
@@ -4404,7 +5212,43 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		if (index == UINT32_MAX) continue;
 		uint32_t buffer_offset = 0;
 		KYTY_PROFILER_BLOCK("RebindBuffers::Storage");
-		prepared.buffers[index] = NativeStorageBuffer(m_context, prepared.buffer_sources[index], buffer, buffer_offset);
+		if (buffer.written && RingCensus::Enabled()) [[unlikely]] {
+			// KYTY_TRACE_RING_CENSUS (diagnostic): the census records this binding as the writer of its range.
+			RingCensus::Binding census_binding;
+			census_binding.resource        = resource;
+			census_binding.descriptor      = index;
+			census_binding.max_byte_extent = buffer.max_byte_extent;
+			census_binding.fixed_ranges    = buffer.fixed_writes ? &buffer.fixed_write_ranges : nullptr;
+			census_binding.append    = buffer.append_counter != ShaderRecompiler::IR::BufferResource::NoAppendCounter;
+			census_binding.read      = buffer.read;
+			census_binding.atomic    = buffer.atomic;
+			census_binding.formatted = buffer.formatted;
+			const RingCensus::BindingScope census_scope(&census_binding);
+			prepared.buffers[index] = NativeStorageBuffer(m_context, prepared.buffer_sources[index], buffer, buffer_offset);
+		} else {
+			// Project 15 way B P1.1: a read-only binding with a ready plan entry of the same source, whose proof holds, takes
+			// the helper's binding (with KYTY_CHECK_PLAN_BUFFERS=2 today's binding is compared).
+			const bool  check      = BufferCache::PlanBufferCheck();
+			const auto& source     = prepared.buffer_sources[index];
+			PlanBuffer* plan_entry = !buffer.written
+			                             ? (index < prepared.plan_entries.size() && prepared.plan_entries[index] != nullptr
+			                                    ? prepared.plan_entries[index]
+			                                    : BufferCache::PlanStageEntry(&program, resource))
+			                             : nullptr;
+			const bool  usable = plan_entry != nullptr && plan_entry->ready && plan_entry->vaddr == source.address &&
+			                    plan_entry->size == source.size && source.address != 0 && source.size != 0;
+			if (usable && !check && m_context.GetBufferCache().PlanAnswerBinding(*plan_entry, source.address, source.size)) {
+				prepared.buffers[index] = vk::DescriptorBufferInfo {plan_entry->peek.handle, plan_entry->bind_offset, plan_entry->bind_range};
+				pack_memory_offset(index, plan_entry->memory_offset);
+				if (layout.memory_stride_dword != ShaderRecompiler::IR::PushData::NoStart) {
+					prepared.shader_data[layout.memory_stride_dword + index] = plan_entry->stride;
+				}
+				continue;
+			}
+			prepared.buffers[index] = NativeStorageBuffer(m_context, prepared.buffer_sources[index], buffer, buffer_offset);
+			if (check && usable) PlanBindingCheck(*plan_entry, prepared.buffers[index], buffer_offset, snapshot, resource,
+			                                           layout.memory_stride_dword != ShaderRecompiler::IR::PushData::NoStart);
+		}
 		pack_memory_offset(index, buffer_offset);
 		if (layout.memory_stride_dword != ShaderRecompiler::IR::PushData::NoStart) {
 			// The record stride the shader reads at run time.
@@ -4412,6 +5256,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 			prepared.shader_data[layout.memory_stride_dword + index] = descriptor.Type() == 0u ? descriptor.Stride() : 0u;
 		}
 	}
+	floor_part.reset(); // (W3 P0)
 	const bool srt_uniform = layout.descriptor_counts[static_cast<size_t>(BindingKind::FlattenedSrtUniform)] != 0;
 	// Uniform const buffers (ShaderIR.h): words uploaded once, padded with zeros to whole uvec4 elements; the uniform view
 	// covers the padded words (the uvec4 elements the shader declares lie inside: every ReadConst slot is below the
@@ -4433,9 +5278,10 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		}
 	};
 	sub_timer.emplace(DispatchSub::SrtUpload);
+	const ChunkLead::FloorTimer floor_upload(ChunkLead::FpUpload); // KYTY_TRACE_PEEK_CENSUS (way B W0 A7)
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::FlattenedSrt)] != 0 || srt_uniform) {
 		if (DescriptorTrace::SrtDumpOn()) DescriptorTrace::SrtDump(program.shader_hash, snapshot.flattened_srt);
-		if (prepared.bindless_patches.empty()) {
+		if (prepared.bindless_patches.empty() && m_gpu_word_patches.empty()) {
 			upload_srt(snapshot.flattened_srt);
 		} else {
 			m_bindless_srt.assign(snapshot.flattened_srt.begin(), snapshot.flattened_srt.end());
@@ -4445,6 +5291,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 					m_bindless_srt[patch.offset + 1u] = patch.entries;
 				}
 			}
+			for (const auto& [index, value]: m_gpu_word_patches) m_bindless_srt[index] = value; // KYTY_PERF_SRT_GPU_WORDS
 			upload_srt(m_bindless_srt);
 		}
 	}
@@ -4455,6 +5302,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 }
 
 void RenderExecutor::RebindImages(PreparedBindings& prepared) {
+	const Common::SlowFrame::Scope slow_frame_scope(Common::SlowFrame::RebindImg); // KYTY_TRACE_SLOW_FRAMES
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
 	const auto& program  = *prepared.runtime->program;
@@ -4462,16 +5310,34 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	auto&       images   = prepared.images;
 	EXIT_IF(images.size() != program.info.images.size());
 	auto& texture_cache = m_context.GetTextureCache();
+	PeekImages::Stage* peek_entry = nullptr; // KYTY_CHECK_PEEK=2 (S2b)
+	if (PeekImages::Check()) {
+		auto& pending = PeekImages::Pending();
+		if (const auto it = pending.find(&prepared); it != pending.end() && it->second.pending) peek_entry = &it->second;
+	}
 	// Acquire each view before a later overlapping descriptor can replace its image.
 	const auto rebind_image_slot = [&](uint32_t i) {
+		const uint64_t slow0 = t_peek_slow;
+		struct SlowNote {
+			PeekImages::Stage* entry;
+			uint64_t           slow0;
+			uint32_t           i;
+			~SlowNote() {
+				if (entry != nullptr && t_peek_slow != slow0 && i < entry->stale.size()) entry->stale[i] = 1u;
+			}
+		} const slow_note {peek_entry, slow0, i};
 		const auto old_image = texture_cache.m_slot_images.try_get(images[i].image_id);
 		if (old_image == nullptr || (!old_image->registered && !old_image->info.data.Empty()) ||
 		    old_image->binding.needs_rebind) {
 			if (old_image != nullptr) {
 				ClearImageBinding(*old_image, images[i].image_id);
 			}
-			images[i] = ResolveTexture(program.info.images[i], snapshot.images[i],
-			                           ImageCompareFuncs(program, snapshot, i));
+			t_peek_slow++; // KYTY_CHECK_PEEK=2 (S2b): the full image search
+			{
+				const Common::SlowFrame::Scope slow_resolve(Common::SlowFrame::ResolveTex); // KYTY_TRACE_SLOW_FRAMES
+				images[i] = ResolveTexture(program.info.images[i], snapshot.images[i],
+				                           ImageCompareFuncs(program, snapshot, i));
+			}
 			if (i < prepared.image_source.size()) prepared.image_source[i] = 0u;
 			BindImage(images[i].image_id,
 			          images[i].desc.type == TextureCache::BindingType::Storage);
@@ -4479,6 +5345,8 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		auto& binding = images[i];
 		binding.mip_views.clear();
 		const auto& resource = program.info.images[i];
+		std::optional<Common::SlowFrame::Scope> slow_view;
+		slow_view.emplace(Common::SlowFrame::FindView); // KYTY_TRACE_SLOW_FRAMES
 		if (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::Dynamic) {
 			EXIT_IF(resource.mip_count == 0u ||
 			        resource.mip_count != binding.desc.view_info.level_count);
@@ -4495,12 +5363,14 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		} else {
 			binding.image_view = texture_cache.FindTextureReplay(binding.image_id, binding.desc);
 		}
+		slow_view.reset();
 		auto&      image   = texture_cache.GetImage(binding.image_id);
 		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
 		image.usage.storage |= storage;
 		image.usage.texture |= !storage;
 		// KYTY_WORKAROUND_DCC_FAST_CLEAR: after the view's contents are final for this use.
 		if (TextureCache::DccFastClearEnabled()) {
+			const Common::SlowFrame::Scope slow_dcc(Common::SlowFrame::DccClear); // KYTY_TRACE_SLOW_FRAMES
 			texture_cache.ApplyDccFastClear(m_context.GetCommandScheduler().Current(), binding.image_id, binding.desc);
 		}
 	};
@@ -4510,6 +5380,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	auto* table_hit = static_cast<TableSet*>(prepared.table_hit);
 	bool  table_ok  = false;
 	if (table_hit != nullptr) {
+		const Common::SlowFrame::Scope slow_table(Common::SlowFrame::TableReady); // KYTY_TRACE_SLOW_FRAMES
 		table_ok = DrawRepeat::g_image_registry_epoch.load(std::memory_order_acquire) == prepared.table_epoch &&
 		           texture_cache.TableTexturesReady(table_hit->member_ids);
 		(table_ok ? TableStats().rebind_hits : TableStats().rebind_fail)++;
@@ -4541,6 +5412,81 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		prepared.table_store = nullptr;
 	}
 	prepared.table_hit = nullptr;
+	if (PeekImages::Check()) {
+		// KYTY_CHECK_PEEK=2 (S2b): an answered slot must hold the peeked image and views.
+		auto& st = PeekImages::g_stats;
+		if (peek_entry != nullptr) {
+			auto& peek       = *peek_entry;
+			peek.pending     = false;
+			const bool moved = DrawRepeat::g_image_registry_epoch.load(std::memory_order_acquire) != peek.epoch;
+			for (size_t i = 0; i < images.size() && i < peek.klass.size(); i++) {
+				if (peek.klass[i] != PeekImages::SetSlot && peek.klass[i] != PeekImages::Replay) continue;
+				if (peek.stale[i] != 0u) st.stale_ready++; // ready at the peek, today's path took a slow path
+				st.compared++;
+				auto       view  = peek.views[i];
+				const bool fault = PeekImages::FaultEvery() != 0 && st.compared % PeekImages::FaultEvery() == 0;
+				if (fault) {
+					view = PeekImages::Shifted(view);
+					st.injected++;
+				}
+				const bool same = images[i].image_id == peek.ids[i] && images[i].image_view == view && images[i].mip_views == peek.mips[i];
+				if (same) continue;
+				if (fault) {
+					st.detected++;
+				} else if (moved) {
+					st.moved++;
+				} else {
+					st.bad++;
+					if (st.logged++ < 20u) {
+						std::fprintf(stderr, "CHECK_PEEK_IMAGES bad slot=%zu class=%u id_same=%d view_same=%d mips=%zu/%zu\n", i, peek.klass[i],
+						             images[i].image_id == peek.ids[i] ? 1 : 0, images[i].image_view == peek.views[i] ? 1 : 0,
+						             images[i].mip_views.size(), peek.mips[i].size());
+					}
+				}
+			}
+			if (peek.samplers_answered && !program.info.samplers.empty() && prepared.samplers != peek.samplers) st.sampler_bad++;
+			if (peek.has_ahead) {
+				// N4.1: the slots the opening's peek answered must hold its image and views too.
+				auto&          a      = g_ahead;
+				const auto&    ah     = peek.ahead;
+				const uint32_t bucket = AheadBucket(peek.ahead_distance);
+				const bool     moved  = DrawRepeat::g_image_registry_epoch.load(std::memory_order_acquire) != ah.epoch;
+				a.i_stages++;
+				for (size_t i = 0; i < images.size() && i < ah.klass.size(); i++) {
+					const bool ahead_answer = ah.klass[i] == PeekImages::SetSlot || ah.klass[i] == PeekImages::Replay;
+					const bool fresh_answer = peek.klass[i] == PeekImages::SetSlot || peek.klass[i] == PeekImages::Replay;
+					if (!ahead_answer) {
+						if (fresh_answer) a.i_lost++;
+						continue;
+					}
+					a.i_compared++;
+					a.i_compared_by_distance[bucket]++;
+					auto       view  = ah.views[i];
+					const bool fault = PeekImages::FaultEvery() != 0 && a.i_compared % PeekImages::FaultEvery() == 0;
+					if (fault) {
+						view = PeekImages::Shifted(view);
+						a.i_injected++;
+					}
+					if (moved) a.i_moved_any[bucket]++;
+					if (peek.stale[i] != 0u) a.i_stale_any[bucket]++;
+					const bool same = images[i].image_id == ah.ids[i] && images[i].image_view == view && images[i].mip_views == ah.mips[i];
+					if (same) continue;
+					if (fault) {
+						a.i_detected++;
+					} else if (moved) {
+						a.i_moved++;
+						a.i_moved_by_distance[bucket]++;
+					} else if (peek.stale[i] != 0u) {
+						a.i_stale++;
+					} else {
+						a.i_bad++;
+					}
+				}
+			}
+		} else {
+			st.unchecked++;
+		}
+	}
 }
 
 // PrepareGraphicsBindings: a color target whose image was replaced (unregistered with data, or to be rebound) is found
@@ -4586,6 +5532,7 @@ void RenderExecutor::PrepareGraphicsBuffersHead(std::span<PreparedBindings* cons
 }
 
 void RenderExecutor::PrepareGraphicsImages(std::span<PreparedBindings* const> stages, std::span<RenderColorInfo> colors) {
+	const ChunkLead::FloorTimer floor_images(ChunkLead::FpImages); // KYTY_TRACE_PEEK_CENSUS (way B W0 A10)
 	GraphicsPartMarks marks;
 	for (auto* stage: stages) {
 		RebindImages(*stage);
@@ -5096,6 +6043,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     vk::PipelineBindPoint              pipeline_bind_point,
                                     const PipelineCache::Pipeline&     pipeline,
                                     std::span<PreparedBindings* const> prepared_bindings) {
+	const Common::SlowFrame::Scope slow_frame_scope(Common::SlowFrame::Commit); // KYTY_TRACE_SLOW_FRAMES
 	KYTY_PROFILER_FUNCTION();
 	std::optional<DispatchSubTimer> census_part(std::in_place, DispatchSub::BPre); // KYTY_TRACE_DRAW_CENSUS
 	auto   vk_buffer        = buffer.Handle();
@@ -5305,12 +6253,15 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	// The record packets, with the recording thread's heap sets.
 	const bool packet = RecordPacketsCommit();
 	census_part.emplace(DispatchSub::BScan);
+	std::optional<ChunkLead::FloorTimer> floor_scan(std::in_place, ChunkLead::FpScanTransit); // KYTY_TRACE_PEEK_CENSUS (W0 A13)
 	// Nothing to scan unless a stage reads scalar resources (the scan skips the others anyway).
 	if (has_scalar_reads) {
+		DrawCoverage::t_scans++; // (way B W0 Table B)
 		KYTY_PROFILER_BLOCK("Commit::OverlapScan");
 		scan_scalar_reads(report_image_overlap, report_buffer_overlap);
 	}
 		census_part.emplace(DispatchSub::BDesc);
+	floor_scan.reset();
 	m_descriptor_images.resize(image_descriptor_count);
 	m_descriptor_writes.clear();
 	m_descriptor_writes.reserve(write_count);
@@ -5323,6 +6274,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		const auto  shader_stage  = NativeShaderStage(program.stage);
 		const auto  shader_stages = ShaderPipelineStages(shader_stage);
 		census_part.emplace(DispatchSub::BTransit);
+		floor_scan.emplace(ChunkLead::FpScanTransit); // KYTY_TRACE_PEEK_CENSUS (W0 A13)
 		if (descriptors.gds.buffer != nullptr) {
 			buffer.EndRendering();
 			const auto barrier = MakeGdsDependency(descriptors.gds.buffer);
@@ -5412,6 +6364,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			}
 			binding.layout = image.backing.state.layout;
 		}
+		floor_scan.reset();
 		census_part.emplace(DispatchSub::BDesc);
 
 		std::array<size_t, ShaderRecompiler::IR::ImageBindingCount> image_starts {};
@@ -5618,10 +6571,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	// The bindless heaps prepared for this draw are read by the commands recorded at this tick.
 	{
 		// The worker may be preparing the next draw's bindless heaps meanwhile.
-		auto&                        bindless_table = m_context.GetBindlessTable();
-		std::unique_lock<std::mutex> binder_lock(bindless_table.BinderMutex(), std::defer_lock);
-		const auto                   tick = m_context.GetCommandScheduler().CurrentTick();
-		binder_lock.lock();
+		auto&            bindless_table = m_context.GetBindlessTable();
+		const auto       tick           = m_context.GetCommandScheduler().CurrentTick();
+		const BinderLock binder_lock(bindless_table.BinderMutex());
 		bindless_table.MarkDrawHeapsCommitted(tick, m_commit_bindless_heaps, m_commit_bindless_tables, m_commit_bindless_plan,
 		                                      true);
 	}

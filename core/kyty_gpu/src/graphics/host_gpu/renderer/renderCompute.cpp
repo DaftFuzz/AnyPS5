@@ -1,8 +1,10 @@
+#include "common/slowFrame.h" // KYTY_TRACE_SLOW_FRAMES (diagnostic)
 #include "graphics/host_gpu/renderer/perfCounters.h"
 #include "graphics/host_gpu/renderer/cleanDraws.h"
 #include "graphics/host_gpu/renderer/debugSample.h"
 #include "graphics/host_gpu/renderer/refCapture.h"
 #include "graphics/host_gpu/renderer/renderComputeTrace.h"
+#include "graphics/guest_gpu/chunkLead.h"
 #include "graphics/host_gpu/renderer/twinDispatch.h"
 #include "graphics/host_gpu/renderer/gpuTimer.h"
 #include "graphics/host_gpu/gpuCheckpoints.h"
@@ -19,6 +21,7 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include <optional>
 #include "common/threads.h"
+#include "graphics/guest_gpu/chunkCensus.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
@@ -337,16 +340,24 @@ static void FullMemoryBarrier(vk::CommandBuffer vk_buffer) {
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode, bool async_compute) {
+	const Common::SlowFrame::Scope slow_frame_scope(Common::SlowFrame::DispatchOp); // KYTY_TRACE_SLOW_FRAMES
 	CleanDraws::NoteBreak(async_compute ? CleanDraws::BreakAsync : CleanDraws::BreakDispatch); // KYTY_TRACE_CLEAN_DRAWS
 	DispatchCensusTimer         census_timer(buffer.GetShaders().GetCs().cs_regs.data_addr, async_compute); // KYTY_TRACE_DISPATCH_CENSUS
+	ChunkLead::FloorPhase       floor_phase(ChunkLead::FpD1); // KYTY_TRACE_PEEK_CENSUS (way B W0 D1-D7)
 	GpuBurnAt(GpuBurnSite::Dispatch); // KYTY_DIAG_GPU_BURN_AT=dispatch (measurement only)
 	// KYTY_DIAG_GPU_BURN_AT=dispatch_async / dispatch_gfx (measurement only): the asynchronous compute queues' dispatches
 	// or the graphics queue's (step 0c).
 	GpuBurnAt(async_compute ? GpuBurnSite::DispatchAsync : GpuBurnSite::DispatchGfx);
-	m_context.GetCommandScheduler().NoteGpuCommand();
+	{
+		const DispatchSubTimer p0_timer(DispatchSub::P0Note); // KYTY_TRACE_DISPATCH_CENSUS
+		m_context.GetCommandScheduler().NoteGpuCommand();
+	}
 	KYTY_PROFILER_BLOCK("Dispatch(direct)");
 	EXIT_IF(buffer.IsInvalid());
-	m_context.GetCommandScheduler().PopPendingOperations();
+	{
+		const DispatchSubTimer p0_timer(DispatchSub::P0Pop); // KYTY_TRACE_DISPATCH_CENSUS
+		m_context.GetCommandScheduler().PopPendingOperations();
+	}
 	auto& ctx    = buffer.GetRegisters();
 	auto& sh_ctx = buffer.GetShaders();
 
@@ -368,6 +379,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	std::optional<Common::LockGuard> lock_holder;
 	{
 		KYTY_PROFILER_BLOCK("Dispatch::ContextLock");
+		const DispatchSubTimer p0_timer(DispatchSub::P0Lock); // KYTY_TRACE_DISPATCH_CENSUS
 		lock_holder.emplace(m_context.GetMutex());
 	}
 	if (sh_ctx.GetCs().cs_regs.data_addr == 0) {
@@ -424,11 +436,13 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 	census_timer.Mark(1);
+	floor_phase.Next(ChunkLead::FpD2);
 	ShaderProgram compute_program;
 	if (!TakeResolvedDispatch(input_info, compute_program)) {
 		compute_program = m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
 	}
 	census_timer.Mark(2);
+	floor_phase.Next(ChunkLead::FpD3);
 	// (Upstream also starts its image heap here, ImageHeap::BeginDraw; not in use, RenderContext::ImageHeapEnabled.)
 	// KYTY_DIAG_TWIN_DISPATCH: the other program of a selected dispatch, before anything of the dispatch is recorded.
 	TwinDispatch::Twin twin;
@@ -485,35 +499,48 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (ref_capture) RefCapture::Prefetch(cs_regs);
 	buffer.EndRendering();
 	census_timer.Mark(3);
+	floor_phase.Next(ChunkLead::FpD4);
 	std::optional<DispatchSubTimer> sub_timer(std::in_place, DispatchSub::Pipeline); // KYTY_TRACE_DISPATCH_CENSUS
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
 	auto& bindings = m_compute_bindings;
-	sub_timer.emplace(DispatchSub::PrepareBindings);
-	PrepareBindings(input_info.stage, bindings);
-	sub_timer.reset();
-	if (program.bindings.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart) {
-		std::copy(std::begin(input_info.dispatch_threads_num), std::end(input_info.dispatch_threads_num),
-		          bindings.shader_data.begin() + program.bindings.dispatch_thread_dword);
-	}
 	PreparedBindings* descriptor_stage = &bindings;
-	census_timer.Mark(4);
-	sub_timer.emplace(DispatchSub::FindBuffers);
-	FindBuffers(std::span {&descriptor_stage, 1u});
-	sub_timer.emplace(DispatchSub::PrepareBda);
-	if (program.info.uses_dma) {
-		m_context.PrepareBda();
+	// KYTY_CHECK_CHUNKS=2 (project 15, the oracle v2): a chunk-member dispatch is prepared once more before its preparation;
+	// the two preparations' prints must be equal (renderDraw.cpp ChunkCheckFirst; the commit uses the second).
+	const bool chunk_check = ChunkCensus::CheckOn() && ChunkCensus::t_member;
+	for (uint32_t preparation = chunk_check ? 0u : 1u; preparation < 2u; preparation++) {
+		// The first preparation (the oracle's) into bindings of its own.
+		auto&             prepared       = preparation == 0u ? ChunkScratchBindings(4) : bindings;
+		PreparedBindings* prepared_stage = &prepared;
+		sub_timer.emplace(DispatchSub::PrepareBindings);
+		PrepareBindings(input_info.stage, prepared);
+		sub_timer.reset();
+		if (program.bindings.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart) {
+			std::copy(std::begin(input_info.dispatch_threads_num), std::end(input_info.dispatch_threads_num),
+			          prepared.shader_data.begin() + program.bindings.dispatch_thread_dword);
+		}
+		census_timer.Mark(4);
+		floor_phase.Next(ChunkLead::FpD5);
+		sub_timer.emplace(DispatchSub::FindBuffers);
+		FindBuffers(std::span {&prepared_stage, 1u});
+		sub_timer.emplace(DispatchSub::PrepareBda);
+		if (program.info.uses_dma) {
+			m_context.PrepareBda();
+		}
+		sub_timer.emplace(DispatchSub::RebindImages);
+		if (program.info.uses_image_heap) {
+			m_context.GetImageHeap().Rebind(*this);
+		}
+		RebindImages(prepared);
+		sub_timer.emplace(DispatchSub::SharedMemory);
+		BindSharedMemory(m_context, input_info, prepared);
+		sub_timer.emplace(DispatchSub::RebindBuffers);
+		RebindBuffers(prepared);
+		sub_timer.reset();
+		if (preparation == 0u) ChunkCheckFirst(std::span {&prepared_stage, 1u}, nullptr);
 	}
-	sub_timer.emplace(DispatchSub::RebindImages);
-	if (program.info.uses_image_heap) {
-		m_context.GetImageHeap().Rebind(*this);
-	}
-	RebindImages(bindings);
-	sub_timer.emplace(DispatchSub::SharedMemory);
-	BindSharedMemory(m_context, input_info, bindings);
-	sub_timer.emplace(DispatchSub::RebindBuffers);
-	RebindBuffers(bindings);
-	sub_timer.reset();
+	if (chunk_check) ChunkCheckSecond(std::span {&descriptor_stage, 1u}, nullptr, true);
 	census_timer.Mark(5);
+	floor_phase.Next(ChunkLead::FpD6);
 
 	auto              vk_buffer        = buffer.Handle();
 	sub_timer.emplace(DispatchSub::CommitBindings);
@@ -545,6 +572,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		NoteComputeHazardBarrier();
 	}
 	census_timer.Mark(6);
+	floor_phase.Next(ChunkLead::FpD7);
 	sub_timer.emplace(DispatchSub::TailPre); // KYTY_TRACE_DISPATCH_CENSUS: to the recording
 	bool writes_flip = false;
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
@@ -807,6 +835,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		                       : 0u;
 		GpuTimer::EndCommand(vk_buffer, gpu_time, 'c', program.shader_hash, b);
 	}
+	m_context.GetBufferCache().DiagGpuDelayAfter(vk_buffer, program.shader_hash); // KYTY_DIAG_GPU_DELAY_HASHES (measurement only)
 	{
 		const DispatchSubTimer emitted_timer(DispatchSub::TailEmitted); // KYTY_TRACE_DISPATCH_CENSUS
 		m_context.GetBufferCache().NoteCommandEmitted();
@@ -961,6 +990,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	if (GpuTimer::LabelsEnabled()) GpuTimer::LabelEnd(vk_buffer);
 	if (gpu_time != ~0u) GpuTimer::EndCommand(vk_buffer, gpu_time, 'c', program.shader_hash, 1);
+	m_context.GetBufferCache().DiagGpuDelayAfter(vk_buffer, program.shader_hash); // KYTY_DIAG_GPU_DELAY_HASHES (measurement only)
 	m_context.GetBufferCache().NoteCommandEmitted();
 	GpuCheckpoints::Mark(vk_buffer, ~input_info.stage.program->shader_hash);
 	if (twin_open) TwinDispatch::End(m_context, vk_buffer, program.shader_hash); // KYTY_DIAG_TWIN_DISPATCH: A's copy
