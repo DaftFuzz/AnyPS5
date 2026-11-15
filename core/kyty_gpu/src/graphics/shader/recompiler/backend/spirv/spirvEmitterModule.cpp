@@ -215,6 +215,15 @@ uint32_t F32ArrayType(EmitterState& state, uint32_t count) {
 	return state.builder.Type(spv::OpTypeArray, TypeF32(state), ConstantU32(state, count));
 }
 
+uint32_t OwnDescriptorSet(const EmitterState& state) {
+	return Common::EnvRead::GplSplit() && state.program.stage == ShaderType::Pixel ? IR::SplitPixelSet : IR::SplitVertexSet;
+}
+
+uint32_t BindlessSet(const EmitterState& state) {
+	return Common::EnvRead::GplSplit() && state.program.stage != ShaderType::Compute ? IR::SplitBindlessSet
+	                                                                                 : IR::BindlessDescriptorSet;
+}
+
 void DefineImageArray(EmitterState& state, ImageDefinition& definition, const IR::ImageResource& image,
                       uint32_t count, uint32_t set, uint32_t binding) {
 	definition.type     = ImageType(state, image);
@@ -309,7 +318,7 @@ void DefineDescriptors(EmitterState& state) {
 			const auto variable =
 			    state.builder.DefineGlobalVariable(TypePointer(state, storage, type), storage);
 			state.builder.AddName(variable, name);
-			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet, 0);
+			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet, OwnDescriptorSet(state));
 			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding,
 			                            IR::NativeBinding(state.program.stage, kind));
 			return variable;
@@ -409,7 +418,7 @@ void DefineDescriptors(EmitterState& state) {
 				        IR::ImageResourceClass::None);
 				auto& definition = state.images[IR::ImageBindingIndex(kind)];
 				DefineImageArray(state, definition, *image_types[IR::ImageBindingIndex(kind)],
-				                 counts[index], 0u, IR::NativeBinding(state.program.stage, kind));
+				                 counts[index], OwnDescriptorSet(state), IR::NativeBinding(state.program.stage, kind));
 				state.builder.AddName(definition.variable,
 				                      ("image_" + std::to_string(static_cast<uint32_t>(kind))).c_str());
 				break;
@@ -839,8 +848,7 @@ void DefineBindlessImages(EmitterState& state) {
 		const auto variable = state.builder.DefineGlobalVariable(
 		    TypePointer(state, spv::StorageClassUniformConstant, array), spv::StorageClassUniformConstant);
 		state.builder.AddName(variable, "bindless_images");
-		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet,
-		                            IR::BindlessDescriptorSet);
+		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet, BindlessSet(state));
 		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding, binding);
 		state.bindless_image_variables[type] = variable;
 		state.builder.RequireCapability(spv::CapabilityRuntimeDescriptorArray);
@@ -854,8 +862,7 @@ void DefineBindlessImages(EmitterState& state) {
 		    TypePointer(state, spv::StorageClassStorageBuffer, StorageBufferType(state, state.storage_buffers[2])),
 		    spv::StorageClassStorageBuffer);
 		state.builder.AddName(variable, name);
-		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet,
-		                            IR::BindlessDescriptorSet);
+		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet, BindlessSet(state));
 		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding, binding);
 		return variable;
 	};

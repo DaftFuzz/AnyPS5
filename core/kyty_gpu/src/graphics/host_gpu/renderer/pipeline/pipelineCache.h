@@ -215,6 +215,12 @@ public:
 		uint32_t                last_used             = 0;
 		// KYTY_PERF_GPL: fast-linked from libraries; its optimized pipeline is made in the background and swapped in.
 		std::shared_ptr<GplPending> gpl;
+		// KYTY_PERF_GPL_SPLIT: descriptor_set_layout is set 0 (the vertex stages; push descriptors when they fit),
+		// pixel_set_layout set 1 (shared, never push; not owned), the bindless table set 2, and the push constants are
+		// pushed for push_stages.
+		bool                    split            = false;
+		vk::DescriptorSetLayout pixel_set_layout = nullptr;
+		vk::ShaderStageFlags    push_stages {};
 	};
 
 	struct GraphicsPrograms {
@@ -487,6 +493,11 @@ enum class GplOptimizeEvent : uint8_t { Queued, Swapped, Failed, Discarded };
 void GplCountOptimize(GplOptimizeEvent event, uint64_t us);
 // Destroys the stage libraries and their layouts (after every thread that creates pipelines stopped).
 void GplDestroyLibraries(GraphicContext& graphics);
+// KYTY_PERF_GPL_SPLIT: the descriptor-set update template of a shared set layout (made once from `entries`, kept until
+// GplDestroyLibraries), and the bytes of descriptor infos it reads.
+[[nodiscard]] vk::DescriptorUpdateTemplate GplSetTemplate(GraphicContext& graphics, vk::DescriptorSetLayout layout,
+                                                          std::span<const vk::DescriptorUpdateTemplateEntry> entries,
+                                                          uint32_t& bytes);
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
 

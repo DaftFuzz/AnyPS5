@@ -5896,6 +5896,9 @@ struct CommitPacketHeader {
 	vk::ShaderStageFlags         push_stages;
 	uint32_t                     push_bytes       = 0;
 	uint32_t                     descriptor_bytes = 0;
+	// The set the descriptors are pushed or bound at, and the bindless set (KYTY_PERF_GPL_SPLIT: 0 or 1, and 2).
+	uint32_t                     set_index        = 0;
+	uint32_t                     bindless_index   = 1;
 };
 static_assert(std::is_trivially_copyable_v<CommitPacketHeader> && sizeof(CommitPacketHeader) % 8u == 0u);
 
@@ -5920,15 +5923,16 @@ void RunCommitPacket(const void* blob) {
 			VULKAN_HPP_DEFAULT_DISPATCHER.vkUpdateDescriptorSetWithTemplate(
 			    static_cast<VkDevice>(header.device), static_cast<VkDescriptorSet>(header.set),
 			    static_cast<VkDescriptorUpdateTemplate>(header.push_template), descriptors);
-			header.buffer.bindDescriptorSets(header.bind_point, header.layout, 0, 1, &header.set, 0, nullptr);
+			header.buffer.bindDescriptorSets(header.bind_point, header.layout, header.set_index, 1, &header.set, 0, nullptr);
 		} else {
 			VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdPushDescriptorSetWithTemplateKHR(
 			    static_cast<VkCommandBuffer>(header.buffer), static_cast<VkDescriptorUpdateTemplate>(header.push_template),
-			    static_cast<VkPipelineLayout>(header.layout), 0, descriptors);
+			    static_cast<VkPipelineLayout>(header.layout), header.set_index, descriptors);
 		}
 	}
 	if (header.bindless_set) {
-		header.buffer.bindDescriptorSets(header.bind_point, header.layout, 1, 1, &header.bindless_set, 0, nullptr);
+		header.buffer.bindDescriptorSets(header.bind_point, header.layout, header.bindless_index, 1, &header.bindless_set, 0,
+		                                 nullptr);
 	}
 }
 
@@ -6261,7 +6265,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		EXIT("scalar resource reads overlap a shader buffer write\n");
 	};
 	// The record packets, with the recording thread's heap sets.
-	const bool packet = RecordPacketsCommit();
+	EXIT_IF(pipeline.split && !CommitPacketCallsLoaded());
+	const bool packet = RecordPacketsCommit() || pipeline.split;
 	census_part.emplace(DispatchSub::BScan);
 	std::optional<ChunkLead::FloorTimer> floor_scan(std::in_place, ChunkLead::FpScanTransit); // KYTY_TRACE_PEEK_CENSUS (W0 A13)
 	// Nothing to scan unless a stage reads scalar resources (the scan skips the others anyway).
@@ -6476,10 +6481,32 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 
 	census_part.emplace(DispatchSub::BEmit);
 	if (packet) {
+		std::array<PreparedBindings*, 4> split_vertex {};
+		PreparedBindings*                split_pixel  = nullptr;
+		uint32_t                         split_vertex_count = 0;
+		size_t                           split_vertex_writes = 0, split_pixel_writes = 0;
+		if (pipeline.split) {
+			for (auto* prepared: prepared_bindings) {
+				const auto& program = *prepared->runtime->program;
+				const auto  writes  = static_cast<size_t>(std::popcount(program.bindings.descriptor_mask));
+				if (program.stage == ShaderType::Pixel) {
+					EXIT_IF(split_pixel != nullptr);
+					split_pixel        = prepared;
+					split_pixel_writes = writes;
+				} else {
+					EXIT_IF(split_vertex_count >= split_vertex.size());
+					split_vertex[split_vertex_count++] = prepared;
+					split_vertex_writes += writes;
+				}
+			}
+		}
+		const std::span<PreparedBindings* const> own_stages =
+		    pipeline.split ? std::span<PreparedBindings* const>(split_vertex.data(), split_vertex_count) : prepared_bindings;
+		const size_t own_writes = pipeline.split ? split_vertex_writes : write_count;
 		// The template is made once per pipeline, from the same stage order as the writes.
-		if (write_count != 0 && pipeline.push_template == nullptr) {
+		if (own_writes != 0 && pipeline.push_template == nullptr) {
 			std::vector<vk::DescriptorUpdateTemplateEntry> entries;
-			BuildCommitPacketEntries(prepared_bindings, entries);
+			BuildCommitPacketEntries(own_stages, entries);
 			EXIT_IF(pipeline.descriptor_set_layout == nullptr || entries.empty());
 			vk::DescriptorUpdateTemplateCreateInfo info {};
 			info.descriptorUpdateEntryCount = static_cast<uint32_t>(entries.size());
@@ -6495,19 +6522,60 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			        vk::Result::eSuccess);
 			pipeline.push_template_bytes = entries.back().offset + entries.back().descriptorCount * CommitPacketStride;
 		}
+		if (pipeline.split && split_pixel_writes != 0) {
+			std::vector<vk::DescriptorUpdateTemplateEntry> entries;
+			BuildCommitPacketEntries(std::span<PreparedBindings* const>(&split_pixel, 1), entries);
+			uint32_t   pixel_bytes    = 0;
+			const auto pixel_template = GplSetTemplate(m_context.GetGraphics(), pipeline.pixel_set_layout, entries, pixel_bytes);
+			CommitPacketHeader pixel_header;
+			pixel_header.buffer           = vk_buffer;
+			pixel_header.layout           = pipeline.pipeline_layout;
+			pixel_header.push_template    = pixel_template;
+			pixel_header.bind_point       = pipeline_bind_point;
+			pixel_header.descriptor_bytes = pixel_bytes;
+			pixel_header.set_index        = ShaderRecompiler::IR::SplitPixelSet;
+			pixel_header.device           = m_context.GetGraphics().device;
+			const bool pixel_worker_heap  = RecordPacketsCommit() && CommandRecorder::RecordedByWorker(vk_buffer);
+			if (!pixel_worker_heap) pixel_header.set = m_context.GetDescriptorHeap().Commit(pipeline.pixel_set_layout);
+			const size_t total = sizeof(pixel_header) + pixel_header.descriptor_bytes;
+			static thread_local std::vector<uint8_t> direct_pixel_packet;
+			auto*      out    = static_cast<uint8_t*>(CommandRecorder::ReserveCall(vk_buffer, total));
+			const bool direct = out == nullptr;
+			if (direct) {
+				direct_pixel_packet.resize(total);
+				out = direct_pixel_packet.data();
+			}
+			if (pixel_worker_heap && !direct) {
+				pixel_header.heap_layout  = pipeline.pixel_set_layout;
+				pixel_header.heap_context = &m_context;
+				pixel_header.heap_tick    = m_context.GetCommandScheduler().CurrentTick();
+			} else if (pixel_worker_heap) {
+				pixel_header.set = m_context.GetDescriptorHeap().Commit(pipeline.pixel_set_layout);
+			}
+			std::memcpy(out, &pixel_header, sizeof(pixel_header));
+			const uint32_t filled =
+			    FillCommitPacket(m_context, out + sizeof(pixel_header), std::span<PreparedBindings* const>(&split_pixel, 1));
+			EXIT_IF(filled != pixel_header.descriptor_bytes);
+			if (direct) {
+				RunCommitPacket(out);
+			} else {
+				CommandRecorder::CommitCall(RunCommitPacket);
+			}
+		}
 		CommitPacketHeader header;
 		header.buffer           = vk_buffer;
 		header.layout           = pipeline.pipeline_layout;
 		header.push_template    = pipeline.push_template;
 		header.bind_point       = pipeline_bind_point;
-		header.push_stages      = push_stages;
+		header.push_stages      = pipeline.split ? pipeline.push_stages : push_stages;
+		header.bindless_index   = pipeline.split ? ShaderRecompiler::IR::SplitBindlessSet : 1u;
 		header.push_bytes       = has_push_data ? static_cast<uint32_t>(sizeof(push_data)) : 0u;
-		header.descriptor_bytes = write_count != 0 ? pipeline.push_template_bytes : 0u;
+		header.descriptor_bytes = own_writes != 0 ? pipeline.push_template_bytes : 0u;
 		const bool heap_set     = header.descriptor_bytes != 0 && !pipeline.uses_push_descriptors;
 		// The record packets: the recording thread takes the set from its own heap for this command buffer's tick
 		// (its pools are touched by that thread only). Otherwise the heap set is taken here, where the old commit took it
 		// (the heap belongs to the committing thread), before the ring room is reserved: a pool reset drains the ring.
-		const bool worker_heap = heap_set && packet && CommandRecorder::RecordedByWorker(vk_buffer);
+		const bool worker_heap = heap_set && RecordPacketsCommit() && CommandRecorder::RecordedByWorker(vk_buffer);
 		if (heap_set) {
 			header.device = m_context.GetGraphics().device;
 			if (!worker_heap) header.set = m_context.GetDescriptorHeap().Commit(pipeline.descriptor_set_layout);
@@ -6538,7 +6606,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			if (header.push_bytes != 0) std::memcpy(out + sizeof(header), push_data.dwords.data(), header.push_bytes);
 			if (header.descriptor_bytes != 0) {
 				const uint32_t filled =
-				    FillCommitPacket(m_context, out + sizeof(header) + header.push_bytes, prepared_bindings);
+				    FillCommitPacket(m_context, out + sizeof(header) + header.push_bytes, own_stages);
 				EXIT_IF(filled != header.descriptor_bytes);
 			}
 			if (direct) {
