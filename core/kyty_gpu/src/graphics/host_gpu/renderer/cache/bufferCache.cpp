@@ -2094,7 +2094,8 @@ BufferCache::CpWriteDecline BufferCache::CpWriteThroughOwnedPage(uint64_t addres
 	if (replaces_gpu_bytes) {
 		GpuDirtySubtract(address, size);
 		// A page left without GPU bytes holds current data in guest memory ("GPU-modified page <=> bytes to download").
-		if (!m_gpu_modified_ranges.Intersects(page, TRACKER_PAGE_SIZE) && m_memory_tracker.IsRegionGpuModified(page, TRACKER_PAGE_SIZE)) {
+		if (m_memory_tracker.IsRegionGpuModified(page, TRACKER_PAGE_SIZE) &&
+		    !HasGpuDirtyBytes(page, TRACKER_PAGE_SIZE, DirtyReader::CpWriteUnmark)) {
 			m_memory_tracker.UnmarkRegionAsGpuModified(page, TRACKER_PAGE_SIZE);
 		}
 		m_cp_write_stats.replaced.fetch_add(1, std::memory_order_relaxed);
@@ -4623,8 +4624,31 @@ bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionGpuModified(vaddr, size);
 }
 
-bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
-	return m_gpu_modified_ranges.Intersects(vaddr, size);
+bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size, DirtyReader reader) {
+	if (m_gpu_modified_ranges.Intersects(vaddr, size)) return true;
+	if (m_eager_readbacks.empty()) return false;
+	const uint32_t kinds = InFlightReadbackKinds(vaddr, size);
+	if (kinds == 0u) return false;
+	const auto site = static_cast<uint32_t>(reader);
+	if ((kinds & 2u) != 0u) {
+		m_in_flight_reads[1][site].fetch_add(1, std::memory_order_relaxed);
+	} else {
+		m_in_flight_reads[0][site].fetch_add(1, std::memory_order_relaxed);
+	}
+	return true;
+}
+
+uint32_t BufferCache::InFlightReadbackKinds(uint64_t vaddr, uint64_t size) const {
+	uint32_t kinds = 0;
+	for (const auto& entry: m_eager_readbacks) {
+		if (!(vaddr < entry.end && entry.start < vaddr + size)) continue;
+		const bool holds = std::ranges::any_of(entry.bytes, [&](const auto& interval) {
+			return vaddr < interval.second && interval.first < vaddr + size;
+		});
+		if (!holds || EagerDone(entry)) continue;
+		kinds |= entry.copy_tick != 0 ? 2u : 1u;
+	}
+	return kinds;
 }
 
 bool BufferCache::HasGpuDirtyBytesShared(uint64_t vaddr, uint64_t size) {

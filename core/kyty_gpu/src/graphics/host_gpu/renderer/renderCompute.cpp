@@ -879,7 +879,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	// Upstream be5915c24: an indirect dispatch whose CPU-visible arguments hold an empty group count does nothing on
 	// the GPU, so it is dropped before its shader is prepared.
 	vk::DispatchIndirectCommand args {};
-	if (!m_context.GetBufferCache().HasGpuDirtyBytes(args_addr, sizeof(args)) &&
+	if (!m_context.GetBufferCache().HasGpuDirtyBytes(args_addr, sizeof(args), BufferCache::DirtyReader::IndirectArgs) &&
 	    LibKernel::Memory::TryReadBacking(args_addr, &args, sizeof(args)) &&
 	    (args.x == 0 || args.y == 0 || args.z == 0)) {
 		return;

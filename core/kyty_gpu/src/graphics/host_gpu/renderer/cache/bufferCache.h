@@ -222,7 +222,9 @@ public:
 	                bool src_gds);
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
-	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	enum class DirtyReader : uint32_t { Texture, IndirectArgs, ImageHeap, GpuWord, CpWriteUnmark, Other, Count };
+	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size, DirtyReader reader = DirtyReader::Other);
+	void               ReportInFlightReadPerf();
 	// HasGpuDirtyBytes for another thread (the resolve thread): the dirty-byte set changes only
 	// through GpuDirtyAdd/GpuDirtySubtract, which take m_gpu_dirty_mutex exclusively; this always takes it shared.
 	[[nodiscard]] bool HasGpuDirtyBytesShared(uint64_t vaddr, uint64_t size);
@@ -902,6 +904,8 @@ private:
 	void                      VerifyCopyReadback(const std::vector<std::pair<uint64_t, uint64_t>>& bytes);
 	// True when an unfinished eager readback is copying one of the bytes of the range.
 	[[nodiscard]] bool PendingReadbackCovers(uint64_t vaddr, uint64_t size) const;
+	[[nodiscard]] uint32_t InFlightReadbackKinds(uint64_t vaddr, uint64_t size) const;
+	std::atomic<uint64_t>  m_in_flight_reads[2][static_cast<uint32_t>(DirtyReader::Count)] {};
 	void        RecordHotRead(uint64_t vaddr);
 	void        BumpHotGeneration(uint64_t vaddr, uint64_t size);
 	void        ApplyEagerReadbacks(uint64_t vaddr, uint64_t size, bool wait);

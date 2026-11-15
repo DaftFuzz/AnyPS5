@@ -3223,8 +3223,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			result         = InsertImage(desc.info);
 			inserted_new   = true;
 			auto& inserted = m_slot_images[result];
-			if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
-			                                    inserted.info.data.size)) {
+			if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address, inserted.info.data.size,
+			                                    BufferCache::DirtyReader::Texture)) {
 				inserted.MarkBufferModified();
 			}
 		}
