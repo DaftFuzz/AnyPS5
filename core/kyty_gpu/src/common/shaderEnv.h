@@ -80,6 +80,7 @@ inline constexpr const char* Names[] = {
 
 // Sorted (strcmp order; checked below).
 inline constexpr const char* OutputOnlyNames[] = {
+    "KYTY_CHECK_NULL_SLOT_RUNTIME",
     "KYTY_DIAG_LDS_STORAGE",
     "KYTY_DIAG_NULL_SLOT_REPLAY",
     // Precompiler report, no module made.

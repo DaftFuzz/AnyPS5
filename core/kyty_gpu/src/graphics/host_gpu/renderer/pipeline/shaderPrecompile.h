@@ -378,6 +378,7 @@ private:
 	[[nodiscard]] std::unordered_set<uint64_t> LoadSuspects();
 	void LoadCompute(const std::unordered_set<uint64_t>& skipped, std::vector<Job>& jobs);
 	void NullSlotReplay(std::vector<Job>& jobs);
+	size_t CanonicalizeNullSlots(std::vector<PrecompileGraphicsRecord>& pipelines);
 	// `stage_jobs`: the shader reuse, the stage-only jobs (queued after all others).
 	void LoadGraphics(const std::unordered_set<uint64_t>& skipped, std::vector<Job>& jobs, std::vector<Job>& stage_jobs);
 	void Worker(uint32_t index);

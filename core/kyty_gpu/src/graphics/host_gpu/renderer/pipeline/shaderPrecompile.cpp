@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCacheTrace.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/ir/passes/NullSlot.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kytyGitVersion.h"
 #include "loader/systemContent.h"
@@ -2252,6 +2253,90 @@ bool ShaderPrecompiler::CoveringRecord(const PrecompileGraphicsRecord& wanted, P
 	return true;
 }
 
+size_t ShaderPrecompiler::CanonicalizeNullSlots(std::vector<PrecompileGraphicsRecord>& pipelines) {
+	if (!ShaderRecompiler::IR::NullSlotRuntimeForStage(ShaderType::Vertex)) return 0;
+	const auto null_slot = [](const ShaderRecompiler::IR::ResourceSpecialization::Buffer& b) {
+		return b.zero_stride_oob && static_cast<uint32_t>(b.descriptor_format) == 0u && b.descriptor_swizzle == 0u;
+	};
+	const auto live_slot = [](const ShaderRecompiler::IR::ResourceSpecialization::Buffer& b) {
+		return !b.zero_stride_oob && (b.packed_stride >> 31u) != 0u && static_cast<uint32_t>(b.descriptor_format) != 0u;
+	};
+	std::unordered_map<uint64_t, std::vector<std::array<uint32_t, 2>>> live;
+	for (const auto key: m_stage_order) {
+		const auto& record = m_stages.at(key).record;
+		auto&       values = live[ProgramKey(RecordIdentity(record))];
+		const auto& bufs   = record.specialization.buffers;
+		if (values.size() < bufs.size()) values.resize(bufs.size(), {0u, 0u});
+		for (size_t i = 0; i < bufs.size(); i++) {
+			if (live_slot(bufs[i])) values[i] = {static_cast<uint32_t>(bufs[i].descriptor_format), bufs[i].descriptor_swizzle};
+		}
+	}
+	std::unordered_map<uint64_t, uint64_t> remap;
+	std::vector<uint64_t>                  order;
+	size_t                                 slots_runtime = 0;
+	size_t                                 slots_shared  = 0;
+	size_t                                 merged        = 0;
+	for (const auto key: m_stage_order) {
+		auto  node   = m_stages.extract(key);
+		auto& record = node.mapped().record;
+		const auto& values = live[ProgramKey(RecordIdentity(record))];
+		bool        changed = false;
+		for (size_t i = 0; i < record.specialization.buffers.size(); i++) {
+			auto& b = record.specialization.buffers[i];
+			if (!null_slot(b)) continue;
+			const bool known = i < values.size() && values[i][0] != 0u;
+			b.packed_stride  = (b.packed_stride & ~0x3fffu) | (1u << 31u) | 1u;
+			b.zero_stride_oob = false;
+			if (known) {
+				b.descriptor_format  = static_cast<Prospero::BufferFormat>(values[i][0]);
+				b.descriptor_swizzle = values[i][1];
+				slots_shared++;
+			} else {
+				b.descriptor_format  = static_cast<Prospero::BufferFormat>(ShaderRecompiler::IR::NullSlot::RuntimeFormat);
+				b.descriptor_swizzle = 0u;
+				slots_runtime++;
+			}
+			changed = true;
+		}
+		const auto new_key = changed ? record.Key() : key;
+		remap[key]         = new_key;
+		if (changed) {
+			m_recorded_graphics.erase(key);
+			m_recorded_graphics.insert(new_key);
+		}
+		if (m_stages.contains(new_key) || std::ranges::find(order, new_key) != order.end()) {
+			merged++;
+			continue;
+		}
+		node.key() = new_key;
+		m_stages.insert(std::move(node));
+		order.push_back(new_key);
+	}
+	m_stage_order = std::move(order);
+	size_t pipelines_changed = 0;
+	for (auto& p: pipelines) {
+		bool changed = false;
+		for (auto& k: p.vertex) {
+			if (k == 0) continue;
+			if (const auto it = remap.find(k); it != remap.end() && it->second != k) {
+				k       = it->second;
+				changed = true;
+			}
+		}
+		if (p.pixel != 0) {
+			if (const auto it = remap.find(p.pixel); it != remap.end() && it->second != p.pixel) {
+				p.pixel = it->second;
+				changed = true;
+			}
+		}
+		if (changed) pipelines_changed++;
+	}
+	std::fprintf(stderr,
+	             "NULL_SLOT_CANON graphics stages=%zu slots_runtime=%zu slots_shared=%zu stages_merged=%zu pipelines_rekeyed=%zu\n",
+	             m_stage_order.size(), slots_runtime, slots_shared, merged, pipelines_changed);
+	return slots_runtime + slots_shared;
+}
+
 void ShaderPrecompiler::LoadGraphics(const std::unordered_set<uint64_t>& skipped, std::vector<Job>& jobs,
                                      std::vector<Job>& stage_jobs) {
 	const auto bytes        = ReadFileBytes(m_graphics_journal_path);
@@ -2302,6 +2387,7 @@ void ShaderPrecompiler::LoadGraphics(const std::unordered_set<uint64_t>& skipped
 		}
 	});
 	torn = torn || !complete;
+	if (CanonicalizeNullSlots(pipelines) != 0u && header_ok && !Config::PrecompileOnly()) torn = true;
 	// The pipelines whose stages were all recorded (a stage record can be missing when its code had changed); one
 	// with a suspect key or stage is skipped for this build.
 	size_t unresolved = 0;
