@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/passes/NullSlot.h"
 
 #include <algorithm>
 #include <fmt/format.h>
@@ -344,6 +345,12 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 				const auto collect_element = [&](uint32_t resource) {
 					auto selected = memory;
 					selected.resource = resource;
+					if (selected.formatted && !selected.typed && resource < program.info.buffers.size() &&
+					    static_cast<uint32_t>(program.info.buffers[resource].descriptor_format) == NullSlot::RuntimeFormat) {
+						info.buffer_u8 = true;
+						info.buffer_u16 = true;
+						info.coherent_narrow |= selected.coherent;
+					}
 					const auto bits = StorageBufferElementBits(program, selected);
 					info.buffer_u8 |= bits == 8u;
 					info.buffer_u16 |= bits == 16u;

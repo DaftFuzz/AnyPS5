@@ -9,6 +9,7 @@
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/passes/NullSlot.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
 #include <algorithm>
@@ -163,6 +164,8 @@ struct EmitterState {
 	// One function per formatted load shape through a GPU-selected
 	// descriptor, the whole load in one call (shape key: channels | components << 4 | d16 << 8 -> function).
 	std::map<uint32_t, uint32_t>                     indirect_formatted_load_functions;
+	std::map<uint64_t, uint32_t>                     runtime_format_functions;
+	std::map<uint32_t, std::array<uint32_t, 3>>      runtime_format_values;
 	uint32_t                                         indirect_raw_function = 0;
 	uint32_t                                         indirect_raw_coherent_function = 0; // GLC accesses (MemoryInfo::coherent)
 	// F1 (grouped IndirectBuffer reads): indirect_raw_x<N>[_coherent], index (N - 2) + 3 * coherent (0: not defined).
@@ -704,6 +707,8 @@ uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t m
 // Slot word of an image heap byte offset; offsets past the heap select the null element.
 uint32_t EmitImageHeapEntry(EmitterState& state, uint32_t key, uint32_t mapping_offset);
 MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem);
+MemoryResourceAccess PrepareBufferResourceAccess(EmitterState& state, const IR::MemoryInfo& mem, uint32_t bits);
+bool                 RuntimeFormatBuffer(const EmitterState& state, const IR::MemoryInfo& mem);
 
 MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState&         state,
                                                         const IR::MemoryInfo& mem,
@@ -825,6 +830,8 @@ void DeclareBdaEntryShare(EmitterState& state);
 // Fills state.scalar_groups (after DefineGetBdaPointer; none when it defined nothing).
 void FindScalarLoadGroups(EmitterState& state);
 void DefineIndirectFormattedLoadFunctions(ValueEmitContext& ctx);
+void DefineRuntimeFormatFunctions(ValueEmitContext& ctx);
+void EmitRuntimeFormatValues(EmitterState& state);
 void DefineIndirectRawDword(ValueEmitContext& ctx);
 void ApplyHelperInline(EmitterState& state, std::vector<uint32_t>& module);
 void DefineIndirectStoreFunctions(ValueEmitContext& ctx);

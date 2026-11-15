@@ -826,6 +826,7 @@ struct Bindings {
 	// One dword per buffer binding with its descriptor's record
 	// stride, so the stride is shader data instead of part of the pipeline specialization.
 	uint32_t memory_stride_dword = PushData::NoStart;
+	uint32_t memory_word3_dword  = PushData::NoStart;
 
 	// The buffer bindings the stage has.
 	[[nodiscard]] uint32_t BufferBindings() const {
@@ -833,6 +834,7 @@ struct Bindings {
 	}
 	[[nodiscard]] uint32_t ShaderDataDwords() const {
 		const auto buffers = BufferBindings();
+		if (memory_word3_dword != PushData::NoStart) return memory_word3_dword + buffers;
 		if (memory_stride_dword != PushData::NoStart) return memory_stride_dword + buffers;
 		return memory_offset_dword + (buffers + 3u) / 4u;
 	}
@@ -1214,6 +1216,8 @@ struct ResourcePlan {
 		// and per binding whether this session has had a live V# of it (its first is checked against the journal).
 		std::vector<std::array<uint32_t, 2>> journal;
 		std::vector<uint8_t>                 journal_checked;
+		std::vector<uint8_t>                 null_pending;
+		std::vector<std::array<uint64_t, 2>> slot_keys;
 	};
 	std::shared_ptr<NullFormattedLive> null_formatted_live = std::make_shared<NullFormattedLive>();
 };

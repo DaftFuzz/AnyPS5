@@ -175,8 +175,9 @@ bool AheadReadMemory(void* userdata, uint64_t address, std::span<uint32_t> value
 // reader replaces it. Returns false (and says why in *refusal) when it refused; the outputs are then unusable.
 // the null formatted share for a materialization a worker made (see ResourcePlan::Scratch::null_share_kinds):
 // applies and updates the plan's shared last live specializations in draw order (GPU thread).
-void ApplyNullFormattedShare(const ResourcePlan& program, const std::vector<uint8_t>& kinds,
+bool ApplyNullFormattedShare(const ResourcePlan& program, const std::vector<uint8_t>& kinds,
                              ResourceSpecialization& specialization);
+bool NullSlotRuntimeLive(const ResourcePlan& program, const std::vector<uint8_t>& kinds);
 // Project 15 S2d: what ApplyNullFormattedShare does to `specialization` (the null buffers take the shared format),
 // without its writes (the live formats and the journal stay as they are). Under the plan's share lock.
 void PeekNullFormattedShare(const ResourcePlan& program, const std::vector<uint8_t>& kinds,

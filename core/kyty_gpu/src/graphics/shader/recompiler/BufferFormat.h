@@ -249,6 +249,10 @@ constexpr BufferFormatInfo GetFormatInfo(Prospero::BufferFormat format) {
 	}
 }
 
+constexpr uint32_t FormattedElementBits(const BufferFormatInfo& info) {
+	return info.type == ComponentType::Unknown || info.packed_bitfield ? 32u : info.component_bits[0];
+}
+
 constexpr uint32_t GetFormatComponentByteOffset(const BufferFormatInfo& info, uint32_t component) {
 	if (component >= info.component_count) {
 		return 0;

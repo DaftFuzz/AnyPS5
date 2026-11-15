@@ -1039,6 +1039,7 @@ void EmitProgram(EmitterState& state) {
 	DefineGetBdaPointer(state);
 	FindScalarLoadGroups(state);
 	DefineIndirectFormattedLoadFunctions(ctx);
+	DefineRuntimeFormatFunctions(ctx);
 	DefineIndirectRawDword(ctx);
 	DefineIndirectStoreFunctions(ctx);
 	DefineBvhIntersect(state);
@@ -1215,6 +1216,7 @@ void EmitProgram(EmitterState& state) {
 		                                     ConstantU32(state, LdsDwordCount(state)));
 	}
 	EmitMemoryOffsets(state);
+	EmitRuntimeFormatValues(state);
 	EmitPairInitialize(state);
 	if (state.objprim_output_variable != 0) {
 		EmitObjprimIdOutput(state);

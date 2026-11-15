@@ -379,23 +379,31 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 		case IR::ResourceKind::Global:
 			EXIT("physical address memory must use the BDA emitter\n");
 		case IR::ResourceKind::ScalarBuffer:
-		case IR::ResourceKind::Buffer: {
-			const auto bits = mem.kind == IR::ResourceKind::Buffer
-			                      ? IR::StorageBufferElementBits(state.program, mem) : 32u;
-			auto* buffer = &state.storage_buffers[2];
-			if (bits == 8u) {
-				buffer = &state.storage_buffers[0];
-			} else if (bits == 16u) {
-				buffer = &state.storage_buffers[1];
-			} else if (mem.coherent && state.coherent_buffers_alias.variable != 0) {
-				buffer = &state.coherent_buffers_alias; // only GLC accesses
-			}
-			access = PrepareStorageBufferResourceAccess(state, mem, *buffer);
-			access.element_bits = bits;
-			return access;
-		}
+		case IR::ResourceKind::Buffer:
+			return PrepareBufferResourceAccess(
+			    state, mem, mem.kind == IR::ResourceKind::Buffer ? IR::StorageBufferElementBits(state.program, mem) : 32u);
 		default: EXIT("unsupported memory resource kind: %u\n", static_cast<unsigned>(mem.kind));
 	}
+}
+
+MemoryResourceAccess PrepareBufferResourceAccess(EmitterState& state, const IR::MemoryInfo& mem, uint32_t bits) {
+	auto* buffer = &state.storage_buffers[2];
+	if (bits == 8u) {
+		buffer = &state.storage_buffers[0];
+	} else if (bits == 16u) {
+		buffer = &state.storage_buffers[1];
+	} else if (mem.coherent && state.coherent_buffers_alias.variable != 0) {
+		buffer = &state.coherent_buffers_alias;
+	}
+	auto access         = PrepareStorageBufferResourceAccess(state, mem, *buffer);
+	access.element_bits = bits;
+	return access;
+}
+
+bool RuntimeFormatBuffer(const EmitterState& state, const IR::MemoryInfo& mem) {
+	return mem.kind == IR::ResourceKind::Buffer && mem.formatted && !mem.typed &&
+	       mem.resource < state.program.info.buffers.size() &&
+	       static_cast<uint32_t>(state.program.info.buffers[mem.resource].descriptor_format) == IR::NullSlot::RuntimeFormat;
 }
 
 uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAccess& access,

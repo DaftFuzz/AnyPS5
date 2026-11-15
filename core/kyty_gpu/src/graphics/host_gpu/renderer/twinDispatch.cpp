@@ -147,7 +147,8 @@ const char* Incompatible(const ShaderRecompiler::IR::CompiledShaderInfo& a, cons
 	    pa.uses_bindless != pb.uses_bindless || pa.uses_push_descriptors != pb.uses_push_descriptors)
 		return "descriptor layout differs";
 	if (x.push_data_start_dword != y.push_data_start_dword || x.dispatch_thread_dword != y.dispatch_thread_dword ||
-	    x.memory_offset_dword != y.memory_offset_dword || x.memory_stride_dword != y.memory_stride_dword)
+	    x.memory_offset_dword != y.memory_offset_dword || x.memory_stride_dword != y.memory_stride_dword ||
+	    x.memory_word3_dword != y.memory_word3_dword)
 		return "push data layout differs";
 	if (!(a.info.images == b.info.images) || !(a.info.buffers == b.info.buffers) || !(a.info.samplers == b.info.samplers))
 		return "resources differ";

@@ -271,6 +271,10 @@ void DefineDescriptors(EmitterState& state) {
 	// After the packed offsets, one dword per buffer binding holds its record stride.
 	if (buffer_count != 0u)
 		bindings.memory_stride_dword = bindings.memory_offset_dword + (buffer_count + 3u) / 4u;
+	if (buffer_count != 0u && std::ranges::any_of(info.buffers, [](const auto& buffer) {
+		    return static_cast<uint32_t>(buffer.descriptor_format) == IR::NullSlot::RuntimeFormat;
+	    }))
+		bindings.memory_word3_dword = bindings.memory_stride_dword + buffer_count;
 	bindings.push_data_start_dword =
 	    IR::PushData::StartFor(bindings.push_data_start_dword, bindings.ShaderDataDwords());
 	counts[static_cast<size_t>(Kind::ShaderData)] =

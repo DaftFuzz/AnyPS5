@@ -441,6 +441,7 @@ void SerializeCompiledInfo(const IR::CompiledShaderInfo& info, std::vector<uint3
 	o.U32(b.dispatch_thread_dword);
 	o.U32(b.memory_offset_dword);
 	o.U32(b.memory_stride_dword);
+	o.U32(b.memory_word3_dword);
 }
 
 bool DeserializeCompiledInfo(std::span<const uint32_t> words, IR::CompiledShaderInfo& info) {
@@ -461,6 +462,7 @@ bool DeserializeCompiledInfo(std::span<const uint32_t> words, IR::CompiledShader
 	b.dispatch_thread_dword = i.U32();
 	b.memory_offset_dword   = i.U32();
 	b.memory_stride_dword   = i.U32();
+	b.memory_word3_dword    = i.U32();
 	return i.ok && i.AtEnd();
 }
 

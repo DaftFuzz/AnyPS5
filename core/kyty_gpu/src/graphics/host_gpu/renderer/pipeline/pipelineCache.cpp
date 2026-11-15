@@ -1318,10 +1318,10 @@ struct PipelineCache::ProgramCache {
 		for (uint32_t i = 0; i < results.count; i++) {
 			auto& r     = results.stages[i];
 			auto& entry = *static_cast<SourceEntry*>(r.entry);
-			ShaderRecompiler::IR::ApplyNullFormattedShare(*r.plan, r.null_share_kinds, r.specialization);
+			const bool runtime_live = ShaderRecompiler::IR::ApplyNullFormattedShare(*r.plan, r.null_share_kinds, r.specialization);
 			auto*      permutation = static_cast<Permutation*>(r.permutation);
 			const bool shared      = std::ranges::find(r.null_share_kinds, uint8_t {1}) != r.null_share_kinds.end();
-			if (permutation == nullptr || shared || !permutation->program.bindings.PushStartMatches(cursor)) {
+			if (permutation == nullptr || shared || runtime_live || !permutation->program.bindings.PushStartMatches(cursor)) {
 				t_adopt_refinds++; // KYTY_CHECK_PEEK=2 (S2d)
 				permutation = entry.FindPermutation<false>(cursor, r.specialization);
 				if (permutation == nullptr) return false;
@@ -1357,7 +1357,8 @@ struct PipelineCache::ProgramCache {
 			const auto& r           = results.stages[i];
 			const auto& entry       = *static_cast<const SourceEntry*>(r.entry);
 			const auto* permutation = static_cast<const Permutation*>(r.permutation);
-			const bool  shared      = std::ranges::find(r.null_share_kinds, uint8_t {1}) != r.null_share_kinds.end();
+			const bool  shared      = std::ranges::find(r.null_share_kinds, uint8_t {1}) != r.null_share_kinds.end() ||
+			                    ShaderRecompiler::IR::NullSlotRuntimeLive(*r.plan, r.null_share_kinds);
 			const bool  push_same   = permutation != nullptr && permutation->program.bindings.PushStartMatches(cursor);
 			out.flags |= ((permutation == nullptr ? 1u : 0u) | (shared ? 2u : 0u) | (permutation != nullptr && !push_same ? 4u : 0u))
 			             << (3u * std::min(i, 3u));

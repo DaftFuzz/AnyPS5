@@ -1,5 +1,13 @@
 set(ANYPS5_KYTY_GPU_FILE "")
 set(ANYPS5_KYTY_GPU_TARGET "")
+if(BUILD_TESTING)
+    file(CONFIGURE OUTPUT "${CMAKE_BINARY_DIR}/kyty_null_slot_tests/cmake_config.h" CONTENT "")
+    add_test_executable(kyty_null_slot_tests core/kyty_gpu/tests/NullSlot.cpp)
+    target_include_directories(kyty_null_slot_tests PRIVATE
+        "${CMAKE_SOURCE_DIR}/core/kyty_gpu/src" "${CMAKE_BINARY_DIR}/kyty_null_slot_tests")
+    add_test(NAME kyty_null_slot COMMAND kyty_null_slot_tests)
+    set_tests_properties(kyty_null_slot PROPERTIES TIMEOUT 20)
+endif()
 if(NOT WIN32)
     return()
 endif()

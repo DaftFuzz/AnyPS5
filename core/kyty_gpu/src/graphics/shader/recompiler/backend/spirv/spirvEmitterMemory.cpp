@@ -13,8 +13,11 @@
 #include <array>
 #include <bit>
 #include <map>
+#include <optional>
+#include <span>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -437,13 +440,16 @@ uint32_t LoadWordBranchless(ValueEmitContext& ctx, const IR::Inst& inst, const I
 	return Select(state, TypeU32(state), ok, LoadWordInBounds(ctx, resource, safe), ConstantU32(state, 0));
 }
 
-uint32_t LoadWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
-                          const MemoryResourceAccess& resource) {
-	if (RobustBuffer(ctx.state, resource)) return LoadWordBranchless(ctx, inst, mem, resource, 0u);
-	const auto index = DwordIndex(ctx, inst, mem);
+uint32_t LoadWordPreparedAt(ValueEmitContext& ctx, uint32_t index, const MemoryResourceAccess& resource) {
+	if (RobustBuffer(ctx.state, resource)) return LoadWordInBounds(ctx, resource, RobustElement(ctx.state, resource, 0u, index));
 	return EmitValueOrZeroIfCondition(
 	    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index),
 	    [&]() { return LoadWordInBounds(ctx, resource, index); });
+}
+
+uint32_t LoadWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
+                          const MemoryResourceAccess& resource) {
+	return LoadWordPreparedAt(ctx, DwordIndex(ctx, inst, mem), resource);
 }
 
 uint32_t LoadWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) {
@@ -955,7 +961,13 @@ uint32_t FormattedOutOfBoundsValue(ValueEmitContext& ctx, const IR::MemoryInfo& 
 	return NullFormattedOutOfBounds(ctx, mem, components, ConstructU32Composite(ctx.state, components, values));
 }
 
+uint32_t CallRuntimeFormat(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem);
+
 uint32_t FormattedLoad(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
+	if (RuntimeFormatBuffer(ctx.state, mem)) {
+		return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1),
+		                                  [&]() { return CallRuntimeFormat(ctx, inst, mem); });
+	}
 	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
 		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
 		const auto info = Format::GetFormatInfo(BufferFormat(ctx, mem));
@@ -2321,6 +2333,301 @@ uint32_t LoadIndirectFormattedVector(ValueEmitContext& ctx, const IndirectBuffer
 	return ConstructU32Composite(state, components, words);
 }
 
+enum class RuntimeFormatOp : uint32_t { Load, LoadVector };
+
+std::optional<RuntimeFormatOp> RuntimeFormatOpOf(const IR::Inst& inst, const IR::MemoryInfo& mem) {
+	const auto op         = inst.GetOpcode();
+	const auto components = IR::BufferComponentCount(op);
+	if (IR::BufferAccessOf(op) != IR::BufferAccess::Read) return std::nullopt;
+	if (components > 1u || (components == 1u && mem.data_bits == 16u)) return RuntimeFormatOp::LoadVector;
+	if (op == IR::ValueOpcode::LoadBufferU32) return RuntimeFormatOp::Load;
+	return std::nullopt;
+}
+
+uint32_t RuntimeFormatComponents(RuntimeFormatOp op, const IR::Inst& inst) {
+	return op == RuntimeFormatOp::Load ? 1u : IR::BufferComponentCount(inst.GetOpcode());
+}
+
+uint64_t RuntimeFormatKey(RuntimeFormatOp op, uint32_t components, const IR::MemoryInfo& mem) {
+	return uint64_t {mem.resource} | uint64_t {static_cast<uint32_t>(op)} << 32u | uint64_t {components} << 36u |
+	       uint64_t {mem.data_bits == 16u ? 1u : 0u} << 40u | uint64_t {mem.component_count & 7u} << 41u |
+	       uint64_t {mem.coherent ? 1u : 0u} << 44u;
+}
+
+constexpr uint32_t RuntimeTableWords = FormattedTableWords + 1u;
+
+constexpr std::array<uint32_t, FormattedTableFormats * RuntimeTableWords> BuildRuntimeFormatTable() {
+	constexpr auto                                             layout = BuildFormattedTable();
+	std::array<uint32_t, FormattedTableFormats * RuntimeTableWords> table {};
+	for (uint32_t format = 0; format < FormattedTableFormats; ++format) {
+		for (uint32_t word = 0; word < FormattedTableWords; ++word) {
+			table[format * RuntimeTableWords + word] = layout[format * FormattedTableWords + word];
+		}
+		const auto info = Format::GetFormatInfo(static_cast<Prospero::BufferFormat>(format));
+		table[format * RuntimeTableWords + FormattedTableWords] =
+		    static_cast<uint32_t>(std::countr_zero(Format::FormattedElementBits(info) / 8u));
+	}
+	return table;
+}
+
+uint32_t RuntimeSelector(EmitterState& state, uint32_t word3, uint32_t channel) {
+	return EmitBitFieldUExtract(state, word3, ConstantU32(state, channel * 3u), ConstantU32(state, 3u));
+}
+
+uint32_t RuntimeLoadByte(ValueEmitContext& ctx, const MemoryResourceAccess& bytes, uint32_t index) {
+	auto&      state   = ctx.state;
+	const auto id      = state.builder.AllocateId();
+	const auto pointer = EmitMemoryElementPointer(state, bytes, index);
+	return Unary(state, spv::OpUConvert, TypeU32(state),
+	             LoadResourceElement(state, state.storage_buffers[0].element_type, id, pointer, bytes, index));
+}
+
+uint32_t RuntimeEntryType(EmitterState& state) {
+	return state.builder.Type(spv::OpTypeArray, TypeU32(state), ConstantU32(state, RuntimeTableWords));
+}
+
+uint32_t RuntimeFormattedLoad(ValueEmitContext& ctx, const IR::MemoryInfo& mem, RuntimeFormatOp op, uint32_t components,
+                              uint32_t picked, uint32_t word3, uint32_t stride, const std::vector<uint32_t>& addresses) {
+	auto&      state   = ctx.state;
+	const auto u32     = TypeU32(state);
+	const auto boolean = TypeBool(state);
+	const auto zero    = ConstantU32(state, 0);
+	const auto field   = [&](uint32_t word, uint32_t first, uint32_t count) {
+		return EmitBitFieldUExtract(state, word, ConstantU32(state, first), ConstantU32(state, count));
+	};
+	const auto flag = [&](uint32_t word, uint32_t bit) {
+		return Binary(state, spv::OpINotEqual, boolean, field(word, bit, 1u), zero);
+	};
+	const auto word = [&](uint32_t index) {
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, u32, value, picked, index);
+		return value;
+	};
+	const auto head      = word(0);
+	const auto known     = flag(head, 0);
+	const auto count     = field(head, 8, 3);
+	const auto shift     = word(FormattedTableWords);
+	const auto channels  = op == RuntimeFormatOp::LoadVector && mem.data_bits == 16u ? mem.component_count : components;
+	const auto vector    = TypeU32Composite(state, 4u);
+	const auto zero4     = ConstantU32CompositeZero(state, 4u);
+	const auto extract4  = [&](uint32_t composite, uint32_t index) {
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, u32, value, composite, index);
+		return value;
+	};
+	const auto raw = EmitValueOrDefaultIfCondition(state, Unary(state, spv::OpLogicalNot, boolean, known), vector, zero4, [&]() {
+		const auto              resource = PrepareBufferResourceAccess(state, mem, 32u);
+		std::array<uint32_t, 4> values {zero, zero, zero, zero};
+		for (uint32_t component = 0; component < components; component++) {
+			values[component] = LoadWordPreparedAt(
+			    ctx, Binary(state, spv::OpShiftRightLogical, u32, addresses[component], ConstantU32(state, 2)), resource);
+		}
+		return ConstructU32Composite(state, 4u, values);
+	});
+	const auto sources = EmitValueOrDefaultIfCondition(state, known, vector, zero4, [&]() {
+		const auto bytes     = PrepareBufferResourceAccess(state, mem, 8u);
+		const auto dwords    = PrepareBufferResourceAccess(state, mem, 32u);
+		const auto start     = addresses[0];
+		const auto end       = Binary(state, spv::OpIAdd, u32, start,
+		                              Binary(state, spv::OpISub, u32, field(head, 1, 5), ConstantU32(state, 1)));
+		const auto in_bounds = AndCondition(
+		    state, Binary(state, spv::OpUGreaterThanEqual, boolean, end, start),
+		    Binary(state, spv::OpULessThan, boolean, Binary(state, spv::OpShiftRightLogical, u32, end, shift),
+		           Binary(state, spv::OpShiftRightLogical, u32, bytes.length, shift)));
+		const auto base       = Binary(state, spv::OpBitwiseAnd, u32, start, Unary(state, spv::OpNot, u32, field(head, 6, 2)));
+		const auto dword_base = Binary(state, spv::OpBitwiseAnd, u32, base, ConstantU32(state, ~3u));
+		const auto first      = Binary(state, spv::OpShiftRightLogical, u32, dword_base, ConstantU32(state, 2));
+		std::array<uint32_t, 4> words {};
+		for (uint32_t dword = 0; dword < 4u; ++dword) {
+			const auto used  = Binary(state, spv::OpINotEqual, boolean, field(head, 16u + 4u * dword, 4u), zero);
+			const auto need  = AndCondition(state, in_bounds, used);
+			const auto index = Binary(state, spv::OpIAdd, u32, first, ConstantU32(state, dword));
+			const auto whole = Binary(state, spv::OpULessThan, boolean, index, dwords.length);
+			const auto full  = EmitValueOrZeroIfCondition(state, AndCondition(state, need, whole),
+			                                              [&]() { return LoadWordInBounds(ctx, dwords, index); });
+			const auto part  = EmitValueOrZeroIfCondition(
+			    state, AndCondition(state, need, Unary(state, spv::OpLogicalNot, boolean, whole)), [&]() {
+				    auto assembled = zero;
+				    for (uint32_t byte = 0; byte < 4u; ++byte) {
+					    const auto at    = Binary(state, spv::OpIAdd, u32, dword_base, ConstantU32(state, dword * 4u + byte));
+					    const auto valid = Binary(state, spv::OpULessThan, boolean, at, bytes.length);
+					    const auto value = EmitValueOrZeroIfCondition(state, valid, [&]() { return RuntimeLoadByte(ctx, bytes, at); });
+					    assembled        = Binary(state, spv::OpBitwiseOr, u32, assembled,
+					                              Binary(state, spv::OpShiftLeftLogical, u32, value, ConstantU32(state, byte * 8u)));
+				    }
+				    return assembled;
+			    });
+			words[dword] = Binary(state, spv::OpBitwiseOr, u32, full, part);
+		}
+		std::array<uint32_t, 4> converted {};
+		for (uint32_t source = 0; source < 4u; ++source) {
+			const auto desc  = word(1u + source);
+			const auto which = field(desc, 0, 2);
+			auto       value = words[0];
+			for (uint32_t d = 1; d < 4u; ++d) {
+				value = Select(state, u32, Binary(state, spv::OpIEqual, boolean, which, ConstantU32(state, d)), words[d], value);
+			}
+			const auto byte     = Binary(state, spv::OpBitwiseAnd, u32, Binary(state, spv::OpIAdd, u32, base, field(desc, 2, 2)),
+			                             ConstantU32(state, 3));
+			const auto position = Binary(state, spv::OpIAdd, u32, Binary(state, spv::OpShiftLeftLogical, u32, byte, ConstantU32(state, 3)),
+			                             field(desc, 4, 5));
+			const auto bits     = field(desc, 9, 6);
+			const auto extracted = Select(state, u32, flag(desc, 15), EmitBitFieldSExtract(state, value, position, bits),
+			                              EmitBitFieldUExtract(state, value, position, bits));
+			const auto convert = [&]() {
+				return EmitIndexSwitch(state, field(desc, 16, 5), static_cast<uint32_t>(FormattedConv::Count), u32,
+				                       [&](uint32_t conv) {
+					                       const auto kind = static_cast<FormattedConv>(conv);
+					                       return kind == FormattedConv::Identity
+					                                  ? extracted
+					                                  : NormalizeFormatComponent(state, FormattedConvInfo(kind), 0u, extracted);
+				                       });
+			};
+			const auto selected = Binary(state, spv::OpULessThan, boolean, ConstantU32(state, source), count);
+			converted[source]   = EmitValueOrZeroIfCondition(state, AndCondition(state, in_bounds, selected), convert);
+		}
+		return ConstructU32Composite(state, 4u, converted);
+	});
+	std::array<uint32_t, 4> source {};
+	for (uint32_t index = 0; index < 4u; ++index) source[index] = extract4(sources, index);
+	const auto class_bits = field(head, 12, 2);
+	const auto one        = Select(state, u32, flag(head, 11), ConstantU32(state, 1), ConstantU32(state, 0x3f800000u));
+	const auto modulus    = Select(state, u32, Binary(state, spv::OpIEqual, boolean, count, zero), ConstantU32(state, 1), count);
+	const auto channel_value = [&](uint32_t channel) {
+		const auto selector = RuntimeSelector(state, word3, channel);
+		const auto memory   = Binary(state, spv::OpUGreaterThanEqual, boolean, selector, ConstantU32(state, 4));
+		const auto index    = Binary(state, spv::OpUMod, u32, Binary(state, spv::OpISub, u32, selector, ConstantU32(state, 4)), modulus);
+		auto       picked   = source[0];
+		for (uint32_t candidate = 1; candidate < 4u; candidate++) {
+			picked = Select(state, u32, Binary(state, spv::OpIEqual, boolean, index, ConstantU32(state, candidate)), source[candidate],
+			                picked);
+		}
+		const auto constant = Select(state, u32, Binary(state, spv::OpIEqual, boolean, selector, ConstantU32(state, 1)), one, zero);
+		return Select(state, u32, memory, picked, constant);
+	};
+	const auto live     = Binary(state, spv::OpINotEqual, boolean, stride, zero);
+	const auto is_class = [&](uint32_t value) {
+		return Binary(state, spv::OpIEqual, boolean, class_bits, ConstantU32(state, value));
+	};
+	const auto by_class = [&](uint32_t as_uint, uint32_t as_sint, uint32_t as_float) {
+		return Select(state, u32, is_class(0u), as_uint, Select(state, u32, is_class(1u), as_sint, as_float));
+	};
+	const auto finish = [&](uint32_t component, uint32_t formatted) {
+		return Select(state, u32, known, Select(state, u32, live, formatted, zero), extract4(raw, component));
+	};
+	if (op == RuntimeFormatOp::Load) {
+		const auto value = channel_value(0u);
+		if (mem.data_bits != 16u) return finish(0u, value);
+		const auto as_uint  = EmitUMin32(state, value, ConstantU32(state, 0xffffu));
+		const auto as_sint  = EmitSMin32(state, EmitSMax32(state, value, ConstantU32(state, 0xffff8000u)), ConstantU32(state, 0x7fffu));
+		const auto as_float = EmitConvertF16F32(state, EmitBitCastF32U32(state, value));
+		return finish(0u, by_class(as_uint, as_sint, as_float));
+	}
+	std::array<uint32_t, 4> values {};
+	if (mem.data_bits == 16u) {
+		std::array<uint32_t, 4> channel_values {};
+		for (uint32_t channel = 0; channel < channels; channel++) channel_values[channel] = channel_value(channel);
+		for (uint32_t index = 0; index < components; index++) {
+			const std::array<uint32_t, 4> pair {index * 2u < channels ? channel_values[index * 2u] : zero,
+			                                    index * 2u + 1u < channels ? channel_values[index * 2u + 1u] : zero, 0u, 0u};
+			const auto pack = [&](Format::ComponentType type) {
+				Format::BufferFormatInfo info {};
+				info.type = type;
+				return PackD16Channels(state, info, pair, 2u, 1u);
+			};
+			values[index] = finish(index, by_class(pack(Format::ComponentType::Uint), pack(Format::ComponentType::Sint),
+			                                       pack(Format::ComponentType::Float)));
+		}
+		return ConstructU32Composite(state, components, values);
+	}
+	for (uint32_t index = 0; index < components; index++) values[index] = finish(index, channel_value(index));
+	return ConstructU32Composite(state, components, values);
+}
+
+void DefineRuntimeFormatFunctionsImpl(ValueEmitContext& ctx) {
+	auto& state = ctx.state;
+	if (state.program.bindings.memory_word3_dword == IR::PushData::NoStart) return;
+	std::map<uint64_t, IR::MemoryInfo> found;
+	for (const auto* block: state.program.blocks) {
+		for (const auto& inst: *block) {
+			if (IR::BufferAccessOf(inst.GetOpcode()) == IR::BufferAccess::None) continue;
+			const auto index = inst.Flags<IR::MemoryFlags>().index;
+			if (index >= state.program.memory_info.size()) continue;
+			const auto& mem = state.program.memory_info[index];
+			if (!RuntimeFormatBuffer(state, mem)) continue;
+			const auto op = RuntimeFormatOpOf(inst, mem);
+			if (!op.has_value()) EXIT("runtime-format buffer %u has an access without a runtime-format form\n", mem.resource);
+			found.try_emplace(RuntimeFormatKey(*op, RuntimeFormatComponents(*op, inst), mem), mem);
+		}
+	}
+	const auto u32 = TypeU32(state);
+	for (const auto& [key, mem]: found) {
+		const auto op            = static_cast<RuntimeFormatOp>((key >> 32u) & 0xfu);
+		const auto components    = static_cast<uint32_t>((key >> 36u) & 0xfu);
+		const auto result_type   = TypeU32Composite(state, components);
+		std::vector<uint32_t> parameter_types(components, u32);
+		parameter_types.insert(parameter_types.end(), {RuntimeEntryType(state), u32, u32});
+		const auto function_type = state.builder.Type(spv::OpTypeFunction, result_type, std::span<const uint32_t>(parameter_types));
+		const auto function      = state.builder.AllocateId();
+		state.builder.AddName(function, "runtime_format_load");
+		state.builder.AddFunction(spv::OpFunction, result_type, function, spv::FunctionControlDontInlineMask, function_type);
+		std::vector<uint32_t> parameters;
+		for (const auto type: parameter_types) {
+			parameters.push_back(state.builder.AllocateId());
+			state.builder.AddFunction(spv::OpFunctionParameter, type, parameters.back());
+		}
+		const std::vector<uint32_t> addresses(parameters.begin(), parameters.begin() + components);
+		EmitLabel(state, state.builder.AllocateId());
+		state.builder.AddFunction(spv::OpReturnValue,
+		                          RuntimeFormattedLoad(ctx, mem, op, components, parameters[components], parameters[components + 1u],
+		                                               parameters[components + 2u], addresses));
+		state.builder.AddFunction(spv::OpFunctionEnd);
+		state.runtime_format_functions[key] = function;
+		state.runtime_format_values.try_emplace(mem.resource, std::array<uint32_t, 3> {});
+	}
+}
+
+void EmitRuntimeFormatValuesImpl(EmitterState& state) {
+	if (state.runtime_format_values.empty()) return;
+	const auto stride_dword = state.program.bindings.memory_stride_dword;
+	if (stride_dword == IR::PushData::NoStart) EXIT("dynamic buffer stride has no shader-data slot\n");
+	static constexpr auto table_words = BuildRuntimeFormatTable();
+	const auto            entry_type  = RuntimeEntryType(state);
+	for (auto& [resource, values]: state.runtime_format_values) {
+		const auto binding = ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers, resource);
+		const auto word3   = EmitShaderDataDwordLoad(state, state.program.bindings.memory_word3_dword + binding);
+		const auto stride  = EmitShaderDataDwordLoad(state, stride_dword + binding);
+		const auto format  = EmitBitFieldUExtract(state, word3, ConstantU32(state, IR::NullSlot::FormatField),
+		                                          ConstantU32(state, IR::NullSlot::FormatBits));
+		const auto picked  = EmitIndexSwitch(state, format, FormattedTableFormats, entry_type, [&](uint32_t item) {
+			std::array<uint32_t, RuntimeTableWords> ids {};
+			for (uint32_t i = 0; i < RuntimeTableWords; ++i) ids[i] = ConstantU32(state, table_words[item * RuntimeTableWords + i]);
+			return state.builder.Constant(spv::OpConstantComposite, entry_type, std::span<const uint32_t>(ids));
+		});
+		values = {picked, word3, stride};
+	}
+}
+
+uint32_t CallRuntimeFormat(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
+	auto&      state = ctx.state;
+	const auto op    = RuntimeFormatOpOf(inst, mem);
+	if (!op.has_value()) ctx.Fail(inst, "runtime-format buffer access has no runtime-format form");
+	const auto components = RuntimeFormatComponents(*op, inst);
+	const auto found      = state.runtime_format_functions.find(RuntimeFormatKey(*op, components, mem));
+	if (found == state.runtime_format_functions.end()) ctx.Fail(inst, "runtime-format function was not defined");
+	std::vector<uint32_t> arguments {ByteAddress(ctx, inst, mem)};
+	for (uint32_t component = 1; component < components; component++) {
+		arguments.push_back(ByteAddress(ctx, inst, RebaseRawComponent(mem, component)));
+	}
+	const auto values = state.runtime_format_values.find(mem.resource);
+	if (values == state.runtime_format_values.end() || values->second[0] == 0u) ctx.Fail(inst, "runtime-format values were not emitted");
+	arguments.insert(arguments.end(), values->second.begin(), values->second.end());
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpFunctionCall, TypeU32Composite(state, components), result, found->second,
+	                          std::span<const uint32_t>(arguments));
+	return result;
+}
+
 uint32_t IndirectFormattedLoadKey(uint32_t channels, uint32_t components, bool d16) {
 	return channels | components << 4u | (d16 ? 1u : 0u) << 8u;
 }
@@ -2688,6 +2995,7 @@ uint32_t LoadBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compon
 			    return mem.formatted ? LoadIndirectFormatted(ctx, inst, components)
 			                         : LoadIndirectBuffer(ctx, inst, components);
 		    }
+		    if (RuntimeFormatBuffer(state, mem)) return CallRuntimeFormat(ctx, inst, mem);
 		    const auto resource = PrepareMemoryResourceAccess(state, mem);
 		    const auto info = Format::GetFormatInfo(
 		        mem.formatted ? BufferFormat(ctx, mem) : Prospero::BufferFormat::kInvalid);
@@ -2880,6 +3188,14 @@ void ReportBdaStoreMiss(EmitterState& state, uint32_t address, uint32_t bda) {
 			               ConstantU32(state, static_cast<uint32_t>(hash >> 32u)));
 		});
 	});
+}
+
+void DefineRuntimeFormatFunctions(ValueEmitContext& ctx) {
+	DefineRuntimeFormatFunctionsImpl(ctx);
+}
+
+void EmitRuntimeFormatValues(EmitterState& state) {
+	EmitRuntimeFormatValuesImpl(state);
 }
 
 void DefineIndirectFormattedLoadFunctions(ValueEmitContext& ctx) {

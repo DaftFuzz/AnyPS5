@@ -9,6 +9,7 @@
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/BindlessBindings.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/passes/NullSlot.h"
 #include "graphics/shader/recompiler/ir/passes/SrtTape.h"
 #include "graphics/shader/shaderBindings.h"
 
@@ -2323,6 +2324,203 @@ void ReadOrdinaryMemory(uint64_t vaddr, void* data, uint64_t size) {
 	}
 }
 
+namespace {
+
+bool NullSlotSwitch(const char* value, const char* label) {
+	const bool enabled = value != nullptr && value[0] == '1';
+	if (enabled) std::fprintf(stderr, "%s enabled\n", label);
+	return enabled;
+}
+
+bool NullSlotSeedEnabled() {
+	static const bool on = NullSlotSwitch(Common::ShaderEnv::Read("KYTY_PERF_NULL_SLOT_SEED"), "PERF_NULL_SLOT_SEED");
+	return on;
+}
+
+bool NullSlotRuntimeEnabled() {
+	static const bool on =
+	    NullSlotSwitch(Common::ShaderEnv::Read("KYTY_PERF_NULL_SLOT_RUNTIME_FORMAT"), "PERF_NULL_SLOT_RUNTIME_FORMAT");
+	return on;
+}
+
+struct NullSlotCounters {
+	std::atomic<uint64_t> seeded {0};
+	std::atomic<uint64_t> runtime_bindings {0};
+	std::atomic<uint64_t> runtime_live {0};
+	std::atomic<uint64_t> caused {0};
+	std::atomic<uint64_t> avoided {0};
+	std::atomic<uint64_t> seed_hits {0};
+	std::atomic<uint64_t> seed_misses {0};
+	std::atomic<uint64_t> logged {0};
+};
+NullSlotCounters  g_null_slot;
+std::atomic<bool> g_null_slot_runtime_active {false};
+
+struct NullSlotTable {
+	std::mutex                                    mutex;
+	std::unordered_map<uint64_t, NullSlot::Value> precise;
+	std::unordered_map<uint64_t, NullSlot::Value> coarse;
+};
+NullSlotTable g_null_slot_table;
+
+uint64_t NullSlotMix(uint64_t hash, uint64_t value) {
+	return hash ^ (value + 0x9e3779b97f4a7c15ull + (hash << 6u) + (hash >> 2u));
+}
+
+uint64_t NullSlotHashValue(const Value& value, uint32_t depth, uint32_t& budget) {
+	const Value resolved = value.Resolve();
+	const auto  hash     = NullSlotMix(0x51u, static_cast<uint64_t>(resolved.RawType()));
+	if (resolved.IsEmpty()) return hash;
+	if (resolved.IsImmediate()) return NullSlotMix(hash, resolved.ImmediateBits());
+	const Inst* inst = resolved.TryInstruction();
+	if (inst == nullptr || depth == 0u || budget == 0u) return NullSlotMix(hash, 0xffffu);
+	budget--;
+	auto       result = NullSlotMix(NullSlotMix(hash, static_cast<uint64_t>(inst->GetOpcode())), inst->Flags<uint64_t>());
+	const auto args   = inst->NumArgs();
+	result            = NullSlotMix(result, args);
+	for (size_t arg = 0; arg < args; arg++) result = NullSlotMix(result, NullSlotHashValue(inst->Arg(arg), depth - 1u, budget));
+	return result;
+}
+
+std::array<uint64_t, 2> NullSlotKeys(const ResourcePlan& program, size_t i) {
+	const auto& base    = program.info.buffers[i];
+	uint64_t    precise = 0;
+	if (base.source < program.descriptor_sources.size() &&
+	    !program.descriptor_sources[base.source].indirect_descriptor.has_value()) {
+		const auto& source = program.descriptor_sources[base.source];
+		uint32_t    budget = 256u;
+		precise            = NullSlotMix(0x7072u, static_cast<uint64_t>(program.stage));
+		for (uint32_t dword = 0; dword < source.dword_count && dword < source.dwords.size(); dword++) {
+			precise = NullSlotMix(precise, NullSlotHashValue(source.dwords[dword], 24u, budget));
+		}
+		precise |= 1u;
+	}
+	const uint64_t coarse =
+	    NullSlotMix(NullSlotMix(NullSlotMix(0x636fu, static_cast<uint64_t>(program.stage)), i), program.info.buffers.size()) | 1u;
+	return {precise, coarse};
+}
+
+bool NullSlotUsable(const NullSlot::Value& value) {
+	if (value[0] == 0u || value[0] >= NullSlot::RuntimeFormat) return false;
+	const auto info = Format::GetFormatInfo(static_cast<Prospero::BufferFormat>(value[0]));
+	return NullSlot::SwizzleResolvable(info.component_count, value[1]);
+}
+
+void NullSlotGrow(ResourcePlan::NullFormattedLive& shared, size_t buffers) {
+	if (shared.live.size() < buffers) shared.live.resize(buffers, {0u, 0u});
+	if (shared.null_pending.size() < buffers) shared.null_pending.resize(buffers, 0u);
+	if (shared.slot_keys.size() < buffers) shared.slot_keys.resize(buffers, {0u, 0u});
+}
+
+const std::array<uint64_t, 2>& NullSlotKeysOf(const ResourcePlan& program, ResourcePlan::NullFormattedLive& shared, size_t i) {
+	NullSlotGrow(shared, program.info.buffers.size());
+	if (shared.slot_keys[i][1] == 0u) shared.slot_keys[i] = NullSlotKeys(program, i);
+	return shared.slot_keys[i];
+}
+
+NullSlot::Decision NullSlotDecide(const ResourcePlan& program, ResourcePlan::NullFormattedLive& shared, size_t i) {
+	NullSlotGrow(shared, program.info.buffers.size());
+	const bool       seed    = NullSlotSeedEnabled();
+	const bool       runtime = NullSlotRuntimeEnabled() && !program.info.buffers[i].written;
+	NullSlot::Guesses guesses;
+	if (seed && shared.live[i][0] == 0u) {
+		const auto&      keys = NullSlotKeysOf(program, shared, i);
+		std::scoped_lock lock(g_null_slot_table.mutex);
+		if (const auto it = g_null_slot_table.precise.find(keys[0]); keys[0] != 0u && it != g_null_slot_table.precise.end()) {
+			guesses.precise        = it->second;
+			guesses.precise_usable = NullSlotUsable(it->second);
+		}
+		if (const auto it = g_null_slot_table.coarse.find(keys[1]); it != g_null_slot_table.coarse.end()) {
+			guesses.coarse        = it->second;
+			guesses.coarse_usable = NullSlotUsable(it->second);
+		}
+	}
+	return NullSlot::DecideNull(shared.live[i], guesses, seed, runtime);
+}
+
+void NullSlotCommitNull(const ResourcePlan& program, ResourcePlan::NullFormattedLive& shared, size_t i,
+                        const NullSlot::Decision& decision) {
+	NullSlotGrow(shared, program.info.buffers.size());
+	if (shared.null_pending[i] == static_cast<uint8_t>(NullSlot::Source::None)) {
+		shared.null_pending[i] = static_cast<uint8_t>(decision.source);
+	}
+	if (shared.live[i][0] != 0u) return;
+	if (decision.source == NullSlot::Source::Seed) {
+		shared.live[i] = decision.value;
+		g_null_slot.seeded.fetch_add(1, std::memory_order_relaxed);
+	} else if (decision.source == NullSlot::Source::Runtime) {
+		shared.live[i] = decision.value;
+		g_null_slot.runtime_bindings.fetch_add(1, std::memory_order_relaxed);
+		g_null_slot_runtime_active.store(true, std::memory_order_relaxed);
+	}
+}
+
+const char* NullSlotSourceName(NullSlot::Source source) {
+	switch (source) {
+		case NullSlot::Source::Own: return "own";
+		case NullSlot::Source::Seed: return "seed";
+		case NullSlot::Source::Runtime: return "runtime";
+		default: return "live";
+	}
+}
+
+bool NullSlotOnLive(const ResourcePlan& program, ResourcePlan::NullFormattedLive& shared, size_t i,
+                    const NullSlot::Value& value) {
+	NullSlotGrow(shared, program.info.buffers.size());
+	const auto pending = static_cast<NullSlot::Source>(shared.null_pending[i]);
+	const bool runtime = NullSlot::IsRuntime(shared.live[i]);
+	const auto result  = NullSlot::Classify(pending, shared.live[i], value);
+	if (result != NullSlot::Transition::None) {
+		shared.null_pending[i] = static_cast<uint8_t>(NullSlot::Source::Live);
+		const bool caused      = result == NullSlot::Transition::Caused;
+		(caused ? g_null_slot.caused : g_null_slot.avoided).fetch_add(1, std::memory_order_relaxed);
+		if (pending == NullSlot::Source::Seed) {
+			(caused ? g_null_slot.seed_misses : g_null_slot.seed_hits).fetch_add(1, std::memory_order_relaxed);
+		}
+		if (Common::EnvRead::PerfLines() && g_null_slot.logged.fetch_add(1, std::memory_order_relaxed) < 256u) {
+			std::fprintf(stderr, "NULL_SLOT_TRANSITION hash=0x%016llx buffer=%zu result=%s null=%s taken=%u/0x%x live=%u/0x%x\n",
+			             static_cast<unsigned long long>(program.shader_hash), i, caused ? "caused" : "avoided",
+			             NullSlotSourceName(pending), shared.live[i][0], shared.live[i][1], value[0], value[1]);
+		}
+	}
+	if (runtime) {
+		g_null_slot.runtime_live.fetch_add(1, std::memory_order_relaxed);
+		return true;
+	}
+	if (NullSlotSeedEnabled() && NullSlotUsable(value)) {
+		const auto       keys = NullSlotKeysOf(program, shared, i);
+		std::scoped_lock lock(g_null_slot_table.mutex);
+		if (keys[0] != 0u) g_null_slot_table.precise[keys[0]] = value;
+		g_null_slot_table.coarse[keys[1]] = value;
+	}
+	return false;
+}
+
+void NullSlotTakeValue(ResourceSpecialization::Buffer& buffer, const NullSlot::Value& value) {
+	buffer.packed_stride      = (buffer.packed_stride & ~0x3fffu) | (1u << 31u) | 1u;
+	buffer.zero_stride_oob    = false;
+	buffer.descriptor_format  = static_cast<Prospero::BufferFormat>(value[0]);
+	buffer.descriptor_swizzle = value[1];
+}
+
+void NullSlotTakeRuntime(ResourceSpecialization::Buffer& buffer) {
+	buffer.descriptor_format  = static_cast<Prospero::BufferFormat>(NullSlot::RuntimeFormat);
+	buffer.descriptor_swizzle = 0u;
+}
+
+} // namespace
+
+bool NullSlotRuntimeLive(const ResourcePlan& program, const std::vector<uint8_t>& kinds) {
+	if (!g_null_slot_runtime_active.load(std::memory_order_relaxed) || program.null_formatted_live == nullptr) return false;
+	if (std::ranges::find(kinds, uint8_t {2}) == kinds.end()) return false;
+	auto&            shared = *program.null_formatted_live;
+	std::scoped_lock lock(shared.mutex);
+	for (size_t i = 0; i < kinds.size() && i < shared.live.size(); i++) {
+		if (kinds[i] == 2u && NullSlot::IsRuntime(shared.live[i])) return true;
+	}
+	return false;
+}
+
 // The null share journal: PERF null_share_journal (ReportNullShareJournalPerf).
 namespace {
 struct NullShareJournalCounters {
@@ -2382,6 +2580,7 @@ void SeedNullFormattedShare(const ResourcePlan& program, std::span<const std::ar
 	for (size_t i = 0; i < buffers && i < journal.size(); i++) {
 		if (!program.info.buffers[i].formatted || journal[i][0] == 0u) continue;
 		shared.journal[i] = journal[i];
+		if (NullSlot::IsRuntime(journal[i])) g_null_slot_runtime_active.store(true, std::memory_order_relaxed);
 		seeded++;
 		if (i < journal_multi.size() && journal_multi[i] != 0u) multi++;
 		if (shared.live[i][0] == 0u) shared.live[i] = journal[i];
@@ -2425,6 +2624,12 @@ void ReportNullShareJournalPerf() {
 	             "checks=%llu mismatches=%llu live_changes=%llu null_variants=%llu avoidable=%llu\n",
 	             n(c.programs), n(c.bindings), n(c.journal_multi), n(c.seeded_shares), n(c.checks), n(c.mismatches),
 	             n(c.live_changes), n(c.null_variants), n(c.avoidable));
+	const auto& s = g_null_slot;
+	std::fprintf(stderr,
+	             "PERF null_slot seed=%d runtime_format=%d seeded=%llu runtime_bindings=%llu runtime_live=%llu "
+	             "transitions_caused=%llu transitions_avoided=%llu seed_hits=%llu seed_misses=%llu\n",
+	             NullSlotSeedEnabled() ? 1 : 0, NullSlotRuntimeEnabled() ? 1 : 0, n(s.seeded), n(s.runtime_bindings),
+	             n(s.runtime_live), n(s.caused), n(s.avoided), n(s.seed_hits), n(s.seed_misses));
 }
 
 // `tape` (when set) evaluates the plan's values instead of SrtWalker; `quiet` mutes its diagnostics.
@@ -2605,16 +2810,19 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 			if (buffer.zero_stride_oob && all_zero && !shared.journal.empty()) {
 				NoteNullShareJournalNull(shared, i); // the null share journal
 			}
-			if (buffer.zero_stride_oob && all_zero && shared.live[i][0] != 0u) {
-				buffer.packed_stride      = (packed_stride & ~0x3fffu) | (1u << 31u) | 1u;
-				buffer.zero_stride_oob    = false;
-				buffer.descriptor_format  = static_cast<Prospero::BufferFormat>(shared.live[i][0]);
-				buffer.descriptor_swizzle = shared.live[i][1];
+			if (buffer.zero_stride_oob && all_zero) {
+				const auto decision = NullSlotDecide(program, shared, i);
+				NullSlotCommitNull(program, shared, i, decision);
+				if (decision.value[0] != 0u) NullSlotTakeValue(buffer, decision.value);
 			} else if (!buffer.zero_stride_oob && (buffer.packed_stride >> 31u) != 0u &&
 			           buffer.descriptor_format != Prospero::BufferFormat::kInvalid) {
-				NoteNullShareJournalLive(program, shared, i, shared.live[i], static_cast<uint32_t>(buffer.descriptor_format),
-				                         buffer.descriptor_swizzle);
-				shared.live[i] = {static_cast<uint32_t>(buffer.descriptor_format), buffer.descriptor_swizzle};
+				const NullSlot::Value value {static_cast<uint32_t>(buffer.descriptor_format), buffer.descriptor_swizzle};
+				if (NullSlotOnLive(program, shared, i, value)) {
+					NullSlotTakeRuntime(buffer);
+				} else {
+					NoteNullShareJournalLive(program, shared, i, shared.live[i], value[0], value[1]);
+					shared.live[i] = value;
+				}
 			}
 			continue;
 		}
@@ -2826,40 +3034,56 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 //  * sticky_buffer_formats is state kept across calls and the reference walker numbers instructions inside
 //    the shared Inst objects, so a flag or a plan that needs either is refused.
 // ApplyNullFormattedShare's update of `live` (held under its lock).
-static void ApplyNullShareTo(const ResourcePlan& program, const std::vector<uint8_t>& kinds,
-                             std::vector<std::array<uint32_t, 2>>& live, ResourceSpecialization& specialization,
-                             ResourcePlan::NullFormattedLive* journal_note) {
-	if (live.size() < program.info.buffers.size()) live.resize(program.info.buffers.size(), {0u, 0u});
-	const bool note = journal_note != nullptr;
+static bool ApplyNullShareTo(const ResourcePlan& program, const std::vector<uint8_t>& kinds,
+                             ResourceSpecialization& specialization, ResourcePlan::NullFormattedLive& shared) {
+	auto& live = shared.live;
+	NullSlotGrow(shared, program.info.buffers.size());
+	bool runtime_live = false;
 	for (size_t i = 0; i < kinds.size() && i < specialization.buffers.size() && i < live.size(); i++) {
 		auto& buffer = specialization.buffers[i];
-		if (note && kinds[i] == 1u) NoteNullShareJournalNull(*journal_note, i);
-		if (kinds[i] == 1u && live[i][0] != 0u) {
-			buffer.packed_stride      = (buffer.packed_stride & ~0x3fffu) | (1u << 31u) | 1u;
-			buffer.zero_stride_oob    = false;
-			buffer.descriptor_format  = static_cast<Prospero::BufferFormat>(live[i][0]);
-			buffer.descriptor_swizzle = live[i][1];
+		if (kinds[i] == 1u) {
+			NoteNullShareJournalNull(shared, i);
+			const auto decision = NullSlotDecide(program, shared, i);
+			NullSlotCommitNull(program, shared, i, decision);
+			if (decision.value[0] != 0u) NullSlotTakeValue(buffer, decision.value);
 		} else if (kinds[i] == 2u) {
-			if (note) {
-				NoteNullShareJournalLive(program, *journal_note, i, live[i], static_cast<uint32_t>(buffer.descriptor_format),
-				                         buffer.descriptor_swizzle);
+			const NullSlot::Value value {static_cast<uint32_t>(buffer.descriptor_format), buffer.descriptor_swizzle};
+			if (NullSlotOnLive(program, shared, i, value)) {
+				NullSlotTakeRuntime(buffer);
+				runtime_live = true;
+				continue;
 			}
-			live[i] = {static_cast<uint32_t>(buffer.descriptor_format), buffer.descriptor_swizzle};
+			NoteNullShareJournalLive(program, shared, i, live[i], value[0], value[1]);
+			live[i] = value;
 		}
 	}
+	return runtime_live;
 }
 
-void ApplyNullFormattedShare(const ResourcePlan& program, const std::vector<uint8_t>& kinds,
+bool ApplyNullFormattedShare(const ResourcePlan& program, const std::vector<uint8_t>& kinds,
                              ResourceSpecialization& specialization) {
-	if (program.null_formatted_live == nullptr || kinds.empty()) return;
+	if (program.null_formatted_live == nullptr || kinds.empty()) return false;
 	auto&            shared = *program.null_formatted_live;
 	std::scoped_lock lock(shared.mutex);
-	ApplyNullShareTo(program, kinds, shared.live, specialization, &shared);
+	return ApplyNullShareTo(program, kinds, specialization, shared);
 }
 
 void PeekNullFormattedShare(const ResourcePlan& program, const std::vector<uint8_t>& kinds,
                             ResourceSpecialization& specialization) {
 	if (program.null_formatted_live == nullptr || kinds.empty()) return;
+	{
+		auto&            shared = *program.null_formatted_live;
+		std::scoped_lock lock(shared.mutex);
+		NullSlotGrow(shared, program.info.buffers.size());
+		for (size_t i = 0; i < kinds.size() && i < specialization.buffers.size(); i++) {
+			if (kinds[i] == 1u && shared.live[i][0] == 0u) {
+				const auto decision = NullSlotDecide(program, shared, i);
+				if (decision.value[0] != 0u) NullSlotTakeValue(specialization.buffers[i], decision.value);
+			} else if (kinds[i] == 2u && NullSlot::IsRuntime(shared.live[i])) {
+				NullSlotTakeRuntime(specialization.buffers[i]);
+			}
+		}
+	}
 	auto&            shared = *program.null_formatted_live;
 	std::scoped_lock lock(shared.mutex);
 	const auto&      live = shared.live;

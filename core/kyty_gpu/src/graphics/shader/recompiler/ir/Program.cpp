@@ -227,9 +227,7 @@ uint32_t StorageBufferElementBits(const Program& program, const MemoryInfo& memo
 	const auto format = memory.typed
 	                        ? Format::DecodeTBufferFormat(memory.data_format, memory.number_format)
 	                        : program.info.buffers[memory.resource].descriptor_format;
-	const auto info = Format::GetFormatInfo(format);
-	return info.type == Format::ComponentType::Unknown || info.packed_bitfield
-	           ? 32u : info.component_bits[0];
+	return Format::FormattedElementBits(Format::GetFormatInfo(format));
 }
 
 bool HasShaderMemoryWrites(const Program& program) {

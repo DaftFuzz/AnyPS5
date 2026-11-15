@@ -5206,6 +5206,10 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		const auto shift = (index % 4u) * 8u;
 		prepared.shader_data[dword] |= offset << shift;
 	};
+	const auto buffer_word3 = [&](uint32_t resource) {
+		const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[resource]);
+		return descriptor.Type() == 0u ? descriptor.fields[3] : 0u;
+	};
 	for (uint32_t resource = 0; resource < program.info.buffers.size(); resource++) {
 		const auto& buffer = program.info.buffers[resource];
 		const auto  index  = buffer.descriptor_index;
@@ -5243,6 +5247,9 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 				if (layout.memory_stride_dword != ShaderRecompiler::IR::PushData::NoStart) {
 					prepared.shader_data[layout.memory_stride_dword + index] = plan_entry->stride;
 				}
+				if (layout.memory_word3_dword != ShaderRecompiler::IR::PushData::NoStart) {
+					prepared.shader_data[layout.memory_word3_dword + index] = buffer_word3(resource);
+				}
 				continue;
 			}
 			prepared.buffers[index] = NativeStorageBuffer(m_context, prepared.buffer_sources[index], buffer, buffer_offset);
@@ -5254,6 +5261,9 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 			// The record stride the shader reads at run time.
 			const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[resource]);
 			prepared.shader_data[layout.memory_stride_dword + index] = descriptor.Type() == 0u ? descriptor.Stride() : 0u;
+		}
+		if (layout.memory_word3_dword != ShaderRecompiler::IR::PushData::NoStart) {
+			prepared.shader_data[layout.memory_word3_dword + index] = buffer_word3(resource);
 		}
 	}
 	floor_part.reset(); // (W3 P0)
