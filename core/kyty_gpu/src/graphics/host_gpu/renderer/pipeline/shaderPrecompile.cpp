@@ -2073,6 +2073,9 @@ void ShaderPrecompiler::LoadCompute(const std::unordered_set<uint64_t>& skipped,
 		m_compute_records.push_back(std::move(record));
 	});
 	torn = torn || !complete;
+	if (const char* replay = Common::ShaderEnv::Read("KYTY_DIAG_NULL_SLOT_REPLAY"); replay != nullptr && replay[0] == '1') {
+		NullSlotReplay(jobs);
+	}
 	// A file whose header does not match (another record layout or version): none of its records is read.
 	const bool other_layout = !bytes.empty() && !header_ok;
 	if (other_layout) g_progress.other_layout_journals.fetch_add(1, std::memory_order_relaxed);
@@ -2106,6 +2109,106 @@ void ShaderPrecompiler::LoadCompute(const std::unordered_set<uint64_t>& skipped,
 		std::fprintf(stderr, "SHADER_PRECOMPILE journal: cannot open %s for writing\n",
 		             m_journal_path.string().c_str());
 	}
+}
+
+void ShaderPrecompiler::NullSlotReplay(std::vector<Job>& jobs) {
+	const auto begin = std::chrono::steady_clock::now();
+	const auto candidate = [](const PrecompileStageRecord& record) {
+		return std::ranges::any_of(record.specialization.buffers, [](const auto& b) {
+			return b.zero_stride_oob || ((b.packed_stride >> 31u) != 0u && static_cast<uint32_t>(b.descriptor_format) != 0u);
+		});
+	};
+	std::unordered_map<uint64_t, std::optional<ResourcePlan>> plans;
+	static const auto profile = ShaderCompileProfile(m_graphics);
+	size_t translated = 0;
+	size_t untranslatable = 0;
+	for (const auto& record: m_compute_records) {
+		if (!candidate(record)) continue;
+		const auto program = ProgramKey(RecordIdentity(record));
+		if (plans.contains(program)) continue;
+		auto& slot = plans[program];
+		ShaderComputeInputInfo           compute = record.compute;
+		ShaderStageInputInfo             stage_input {};
+		stage_input.compute = &compute;
+		ShaderRecompiler::CompileOptions options;
+		options.stage       = record.stage;
+		options.shader_hash = record.shader_hash;
+		options.user_data   = record.user_data;
+		options.back_code   = record.back_code;
+		options.input_info  = stage_input;
+		SetStageCompileOptions(options);
+		options.profile = &profile;
+		auto source     = ShaderRecompiler::PrepareShaderSource(record.code, options);
+		if (!source.calls.empty() || source.unsupported_call_pc != UINT32_MAX) {
+			untranslatable++;
+			continue;
+		}
+		auto program_ir = ShaderRecompiler::TranslateProgram(source.decoded, options);
+		slot.emplace(ShaderRecompiler::IR::ExtractResourcePlan(program_ir.program));
+		translated++;
+	}
+	std::unordered_set<uint64_t> keys;
+	size_t null_slots  = 0;
+	size_t live_slots  = 0;
+	size_t odd_zero    = 0;
+	size_t changed     = 0;
+	size_t merged      = 0;
+	for (size_t index = 0; index < jobs.size(); index++) {
+		auto& job    = jobs[index];
+		auto& record = m_compute_records[job.record];
+		const auto found = plans.find(ProgramKey(RecordIdentity(record)));
+		if (found != plans.end() && found->second.has_value()) {
+			const auto&          plan = *found->second;
+			std::vector<uint8_t> kinds(plan.info.buffers.size(), 0u);
+			bool                 any = false;
+			for (size_t i = 0; i < kinds.size() && i < record.specialization.buffers.size(); i++) {
+				if (!plan.info.buffers[i].formatted) continue;
+				const auto& b = record.specialization.buffers[i];
+				if (b.zero_stride_oob) {
+					if (static_cast<uint32_t>(b.descriptor_format) == 0u && b.descriptor_swizzle == 0u) {
+						kinds[i] = 1u;
+						null_slots++;
+						any = true;
+					} else {
+						odd_zero++;
+					}
+				} else if ((b.packed_stride >> 31u) != 0u && static_cast<uint32_t>(b.descriptor_format) != 0u) {
+					kinds[i] = 2u;
+					live_slots++;
+					any = true;
+				}
+			}
+			if (any) {
+				auto specialization = record.specialization;
+				ShaderRecompiler::IR::ApplyNullFormattedShare(plan, kinds, specialization);
+				const auto before = record.Key();
+				record.specialization = specialization;
+				const auto after = record.Key();
+				if (after != before) {
+					changed++;
+					const auto old_key = job.key;
+					job.key = job.forced_lds ? ForcedLdsKey(after) : after;
+					m_recorded.erase(old_key);
+					m_recorded.insert(after);
+				}
+			}
+		}
+		if (!keys.insert(job.key).second && job.state == JobState::Queued) {
+			job.state = JobState::Dropped;
+			merged++;
+			if (Common::EnvRead::PerfLines()) {
+				std::fprintf(stderr, "NULL_SLOT_REPLAY merged hash=0x%016llx key=%s\n",
+				             static_cast<unsigned long long>(record.shader_hash), HexKey(job.key).c_str());
+			}
+		}
+	}
+	std::fprintf(stderr,
+	             "NULL_SLOT_REPLAY programs=%zu translated=%zu untranslatable=%zu null_slots=%zu live_slots=%zu "
+	             "zero_stride_not_null=%zu records_changed=%zu jobs_merged=%zu of %zu in %.0f ms\n",
+	             plans.size(), translated, untranslatable, null_slots, live_slots, odd_zero, changed, merged, jobs.size(),
+	             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count());
+	ShaderRecompiler::IR::ReportNullShareJournalPerf();
+	std::fflush(stderr);
 }
 
 void ShaderPrecompiler::LoadGraphics(const std::unordered_set<uint64_t>& skipped, std::vector<Job>& jobs,
