@@ -369,6 +369,7 @@ static void PerfReport(RenderContext& renderer) {
 		PerfReportTcLockPcs();
 		renderer.GetCommandScheduler().ReportSubmitPerf();
 		renderer.GetBufferCache().ReportCallerWaitPerf();
+		renderer.GetBufferCache().ReportInFlightReadPerf();
 		renderer.GetBufferCache().ReportCpWriteThroughPerf();
 		renderer.GetBufferCache().ReportProtectPerf();
 		renderer.GetTextureCache().ReportDccGpuAllPerf();

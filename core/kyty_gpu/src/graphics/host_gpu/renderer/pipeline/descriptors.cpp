@@ -5186,7 +5186,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 					// page, 8 GPU-dirty bytes).
 					const uint64_t guest = m_gpu_word_addresses[i].first;
 					uint64_t       flags = GuestGpu::PendingWriteKind(guest);
-					if (cache.IsRegionGpuModified(guest, 4u)) flags |= 4u | (cache.HasGpuDirtyBytes(guest, 4u) ? 8u : 0u);
+					if (cache.IsRegionGpuModified(guest, 4u)) flags |= 4u | (cache.HasGpuDirtyBytes(guest, 4u, BufferCache::DirtyReader::GpuWord) ? 8u : 0u);
 					BufferCache::NoteGpuWordBind(host, guest | (flags << 56u));
 				}
 				m_gpu_word_patches.emplace_back(word.slot, static_cast<uint32_t>(host));

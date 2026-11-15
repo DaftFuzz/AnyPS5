@@ -891,6 +891,10 @@ void BufferCache::DeleteBuffer(BufferId id) {
 		return;
 	}
 	CommitUploadBatch(BatchCommit::DeleteBuffer); // claimed uploads may target this buffer
+	if (!m_eager_readbacks.empty()) {
+		const auto& doomed = m_slot_buffers[id];
+		WaitCopyReadbacks(doomed.CpuAddress(), doomed.Size());
+	}
 	static const bool trace_delete = [] { // KYTY_TRACE_BUFFER_CREATE=1 (diagnostic): every deletion
 		const char* value = std::getenv("KYTY_TRACE_BUFFER_CREATE");
 		return value != nullptr && value[0] == '1';
@@ -2094,7 +2098,8 @@ BufferCache::CpWriteDecline BufferCache::CpWriteThroughOwnedPage(uint64_t addres
 	if (replaces_gpu_bytes) {
 		GpuDirtySubtract(address, size);
 		// A page left without GPU bytes holds current data in guest memory ("GPU-modified page <=> bytes to download").
-		if (!m_gpu_modified_ranges.Intersects(page, TRACKER_PAGE_SIZE) && m_memory_tracker.IsRegionGpuModified(page, TRACKER_PAGE_SIZE)) {
+		if (m_memory_tracker.IsRegionGpuModified(page, TRACKER_PAGE_SIZE) &&
+		    !HasGpuDirtyBytes(page, TRACKER_PAGE_SIZE, DirtyReader::CpWriteUnmark)) {
 			m_memory_tracker.UnmarkRegionAsGpuModified(page, TRACKER_PAGE_SIZE);
 		}
 		m_cp_write_stats.replaced.fetch_add(1, std::memory_order_relaxed);
@@ -4623,13 +4628,47 @@ bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionGpuModified(vaddr, size);
 }
 
-bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
-	return m_gpu_modified_ranges.Intersects(vaddr, size);
+bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size, DirtyReader reader) {
+	if (m_gpu_modified_ranges.Intersects(vaddr, size)) return true;
+	if (m_eager_readbacks.empty()) return false;
+	const uint32_t kinds = InFlightReadbackKinds(vaddr, size);
+	if (kinds == 0u) return false;
+	const auto site = static_cast<uint32_t>(reader);
+	if ((kinds & 2u) != 0u) {
+		m_in_flight_reads[1][site].fetch_add(1, std::memory_order_relaxed);
+	} else {
+		m_in_flight_reads[0][site].fetch_add(1, std::memory_order_relaxed);
+	}
+	return true;
+}
+
+uint32_t BufferCache::InFlightReadbackKinds(uint64_t vaddr, uint64_t size) const {
+	uint32_t kinds = 0;
+	for (const auto& entry: m_eager_readbacks) {
+		if (!(vaddr < entry.end && entry.start < vaddr + size)) continue;
+		const bool holds = std::ranges::any_of(entry.bytes, [&](const auto& interval) {
+			return vaddr < interval.second && interval.first < vaddr + size;
+		});
+		if (!holds || EagerDone(entry)) continue;
+		kinds |= entry.copy_tick != 0 ? 2u : 1u;
+	}
+	return kinds;
 }
 
 bool BufferCache::HasGpuDirtyBytesShared(uint64_t vaddr, uint64_t size) {
 	std::shared_lock lock(m_gpu_dirty_mutex);
-	return m_gpu_modified_ranges.Intersects(vaddr, size);
+	if (m_gpu_modified_ranges.Intersects(vaddr, size)) return true;
+	if (m_in_flight_ranges.Empty() || !m_in_flight_ranges.Intersects(vaddr, size)) return false;
+	m_in_flight_ahead_reads.fetch_add(1, std::memory_order_relaxed);
+	return true;
+}
+
+void BufferCache::InFlightRebuild() {
+	std::unique_lock lock(m_gpu_dirty_mutex);
+	m_in_flight_ranges.Clear();
+	for (const auto& entry: m_eager_readbacks) {
+		for (const auto& [start, end]: entry.bytes) m_in_flight_ranges.Add(start, end - start);
+	}
 }
 
 void BufferCache::GpuDirtyAdd(uint64_t vaddr, uint64_t size) {
@@ -4795,6 +4834,7 @@ void BufferCache::ApplyEagerReadbacks(uint64_t vaddr, uint64_t size, bool wait) 
 			if (BarGpuCopyVerify()) VerifyCopyReadback(entry.bytes); // KYTY_PERF_BAR_GPU_COPY_VERIFY (diagnostic)
 			entry = std::move(m_eager_readbacks.back());
 			m_eager_readbacks.pop_back();
+			InFlightRebuild();
 			UnmarkPublishedWindow(lo, hi);
 			continue;
 		}
@@ -4808,6 +4848,7 @@ void BufferCache::ApplyEagerReadbacks(uint64_t vaddr, uint64_t size, bool wait) 
 		}
 		entry = std::move(m_eager_readbacks.back());
 		m_eager_readbacks.pop_back();
+		InFlightRebuild();
 	}
 }
 
@@ -4864,6 +4905,10 @@ void BufferCache::IssueEagerReadbacks() {
 		std::vector<std::pair<uint64_t, uint64_t>> bytes;
 		m_gpu_modified_ranges.ForEachInRange(hot.start, hot.end - hot.start,
 		                                     [&](uint64_t start, uint64_t end) { bytes.emplace_back(start, end); });
+		{
+			std::unique_lock lock(m_gpu_dirty_mutex);
+			for (const auto& [start, end]: bytes) m_in_flight_ranges.Add(start, end - start);
+		}
 		auto it  = m_buffers.upper_bound(hot.start);
 		if (it != m_buffers.begin()) --it;
 		for (; it != m_buffers.end() && it->first < hot.end; ++it) {
@@ -4872,7 +4917,10 @@ void BufferCache::IssueEagerReadbacks() {
 			const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), hot.end);
 			if (start < finish && DownloadBufferMemory<true>(buffer, start, finish - start)) any = true;
 		}
-		if (!any) continue;
+		if (!any) {
+			InFlightRebuild();
+			continue;
+		}
 		auto done = std::make_shared<std::atomic_bool>(false);
 		m_scheduler.DeferPriorityOperation([done] { done->store(true, std::memory_order_release); });
 		m_eager_readbacks.push_back({.start = hot.start, .end = hot.end, .generation = hot.generation,
@@ -5848,6 +5896,10 @@ uint64_t BufferCache::StartCopyReadback(CallerPlan& plan, uint64_t vaddr, bool i
 	target.chunks            = &direct.chunks;
 	const uint64_t copy_tick = BarGpuCopyAsync(m_scheduler, buffer, plan.newest, plan.total, target);
 	if (copy_tick == 0) return decline();
+	{
+		std::unique_lock lock(m_gpu_dirty_mutex);
+		for (const auto& [start, end]: plan.intervals) m_in_flight_ranges.Add(start, end - start);
+	}
 	// TryBarDownload's state change before its copy: the copied bytes leave the GPU-dirty set. Their pages keep the
 	// GPU-modified mark until the readback is applied.
 	m_memory_tracker.ForEachDownloadRange<false>(plan.lo, plan.hi - plan.lo, [&](uint64_t address, uint64_t bytes) noexcept {

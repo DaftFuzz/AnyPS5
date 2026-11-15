@@ -458,6 +458,22 @@ void BufferCache::ReportCallerWaitPerf() {
 	             take(s.copy_issued), take(s.copy_joined), take(s.copy_declined), take(s.copy_exec_waits));
 }
 
+void BufferCache::ReportInFlightReadPerf() {
+	const auto take = [&](uint32_t kind, DirtyReader reader) {
+		return static_cast<unsigned long long>(m_in_flight_reads[kind][static_cast<uint32_t>(reader)].exchange(0));
+	};
+	for (uint32_t kind = 0; kind < 2u; ++kind) {
+		std::fprintf(stderr,
+		             "PERF in_flight_reads kind=%s texture=%llu indirect_args=%llu image_heap=%llu gpu_word=%llu "
+		             "cp_write_unmark=%llu other=%llu\n",
+		             kind == 1u ? "handback" : "eager", take(kind, DirtyReader::Texture), take(kind, DirtyReader::IndirectArgs),
+		             take(kind, DirtyReader::ImageHeap), take(kind, DirtyReader::GpuWord),
+		             take(kind, DirtyReader::CpWriteUnmark), take(kind, DirtyReader::Other));
+	}
+	std::fprintf(stderr, "PERF in_flight_reads_offthread ahead=%llu\n",
+	             static_cast<unsigned long long>(m_in_flight_ahead_reads.exchange(0)));
+}
+
 void BufferCache::TakeCensus(Census& census) {
 	census = {};
 	for (const auto& [address, id]: m_buffers) {
