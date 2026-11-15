@@ -56,6 +56,7 @@ enum class Switch : uint32_t {
 	CopyPredict,           // KYTY_PERF_COPY_PREDICT (cache/bufferCache.h)
 	ServeDrawWaits,        // KYTY_PERF_SERVE_DRAW_WAITS (cache/bufferCache.h)
 	LabelsOffThread,       // KYTY_PERF_LABELS_OFF_THREAD (guest/graphicsRun.cpp, DeferLabel)
+	MemoWays,              // KYTY_PERF_MEMO_WAYS (cache/bufferCache.cpp, the obtain memo)
 	DrainFreeWait,         // KYTY_PERF_DRAIN_FREE_WAIT (guest_gpu/graphicsRun.cpp, WaitRegMem)
 	Count
 };

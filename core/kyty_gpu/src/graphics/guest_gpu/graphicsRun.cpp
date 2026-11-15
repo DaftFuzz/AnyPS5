@@ -703,6 +703,7 @@ GuestGpu::GuestGpu(RenderContext& renderer)
     : m_renderer(renderer), m_operations(OperationQueueSize), m_resolved(ResolvedQueueSize),
       m_neutral_state {&m_neutral_context, &m_neutral_user_config, &m_neutral_shaders} {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	if (MasterSemaphore::PadHot()) m_pending_commands_p = &m_pending_commands_padded; // KYTY_PERF_PAD_HOT, before any thread
 	GraphicsInitJmpTables();
 	m_pending_writes = std::make_unique<GuestWrite[]>(PendingWriteCapacity);
 	m_operation_writes = std::make_unique<std::atomic<uint64_t>[]>(OperationWritesSize);
@@ -771,7 +772,7 @@ void GuestGpu::PostCommand(Common::UniqueFunction<void>&& command) {
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
 	m_commands.push_back(std::move(command));
-	m_pending_commands.fetch_add(1, std::memory_order_acq_rel);
+	PendingCommands().fetch_add(1, std::memory_order_acq_rel);
 	m_work_epoch.fetch_add(1, std::memory_order_release);
 	m_work_available.Signal();
 	RingExecution();
@@ -786,14 +787,14 @@ void GuestGpu::Wake() {
 
 void GuestGpu::ProcessCommands() {
 	EXIT_IF(!IsGpuThread());
-	while (m_pending_commands.load(std::memory_order_acquire) != 0) {
+	while (PendingCommands().load(std::memory_order_acquire) != 0) {
 		Common::UniqueFunction<void> command;
 		{
 			Common::LockGuard lock(m_queue_mutex);
 			EXIT_IF(m_commands.empty());
 			command = std::move(m_commands.front());
 			m_commands.pop_front();
-			EXIT_IF(m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
+			EXIT_IF(PendingCommands().fetch_sub(1, std::memory_order_acq_rel) == 0);
 			m_commands_running = true;
 		}
 		if (DrawStateObserverOn()) DrawStateObserver::Invalidate(DrawStateObserver::Cause(DrawStateObserver::CauseInvalidate, DrawStateObserver::InvalidateCommand)); // the draw-state observer (DrawStateObserverOn)
@@ -983,7 +984,7 @@ bool GuestGpu::WaitForOperations() {
 		if (!m_resolved.Empty()) {
 			return true;
 		}
-		if (m_pending_commands.load(std::memory_order_acquire) != 0) {
+		if (PendingCommands().load(std::memory_order_acquire) != 0) {
 			const Common::SlowFrame::Scope slow_commands(Common::SlowFrame::Commands); // KYTY_TRACE_SLOW_FRAMES
 			if (ChunkLead::PeekCensusOn()) { // (way B measurement: the commands served while idle)
 				const uint64_t t0 = ChunkLead::Tsc();
@@ -1004,7 +1005,7 @@ bool GuestGpu::WaitForOperations() {
 		if (g_gpu_stage_stats) g_stage_stats.execution_sleeps.fetch_add(1, std::memory_order_relaxed);
 		m_execution_sleeping.store(true, std::memory_order_seq_cst);
 		const auto bell = m_execution_bell.load(std::memory_order_seq_cst);
-		if (m_resolved.Empty() && m_pending_commands.load(std::memory_order_seq_cst) == 0 &&
+		if (m_resolved.Empty() && PendingCommands().load(std::memory_order_seq_cst) == 0 &&
 		    !m_execution_stop.load(std::memory_order_seq_cst)) {
 			m_execution_bell.wait(bell, std::memory_order_seq_cst);
 		}
@@ -1416,7 +1417,7 @@ void GuestGpu::ExecutionThread() {
 		// Destroy the callback before the command processor may reuse what it references.
 		operation.reset();
 		m_executed.Publish(sequence);
-		if (m_pending_commands.load(std::memory_order_acquire) != 0) {
+		if (PendingCommands().load(std::memory_order_acquire) != 0) {
 			const Common::SlowFrame::Scope slow_commands(Common::SlowFrame::Commands); // KYTY_TRACE_SLOW_FRAMES
 			if (ChunkLead::PeekCensusOn()) { // (way B measurement: the commands served between operations)
 				const uint64_t t0 = ChunkLead::Tsc(), w0 = PassCensus::t_wait_ns;
@@ -1864,7 +1865,7 @@ void GuestGpu::ClaimResolved(GpuOperation& operation, void (*busy)(void* context
 		for (Common::SpinWait spin;;) {
 			claim = RenderExecutor::TryClaimResolvedDraw(r, steal);
 			if (claim != RenderExecutor::ResolvedClaim::Running) break;
-			if (m_pending_commands.load(std::memory_order_acquire) != 0) {
+			if (PendingCommands().load(std::memory_order_acquire) != 0) {
 				const auto c0 = std::chrono::steady_clock::now();
 				RunCommands();
 				commands_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - c0).count());
@@ -1969,7 +1970,7 @@ void GuestGpu::RunCommandsWhileWaiting() {
 	if (gpu == nullptr || !IsGpuThread()) {
 		return;
 	}
-	while (gpu->m_pending_commands.load(std::memory_order_acquire) != 0) {
+	while (gpu->PendingCommands().load(std::memory_order_acquire) != 0) {
 		Common::UniqueFunction<void> command;
 		{
 			Common::LockGuard lock(gpu->m_queue_mutex);
@@ -1978,7 +1979,7 @@ void GuestGpu::RunCommandsWhileWaiting() {
 			}
 			command = std::move(gpu->m_commands.front());
 			gpu->m_commands.pop_front();
-			EXIT_IF(gpu->m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
+			EXIT_IF(gpu->PendingCommands().fetch_sub(1, std::memory_order_acq_rel) == 0);
 		}
 		command();
 		gpu->m_work_epoch.fetch_add(1, std::memory_order_release);
@@ -1987,7 +1988,7 @@ void GuestGpu::RunCommandsWhileWaiting() {
 
 bool GuestGpu::CommandsWaiting() noexcept {
 	auto* const gpu = g_gpu_state;
-	return gpu != nullptr && gpu->m_pending_commands.load(std::memory_order_acquire) != 0;
+	return gpu != nullptr && gpu->PendingCommands().load(std::memory_order_acquire) != 0;
 }
 
 bool GuestGpu::WaitsServeCommands() noexcept {
