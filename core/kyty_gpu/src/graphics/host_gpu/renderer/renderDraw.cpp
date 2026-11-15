@@ -4168,7 +4168,16 @@ bool RenderExecutor::ResolveTaskInto(ResolvedDraw& slot, const ResolveTask& task
 			g_helper_plan_snap[row].Publish(t_ahead_helper, t_helper_plans_made, t_helper_packets);
 		}
 	}
-	if (task.writes_verdict != nullptr) task.writes_verdict(task.op_sequence, ok ? PipelineCache::ResolvedWrites(*slot.stages) : 3u);
+	if (task.writes_verdict != nullptr) {
+		const uint8_t verdict = ok ? PipelineCache::ResolvedWrites(*slot.stages) : 3u;
+		if (task.want_ranges && verdict == 2u) {
+			thread_local OpWriteRanges ranges;
+			PipelineCache::ResolvedWriteRanges(*slot.stages, ranges);
+			task.writes_verdict(task, verdict, &ranges);
+		} else {
+			task.writes_verdict(task, verdict, nullptr);
+		}
+	}
 	slot.phase.store(PhaseReady, std::memory_order_release);
 	return ok;
 }

@@ -332,9 +332,14 @@ public:
 		bool                   gpu_indirect = false;
 		DrawIndirectGpuArgs    indirect_args {};
 		// KYTY_PERF_DRAIN_FREE_WAIT: the operation's sequence and where its write verdict goes (PipelineCache::ResolvedWrites,
-		// 3 for an empty resolution), published before the slot is ready; null: not published (a check slot).
+		// 3 for an empty resolution), published before the slot is ready; null: not published (a check slot). With
+		// `want_ranges` (=3, the full variant) the verdict comes with the write and read ranges of the resolution, and the
+		// stream's state taken when the task was made, before any read of it: the executed sequence, the newest published
+		// label and the known GPU tick.
 		uint64_t               op_sequence = 0;
-		void                   (*writes_verdict)(uint64_t sequence, uint8_t verdict) = nullptr;
+		bool                   want_ranges = false;
+		uint64_t               watermark = 0, published = 0, known_tick = 0;
+		void                   (*writes_verdict)(const ResolveTask& task, uint8_t verdict, const OpWriteRanges* ranges) = nullptr;
 	};
 	// The helper (or, with KYTY_CHECK_RESOLVE=2, the resolve thread for the reference): resolves the task into `slot`
 	// (the draw's pre-check included) and marks it ready (empty when there was nothing to resolve).

@@ -2789,6 +2789,78 @@ uint8_t PipelineCache::ResolvedWrites(const ResolvedStages& results) {
 	return writes ? 2 : 1;
 }
 
+uint32_t CoverIntervals(std::vector<std::pair<uint64_t, uint64_t>>& in, std::pair<uint64_t, uint64_t>* out, uint32_t max) {
+	if (in.empty() || max == 0) return 0;
+	std::sort(in.begin(), in.end());
+	size_t n = 0;
+	for (size_t i = 1; i < in.size(); i++) {
+		if (in[i].first <= in[n].second) {
+			in[n].second = std::max(in[n].second, in[i].second);
+		} else {
+			in[++n] = in[i];
+		}
+	}
+	n++;
+	if (n > max) {
+		thread_local std::vector<uint64_t> gaps;
+		gaps.resize(n - 1);
+		for (size_t i = 0; i + 1 < n; i++) gaps[i] = in[i + 1].first - in[i].second;
+		const size_t merges = n - max;
+		std::nth_element(gaps.begin(), gaps.begin() + static_cast<std::ptrdiff_t>(merges - 1), gaps.end());
+		const uint64_t limit = gaps[merges - 1];
+		size_t below = 0;
+		for (size_t i = 0; i + 1 < n; i++) {
+			if (in[i + 1].first - in[i].second < limit) below++;
+		}
+		size_t at_limit = merges - below;
+		size_t m        = 0;
+		for (size_t i = 1; i < n; i++) {
+			const uint64_t own  = in[i].first - in[i - 1].second;
+			const bool     join = own < limit || (own == limit && at_limit != 0);
+			if (own == limit && join) at_limit--;
+			if (join) {
+				in[m].second = std::max(in[m].second, in[i].second);
+			} else {
+				in[++m] = in[i];
+			}
+		}
+		n = m + 1;
+	}
+	const auto count = static_cast<uint32_t>(std::min<size_t>(n, max));
+	std::copy_n(in.begin(), count, out);
+	if (n > max) out[count - 1].second = std::max(out[count - 1].second, in[n - 1].second);
+	return count;
+}
+
+void PipelineCache::ResolvedWriteRanges(const ResolvedStages& results, OpWriteRanges& out) {
+	thread_local std::vector<std::pair<uint64_t, uint64_t>> writes, reads;
+	writes.clear();
+	reads.clear();
+	out.known  = results.adoptable && results.count != 0;
+	out.writes = 0;
+	out.reads  = 0;
+	for (uint32_t i = 0; i < std::min(results.count, 4u) && out.known; i++) {
+		const auto& r = results.stages[i];
+		if (!r.ok || r.permutation == nullptr || r.entry == nullptr ||
+		    static_cast<const ProgramCache::SourceEntry*>(r.entry)->call_source) {
+			out.known = false;
+			break;
+		}
+		const auto& program = static_cast<const ProgramCache::Permutation*>(r.permutation)->program;
+		out.known = StageF::WrittenRangesAhead(r.record.get(), program, r.resources, writes);
+	}
+	if (!out.known) return;
+	for (auto& w: writes) {
+		w.first  = w.first & ~uint64_t {255};
+		w.second = (w.second + 255u) & ~uint64_t {255};
+	}
+	for (const auto& e: results.log.entries) {
+		if (e.size != 0) reads.emplace_back(e.address, e.address + e.size);
+	}
+	out.writes = static_cast<uint8_t>(CoverIntervals(writes, out.write.data(), OpWriteRanges::MaxWrites));
+	out.reads  = static_cast<uint8_t>(CoverIntervals(reads, out.read.data(), OpWriteRanges::MaxReads));
+}
+
 bool PipelineCache::AheadProgramsOk(const ResolvedStages& results) {
 	return results.ahead_programs_ok;
 }

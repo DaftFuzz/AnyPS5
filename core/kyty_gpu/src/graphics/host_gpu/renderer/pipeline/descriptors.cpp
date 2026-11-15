@@ -1525,6 +1525,31 @@ void BuildResolveRecord(RenderContext& renderer, const ShaderRecompiler::IR::Res
 	BuildBufferSources(renderer, snapshot, *record);
 }
 
+bool WrittenRangesAhead(const ResolveRecord* record, const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                        const ShaderRecompiler::IR::ResourceSnapshot& snapshot, std::vector<std::pair<uint64_t, uint64_t>>& out) {
+	if (program.has_address_writes || program.info.uses_dma) return false;
+	for (uint32_t resource = 0; resource < program.info.buffers.size(); resource++) {
+		const auto& metadata = program.info.buffers[resource];
+		if (!metadata.written || metadata.descriptor_index == UINT32_MAX) continue;
+		if (record == nullptr || resource >= record->buffer_count || resource >= snapshot.buffers.size()) return false;
+		const auto& source = record->buffers[resource];
+		const auto& value  = snapshot.buffers[resource];
+		if (value.dword_count < source.words.size() || !std::equal(source.words.begin(), source.words.end(), value.dwords.begin())) {
+			return false;
+		}
+		if (source.outcome == BufferOutcome::Null) continue;
+		if (source.outcome != BufferOutcome::Found || source.sentinel) return false;
+		if (source.size != 0) out.emplace_back(source.address, source.address + source.size);
+	}
+	if (!program.info.indirect_ranges.empty()) {
+		if (!snapshot.indirect_ranges_complete || !snapshot.indirect_writes_complete) return false;
+		for (const auto& range: snapshot.indirect_ranges) {
+			if (range.written && range.size != 0) out.emplace_back(range.address, range.address + range.size);
+		}
+	}
+	return true;
+}
+
 } // namespace StageF
 
 // KYTY_DIAG_PENDING_CLEAR_READS=1 (lane v4x, diagnostic, default off; v4b row 8): a depth image bound as a texture

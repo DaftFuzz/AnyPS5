@@ -497,8 +497,21 @@ public:
 	//     has not finished as far as the known GPU tick says (0: none);
 	//   - DirectShaderWrites (GPU thread): writes of unknown bytes listed so far (monotonic), for the check that an
 	//     operation judged unable to write lists none.
+	// Modes: 1 the reduced variant (any operation in flight that can write drains), 2 its check, 3 the full variant (an
+	// operation in flight whose write ranges, found ahead, exclude the word and whose resolution cannot have read bytes
+	// changed since does not drain), 4 its check. DrainFreeRangesPossible: =3/4 can be on (the resolve side then lists
+	// ranges and the execution thread checks every listed operation's writes against them: WatchWrites).
 	[[nodiscard]] static uint32_t DrainFreeWaitMode();
 	[[nodiscard]] static bool     DrainFreeWaitPossible();
+	[[nodiscard]] static bool     DrainFreeRangesPossible();
+	// GPU thread, around one operation: writes it notes outside `intervals` are counted (WatchedOutside).
+	void                          WatchWrites(const std::pair<uint64_t, uint64_t>* intervals, uint32_t count) noexcept {
+		m_watch_intervals = intervals;
+		m_watch_count     = count;
+		m_watch_on        = true;
+	}
+	void                          UnwatchWrites() noexcept { m_watch_on = false; }
+	[[nodiscard]] uint64_t        WatchedOutside() const noexcept { return m_watch_outside; }
 	[[nodiscard]] uint64_t        PublishedDirectTick(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] uint64_t        DirectShaderWrites() const noexcept { return m_direct_shader_writes; }
 	// KYTY_PERF_SERVE_IN_WAIT (G5, design-gpuwait 2.1; default 0; 1 on, live A/B switch; 2 check, start value only), GPU
@@ -890,6 +903,10 @@ private:
 	std::mutex                        m_published_direct_mutex;
 	std::vector<PublishedDirectWrite> m_published_direct;
 	uint64_t                          m_direct_shader_writes = 0;
+	const std::pair<uint64_t, uint64_t>* m_watch_intervals = nullptr;
+	uint32_t                          m_watch_count   = 0;
+	bool                              m_watch_on      = false;
+	uint64_t                          m_watch_outside = 0;
 	uint32_t                    m_direct_mode_seen = 0;
 	bool                        m_direct_parsed    = false;
 	bool                        m_direct_wanted    = false; // a range is wanted, or a live A/B switch waits
