@@ -1725,6 +1725,7 @@ struct PipelineCache::TableCompileJob {
 	ShaderRecompiler::IR::ResourceSnapshot no_resources;
 	// KYTY_SHADER_PRECOMPILE: the pipeline's record (made from recorded stages), recorded once the cache takes it.
 	PrecompileGraphicsRecord               precompile;
+	PrecompileGraphicsRecord               written;
 	bool                                   precompile_record = false;
 	std::unique_ptr<Pipeline>              pipeline = std::make_unique<Pipeline>();
 	bool                                   failed   = false; // the driver refused it (nothing of it is left)
@@ -2938,6 +2939,16 @@ PipelineCache::GraphicsPipelineKey PipelineCache::ShareRest(const GraphicsPipeli
 	return rest;
 }
 
+void PipelineCache::RestoreRecordedCull(PipelineStaticParameters& static_params, const HW::Context& ctx,
+                                        const HW::UserConfig& user_config) const {
+	if (!m_share_attachments) return;
+	const HW::ModeControl& mc        = ctx.GetModeControl();
+	const bool             rect_list = Prospero::IsRectList(user_config.GetPrimType());
+	static_params.cull_back          = !rect_list && mc.cull_back;
+	static_params.cull_front         = !rect_list && mc.cull_front;
+	static_params.face               = mc.face;
+}
+
 void PipelineCache::NoteSharedPipeline(const GraphicsPipelineKey& key) {
 	if (!m_share_attachments || AttachmentSetSlots(key.rendering) == 0) return;
 	m_share_groups[ShareRest(key)].push_back(key);
@@ -3311,7 +3322,9 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
 	if (precompile_record) {
-		m_precompiler->RecordPipeline(precompile);
+		PrecompileGraphicsRecord written = precompile;
+		RestoreRecordedCull(written.static_params, command.GetRegisters(), command.GetUserConfig());
+		m_precompiler->RecordPipeline(written);
 		if (m_warm != nullptr) m_warm->Mark(precompile.Key(), true);
 	}
 
@@ -3496,6 +3509,8 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipelineAsync(
 		job->precompile.vertex_input  = key.vertex_input;
 		job->precompile.static_params = key.static_params;
 		job->precompile.revision      = ShaderPrecompiler::Revision();
+		job->written                  = job->precompile;
+		RestoreRecordedCull(job->written.static_params, command.GetRegisters(), command.GetUserConfig());
 	}
 	{
 		const std::unique_lock pipelines_lock(m_pipelines_mutex);
@@ -3527,7 +3542,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipelineAsync(
 		} else if (job->precompile_record) {
 			// Recorded when made, not when a draw takes it: a pipeline no later draw took (219 in a 40-minute session)
 			// left its recorded stages without a pipeline record, so the next start never compiled them.
-			m_precompiler->RecordPipeline(job->precompile);
+			m_precompiler->RecordPipeline(job->written);
 			if (m_warm != nullptr) m_warm->Mark(job->precompile.Key(), true);
 		}
 		job->ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
