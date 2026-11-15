@@ -1572,6 +1572,11 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
 		m_precompiler = std::make_unique<ShaderPrecompiler>(m_graphics, m_driver_cache, journal, graphics_journal,
 		                                                    m_precompiled_since_save, m_warm.get());
 		m_program_cache->precompiler = m_precompiler.get();
+	} else if (ShaderPrecompiler::Enabled()) {
+		std::fprintf(stderr, "SHADER_PRECOMPILE unavailable: the Vulkan pipeline cache is off (no title id, non-Release, "
+		                     "unknown git revision, dirty build or vkCreatePipelineCache failed: the 'Vulkan pipeline "
+		                     "cache:' line says which); nothing is precompiled or journalled\n");
+		std::fflush(stderr);
 	}
 }
 
