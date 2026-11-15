@@ -119,11 +119,22 @@ bool SrtGpuWordsVerify() {
 	}();
 	return enabled;
 }
+
+bool SrtGpuWordsOn() {
+	static const bool on = [] {
+		const char* value = Common::ShaderEnv::Read("KYTY_PERF_SRT_GPU_WORDS");
+		const bool  e     = value == nullptr || value[0] != '0';
+		if (!e) std::fprintf(stderr, "PERF_SRT_GPU_WORDS off: the CPU walker reads every SRT word\n");
+		return e;
+	}();
+	return on;
+}
 } // namespace
 
 void PlanSrtGpuWords(Program& program) {
 	program.info.srt_gpu_words.clear();
 	program.info.srt_flat_words = 0;
+	if (!SrtGpuWordsOn()) return;
 	// The only path (9.11, project 21 part 1: town walk 16.0 -> 19.6 fps in clean ABBA, VERIFY 7.2e12 checks with 0
 	// differences, cutscene +1.9%; KYTY_PERF_SRT_GPU_WORDS removed): the shader reads its shader-only SRT words from GPU
 	// memory. A shader that may write the words it reads (stores through unknown addresses) keeps the snapshot.
