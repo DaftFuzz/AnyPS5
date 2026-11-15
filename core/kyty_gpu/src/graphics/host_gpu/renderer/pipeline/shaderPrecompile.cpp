@@ -3323,7 +3323,9 @@ void ShaderPrecompiler::Record(const PrecompileStageRecord& record) {
 }
 
 void ShaderPrecompiler::RecordPipeline(const PrecompileGraphicsRecord& record) {
-	const auto      key = record.Key();
+	PrecompileGraphicsRecord keyed = record;
+	if (m_share) ClearDynamicCull(keyed.static_params);
+	const auto      key = keyed.Key();
 	std::lock_guard lock(m_mutex);
 	if (m_graphics_journal == nullptr || !m_recorded_graphics.insert(key).second) return;
 	WritePayload(m_graphics_journal, SerializePipeline(record));

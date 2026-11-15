@@ -376,6 +376,8 @@ private:
 	Pipeline* FindSharedPipeline(const GraphicsPipelineKey& key, std::span<const ShaderVertexInputInfo> vertex_info,
 	                             const ShaderPixelInputInfo* ps_input_info, const GraphicsPrograms& programs);
 	void      NoteSharedPipeline(const GraphicsPipelineKey& key);
+	void      RestoreRecordedCull(PipelineStaticParameters& static_params, const HW::Context& ctx,
+	                              const HW::UserConfig& user_config) const;
 	void      ReportShare();
 	// N5.1: every change of m_graphics_pipelines and m_table_pending (the execution thread) holds it exclusively; a resolve
 	// helper's FindGraphicsPipeline holds it shared. The execution thread's own reads need no lock (it is the only writer).
