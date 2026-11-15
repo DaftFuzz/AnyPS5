@@ -2570,7 +2570,12 @@ void DefineRuntimeFormatFunctionsImpl(ValueEmitContext& ctx) {
 		const auto function_type = state.builder.Type(spv::OpTypeFunction, result_type, std::span<const uint32_t>(parameter_types));
 		const auto function      = state.builder.AllocateId();
 		state.builder.AddName(function, "runtime_format_load");
-		state.builder.AddFunction(spv::OpFunction, result_type, function, spv::FunctionControlDontInlineMask, function_type);
+		static const bool inline_runtime = [] {
+			const char* value = Common::ShaderEnv::Read("KYTY_PERF_NULL_SLOT_RUNTIME_INLINE");
+			return value != nullptr && value[0] == '1';
+		}();
+		state.builder.AddFunction(spv::OpFunction, result_type, function,
+		                          inline_runtime ? spv::FunctionControlMaskNone : spv::FunctionControlDontInlineMask, function_type);
 		std::vector<uint32_t> parameters;
 		for (const auto type: parameter_types) {
 			parameters.push_back(state.builder.AllocateId());
