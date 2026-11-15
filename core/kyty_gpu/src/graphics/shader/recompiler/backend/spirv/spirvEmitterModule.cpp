@@ -192,6 +192,14 @@ uint32_t PushConstantBlockType(EmitterState& state) {
 }
 
 uint32_t PerVertexType(EmitterState& state) {
+	if (Common::EnvRead::Gpl() != 0u) {
+		return state.builder.DecoratedType(
+		    spv::OpTypeStruct,
+		    {{spv::OpMemberDecorate, {0, spv::DecorationBuiltIn, spv::BuiltInPosition}},
+		     {spv::OpMemberDecorate, {0, spv::DecorationInvariant}},
+		     {spv::OpDecorate, {spv::DecorationBlock}}},
+		    TypeF32Vector(state, 4));
+	}
 	return state.builder.DecoratedType(
 	    spv::OpTypeStruct,
 	    {{spv::OpMemberDecorate, {0, spv::DecorationBuiltIn, spv::BuiltInPosition}},
