@@ -987,10 +987,23 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	if (const auto create_ms =
 	        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - create_begin).count();
 	    (PerfEnabled() && create_ms >= 50.0) || (!background && create_ms >= 200.0)) {
-		std::fprintf(stderr, "PIPELINE_TIME %s vs=0x%016llx ps=0x%016llx %.0fms created_ago=%.0f/%.0fms\n",
-		             background ? "graphics-background" : "graphics", static_cast<unsigned long long>(stats_vs),
-		             static_cast<unsigned long long>(stats_ps), create_ms, ShaderCreatedMsAgo(stats_vs),
-		             ShaderCreatedMsAgo(stats_ps));
+		if (PerfEnabled()) {
+			const auto& vs       = *vs_input_info.stage.program;
+			const auto* ps       = ps_active && ps_input_info->stage ? ps_input_info->stage.program : nullptr;
+			std::fprintf(stderr,
+			             "PIPELINE_TIME %s vs=0x%016llx ps=0x%016llx %.0fms created_ago=%.0f/%.0fms kind=graphics source=%s "
+			             "vs_spirv_words=%u ps_spirv_words=%u vs_form=%s vs_lds=%s\n",
+			             background ? "graphics-background" : "graphics", static_cast<unsigned long long>(stats_vs),
+			             static_cast<unsigned long long>(stats_ps), create_ms, ShaderCreatedMsAgo(stats_vs),
+			             ShaderCreatedMsAgo(stats_ps), background ? "precompile" : "runtime", vs.spirv_words,
+			             ps != nullptr ? ps->spirv_words : 0u, ShaderRecompiler::IR::EmitFormName(vs.emit_form),
+			             ShaderRecompiler::IR::EmitLdsName(vs.emit_lds));
+		} else {
+			std::fprintf(stderr, "PIPELINE_TIME %s vs=0x%016llx ps=0x%016llx %.0fms created_ago=%.0f/%.0fms\n",
+			             background ? "graphics-background" : "graphics", static_cast<unsigned long long>(stats_vs),
+			             static_cast<unsigned long long>(stats_ps), create_ms, ShaderCreatedMsAgo(stats_vs),
+			             ShaderCreatedMsAgo(stats_ps));
+		}
 		std::fflush(stderr);
 	}
 	if (result == vk::Result::eSuccess) { // PIPELINE_REPEAT
@@ -1144,9 +1157,23 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	if (const auto create_ms =
 	        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - create_begin).count();
 	    (PerfEnabled() && create_ms >= 50.0) || (!background && create_ms >= 200.0)) {
-		std::fprintf(stderr, "PIPELINE_TIME %s cs=0x%016llx %.0fms created_ago=%.0fms\n",
-		             background ? "compute-background" : "compute",
-		             static_cast<unsigned long long>(stats_cs), create_ms, ShaderCreatedMsAgo(stats_cs));
+		if (PerfEnabled()) {
+			const auto&    program = *input_info.stage.program;
+			const uint32_t threads = std::max(input_info.threads_num[0], 1u) * std::max(input_info.threads_num[1], 1u) *
+			                         std::max(input_info.threads_num[2], 1u);
+			std::fprintf(stderr,
+			             "PIPELINE_TIME %s cs=0x%016llx %.0fms created_ago=%.0fms kind=compute source=%s spirv_words=%u "
+			             "form=%s lds=%s lds_dwords=%u threads=%u wave=%u\n",
+			             background ? "compute-background" : "compute", static_cast<unsigned long long>(stats_cs),
+			             create_ms, ShaderCreatedMsAgo(stats_cs), background ? "precompile" : "runtime", program.spirv_words,
+			             ShaderRecompiler::IR::EmitFormName(program.emit_form),
+			             ShaderRecompiler::IR::EmitLdsName(program.emit_lds), input_info.lds_size_dwords, threads,
+			             program.wave_size);
+		} else {
+			std::fprintf(stderr, "PIPELINE_TIME %s cs=0x%016llx %.0fms created_ago=%.0fms\n",
+			             background ? "compute-background" : "compute",
+			             static_cast<unsigned long long>(stats_cs), create_ms, ShaderCreatedMsAgo(stats_cs));
+		}
 		std::fflush(stderr);
 	}
 	if (want_stats && result == vk::Result::eSuccess) {

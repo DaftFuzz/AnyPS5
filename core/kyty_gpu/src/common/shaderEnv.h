@@ -75,6 +75,7 @@ inline constexpr const char* Names[] = {
 
 // Sorted (strcmp order; checked below).
 inline constexpr const char* OutputOnlyNames[] = {
+    "KYTY_DIAG_LDS_STORAGE",
     // Precompiler report, no module made.
     "KYTY_DIAG_PRECOMPILE_FILE_MATCH",
     // Whether a dispatch is sent (shader.cpp); the translation is the same.
@@ -86,6 +87,12 @@ inline constexpr const char* OutputOnlyNames[] = {
     // Table-mode pipelines made in the background: the key a lookup asks for, not what a key makes.
     "KYTY_PERF_TABLE_ASYNC",
     "KYTY_PERF_TABLE_ASYNC_THREADS",
+    "KYTY_PRECOMPILE_ONLY_HASHES",
+    "KYTY_PRECOMPILE_SKIP_HASHES",
+    "KYTY_SHADER_HINTS_ANY_VERSION",
+    "KYTY_SHADER_HINTS_EXPORT",
+    "KYTY_SHADER_HINTS_GAME_DIR",
+    "KYTY_SHADER_HINTS_IMPORT",
     // The precompiler: whether and how many records are made in the background, how the warm list is kept.
     "KYTY_SHADER_PRECOMPILE",
     "KYTY_SHADER_PRECOMPILE_GRAPHICS",
@@ -99,6 +106,7 @@ inline constexpr const char* OutputOnlyNames[] = {
     "KYTY_TRACE_DISASM",
     "KYTY_TRACE_INDIRECT_COUNTS",
     "KYTY_TRACE_INDIRECT_IMAGE",
+    "KYTY_TRACE_PERF",
     "KYTY_TRACE_PERMUTATIONS",
     "KYTY_TRACE_SHADER_CODE_DIR",
     "KYTY_TRACE_SHADER_STAGES",

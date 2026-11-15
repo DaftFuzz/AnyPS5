@@ -38,6 +38,7 @@
 // the data-flow below sees that; the rules never look at a register NAME, only at the producing operation.
 #define SPV_ENABLE_UTILITY_CODE 1
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
+#include "common/envRead.h"
 #include "common/shaderEnv.h"
 
 #include <algorithm>
@@ -396,7 +397,7 @@ void LaneShareReport(EmitterState& state) {
 	const auto& share = state.lane_share;
 	if (!share.active) return;
 	static std::atomic_uint reports {0};
-	if (reports.fetch_add(1) >= 64u) return; // a long game session compiles many permutations
+	if (!Common::EnvRead::PerfLines() && reports.fetch_add(1) >= 64u) return;
 	std::fprintf(stderr, "LANE2_UNIFORM_SHARE hash=%016llx instructions=%zu uniform=%zu shared=%zu reused=%llu words_saved=%llu\n",
 	             static_cast<unsigned long long>(state.program.shader_hash), share.instructions, share.uniform.size(),
 	             share.shared.size(), static_cast<unsigned long long>(share.reused),

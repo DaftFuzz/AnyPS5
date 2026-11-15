@@ -152,6 +152,8 @@ CompiledShaderInfo Program::TakeCompiledInfo() && {
 	    .has_address_writes = has_address_writes,
 	    .info            = std::move(info),
 	    .bindings        = std::move(bindings),
+	    .emit_form       = emit_form,
+	    .emit_lds        = emit_lds,
 	};
 	for (const auto& output: result.info.outputs) {
 		if (output.kind == StageOutputKind::Parameter && output.index < 32) {

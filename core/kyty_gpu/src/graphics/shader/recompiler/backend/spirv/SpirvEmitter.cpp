@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 
 #include "common/assert.h"
+#include "common/envRead.h"
 #include "common/shaderEnv.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -352,7 +353,7 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 		}
 		// (The pair rule pairs many compute shaders: their lines are capped.)
 		static std::atomic_uint rule_logged {0};
-		if (listed || rule_logged.fetch_add(1, std::memory_order_relaxed) < 64u) {
+		if (listed || Common::EnvRead::PerfLines() || rule_logged.fetch_add(1, std::memory_order_relaxed) < 64u) {
 			std::fprintf(stderr, "WAVE64_PAIR hash=%016llx threads=%u %s%s%s%s\n",
 			             static_cast<unsigned long long>(program.shader_hash), threads,
 			             reason == nullptr ? "paired" : "kept two lanes: ", reason == nullptr ? "" : reason,
@@ -363,6 +364,13 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 	ValidateNativeProgram(program, program.stage == ShaderType::Compute &&
 	                                   input_info.compute != nullptr && input_info.compute->lds_storage);
 	EmitProgram(state);
+	program.emit_form = state.wave_pair ? IR::EmitForm::Paired
+	                    : state.lane_count == 2u ? IR::EmitForm::TwoLane
+	                                             : IR::EmitForm::OneLane;
+	program.emit_lds  = !program.info.uses_lds                                   ? IR::EmitLds::None
+	                    : state.lds_storage_class == spv::StorageClassStorageBuffer ? IR::EmitLds::Storage
+	                    : state.lds_storage_class == spv::StorageClassWorkgroup     ? IR::EmitLds::Workgroup
+	                                                                                : IR::EmitLds::Function;
 	if (state.native_half) DeclareNativeHalf(state);
 	state.builder.AddEntryPoint(ExecutionModelForStage(state.program.stage), state.main_func,
 	                            "main", state.interface_variables);

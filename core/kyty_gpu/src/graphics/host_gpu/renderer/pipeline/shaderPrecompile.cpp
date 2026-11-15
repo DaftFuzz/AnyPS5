@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <charconv>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -28,6 +29,7 @@
 #include <functional>
 #include <fmt/format.h>
 #include <limits>
+#include <span>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -1433,7 +1435,7 @@ bool PrecompileHintsExport(const std::filesystem::path& journal, const std::file
 
 bool PrecompileHintsImport(const GraphicContext& graphics, const std::filesystem::path& hints,
                            const std::filesystem::path& game_dir, const std::filesystem::path& journal,
-                           const std::filesystem::path& graphics_journal, std::string& summary) {
+                           const std::filesystem::path& graphics_journal, std::string& summary, bool any_version) {
 	const auto bytes = ReadFileBytes(hints);
 	if (bytes.size() < HintsHeaderBytes || std::memcmp(bytes.data(), HintsMagic, sizeof(HintsMagic)) != 0) {
 		summary = "reason=not_a_hints_file";
@@ -1503,7 +1505,7 @@ bool PrecompileHintsImport(const GraphicContext& graphics, const std::filesystem
 	}
 	// A hints file of another game version finds few of its shaders and reads the whole game looking for the rest (the
 	// 1.512 file on 2.002: ~185 GB, players thought it hung, 3.11): nothing is scanned.
-	if (!game_version.empty() && !own_version.empty() && game_version != own_version) {
+	if (!any_version && !game_version.empty() && !own_version.empty() && game_version != own_version) {
 		summary = fmt::format("reason=other_version hints_version={} game_version={}", game_version, own_version);
 		return false;
 	}
@@ -1737,6 +1739,90 @@ void SetStageCompileOptions(ShaderRecompiler::CompileOptions& options) {
 	}
 }
 
+namespace {
+
+struct PrecompileHashList {
+	bool                  set = false;
+	bool                  all = false;
+	std::vector<uint64_t> values;
+	[[nodiscard]] bool Contains(uint64_t hash) const { return all || std::ranges::binary_search(values, hash); }
+};
+
+PrecompileHashList ParsePrecompileHashList(const char* name, const char* value, bool allow_all) {
+	PrecompileHashList list;
+	if (value == nullptr || value[0] == '\0') return list;
+	list.set = true;
+	const std::string_view text(value);
+	size_t                 pos = 0;
+	while (pos < text.size()) {
+		const auto end   = std::min(text.find_first_of(",; \t", pos), text.size());
+		auto       token = text.substr(pos, end - pos);
+		pos              = end + 1;
+		if (token.empty()) continue;
+		if (allow_all && (token == "all" || token == "1")) {
+			list.all = true;
+			continue;
+		}
+		if (token.size() > 2 && token[0] == '0' && (token[1] == 'x' || token[1] == 'X')) token.remove_prefix(2);
+		uint64_t   hash  = 0;
+		const auto parse = std::from_chars(token.data(), token.data() + token.size(), hash, 16);
+		if (token.size() > 16 || parse.ec != std::errc() || parse.ptr != token.data() + token.size()) {
+			std::fprintf(stderr, "SHADER_PRECOMPILE_FILTER %s: '%.*s' is not a hex shader hash (ignored)\n", name,
+			             static_cast<int>(token.size()), token.data());
+			continue;
+		}
+		list.values.push_back(hash);
+	}
+	std::ranges::sort(list.values);
+	return list;
+}
+
+const PrecompileHashList& PrecompileOnlyHashes() {
+	static const auto list =
+	    ParsePrecompileHashList("KYTY_PRECOMPILE_ONLY_HASHES", Common::ShaderEnv::Read("KYTY_PRECOMPILE_ONLY_HASHES"), false);
+	return list;
+}
+
+const PrecompileHashList& PrecompileSkipHashes() {
+	static const auto list =
+	    ParsePrecompileHashList("KYTY_PRECOMPILE_SKIP_HASHES", Common::ShaderEnv::Read("KYTY_PRECOMPILE_SKIP_HASHES"), false);
+	return list;
+}
+
+bool PrecompileHashesFiltered(std::span<const uint64_t> hashes) {
+	const auto& only = PrecompileOnlyHashes();
+	const auto& skip = PrecompileSkipHashes();
+	if (only.set && std::ranges::none_of(hashes, [&](uint64_t hash) { return only.Contains(hash); })) return true;
+	return skip.set && std::ranges::any_of(hashes, [&](uint64_t hash) { return skip.Contains(hash); });
+}
+
+const PrecompileHashList& DiagLdsStorageHashes() {
+	static const auto list = [] {
+		const char* value = Common::ShaderEnv::Read("KYTY_DIAG_LDS_STORAGE");
+		if (value == nullptr || std::strcmp(value, "0") == 0) return PrecompileHashList {};
+		return ParsePrecompileHashList("KYTY_DIAG_LDS_STORAGE", value, true);
+	}();
+	return list;
+}
+
+bool LdsStorageForced(const PrecompileStageRecord& record) {
+	const auto& list = DiagLdsStorageHashes();
+	return list.set && record.stage == ShaderType::Compute && record.compute.lds_size_dwords != 0 &&
+	       !record.compute.lds_storage && list.Contains(record.shader_hash);
+}
+
+uint64_t ForcedLdsKey(uint64_t key) {
+	const uint64_t words[] = {key, 0x45524f5453534c44ull};
+	return XXH3_64bits(words, sizeof(words));
+}
+
+std::string PrecompileFilterText(const char* name, const PrecompileHashList& list) {
+	if (!list.set) return {};
+	return fmt::format(" {}={}", name, list.all ? std::string("all") : std::to_string(list.values.size()));
+}
+
+} // namespace
+
 bool ShaderPrecompiler::Enabled() {
 	static const bool enabled = [] {
 		// Default from Common::EnvDefaults; =0 turns it off.
@@ -1944,6 +2030,8 @@ void ShaderPrecompiler::LoadCompute(const std::unordered_set<uint64_t>& skipped,
 	size_t                rejected = 0;
 	size_t                suspects = 0;
 	size_t                warm     = 0;
+	size_t                filtered = 0;
+	size_t                forced   = 0;
 	std::vector<uint32_t> words;
 	if (header_ok) {
 		words.resize((bytes.size() - HeaderBytes) / sizeof(uint32_t));
@@ -1959,7 +2047,15 @@ void ShaderPrecompiler::LoadCompute(const std::unordered_set<uint64_t>& skipped,
 		job.key = record.Key();
 		if (!m_recorded.insert(job.key).second) return;
 		job.record = static_cast<uint32_t>(m_compute_records.size());
-		if (skipped.contains(job.key)) {
+		if (LdsStorageForced(record)) {
+			job.key        = ForcedLdsKey(job.key);
+			job.forced_lds = true;
+			forced++;
+		}
+		if (const uint64_t hash[] = {record.shader_hash}; PrecompileHashesFiltered(hash)) {
+			job.state = JobState::Dropped;
+			filtered++;
+		} else if (skipped.contains(job.key)) {
 			job.state = JobState::Dropped;
 			suspects++;
 		} else if (m_warm != nullptr && m_warm->Contains(job.key, false)) {
@@ -1988,6 +2084,13 @@ void ShaderPrecompiler::LoadCompute(const std::unordered_set<uint64_t>& skipped,
 	             warm != 0 && ShaderReuseEnabled() ? " (compiled for the reuse store, no pipeline)" : "",
 	             rejected != 0 ? ", some records rejected" : "", torn ? ", torn tail dropped" : "",
 	             other_layout ? ", the file has another record layout or version (its records dropped)" : "");
+	if (PrecompileOnlyHashes().set || PrecompileSkipHashes().set || DiagLdsStorageHashes().set) {
+		std::fprintf(stderr, "SHADER_PRECOMPILE filter: %zu compute records left out, %zu forced to LDS storage%s%s%s\n",
+		             filtered, forced,
+		             PrecompileFilterText("KYTY_PRECOMPILE_ONLY_HASHES", PrecompileOnlyHashes()).c_str(),
+		             PrecompileFilterText("KYTY_PRECOMPILE_SKIP_HASHES", PrecompileSkipHashes()).c_str(),
+		             PrecompileFilterText("KYTY_DIAG_LDS_STORAGE", DiagLdsStorageHashes()).c_str());
+	}
 
 	// --precompile-only records nothing: the file is left as it is (one of another layout stays for the build that
 	// wrote it; a torn tail is repaired by the next game start).
@@ -2059,6 +2162,7 @@ void ShaderPrecompiler::LoadGraphics(const std::unordered_set<uint64_t>& skipped
 	size_t unresolved = 0;
 	size_t suspects   = 0;
 	size_t warm       = 0;
+	size_t filtered   = 0;
 	for (auto& record: pipelines) {
 		const auto key      = record.Key();
 		bool       resolved = true;
@@ -2076,7 +2180,12 @@ void ShaderPrecompiler::LoadGraphics(const std::unordered_set<uint64_t>& skipped
 		job.key      = key;
 		job.record   = static_cast<uint32_t>(m_graphics_records.size());
 		job.graphics = true;
-		if (suspect) {
+		std::vector<uint64_t> stage_hashes;
+		ForEachStage(record, [&](uint64_t stage) { stage_hashes.push_back(m_stages.at(stage).record.shader_hash); });
+		if (PrecompileHashesFiltered(stage_hashes)) {
+			job.state = JobState::Dropped;
+			filtered++;
+		} else if (suspect) {
 			job.state = JobState::Dropped;
 			suspects++;
 		} else if (m_warm != nullptr && m_warm->Contains(key, true) && !ShaderReuseEnabled()) {
@@ -2102,7 +2211,8 @@ void ShaderPrecompiler::LoadGraphics(const std::unordered_set<uint64_t>& skipped
 		auto& stage = m_stages.at(key);
 		if (stage.users != 0) continue;
 		orphans++;
-		if (!ShaderReuseEnabled() || skipped.contains(key)) continue;
+		const uint64_t hash[] = {stage.record.shader_hash};
+		if (!ShaderReuseEnabled() || skipped.contains(key) || PrecompileHashesFiltered(hash)) continue;
 		stage.users = 1; // the job's (a miss while it is queued is pending)
 		Job job;
 		job.key        = key;
@@ -2125,6 +2235,9 @@ void ShaderPrecompiler::LoadGraphics(const std::unordered_set<uint64_t>& skipped
 	             other_device ? ", another GPU's records dropped" : "", rejected != 0 ? ", some records rejected" : "",
 	             unresolved != 0 ? ", pipelines without their stages dropped" : "", torn ? ", torn tail dropped" : "",
 	             other_layout ? ", the file has another record layout or version (its records dropped)" : "");
+	if (PrecompileOnlyHashes().set || PrecompileSkipHashes().set) {
+		std::fprintf(stderr, "SHADER_PRECOMPILE filter: %zu graphics pipelines left out\n", filtered);
+	}
 
 	// --precompile-only records nothing: the file is left as it is (as the compute journal).
 	if (Config::PrecompileOnly()) return;
@@ -2232,6 +2345,10 @@ void ShaderPrecompiler::Worker(uint32_t index) {
 			CompileStageOnly(job->key);
 		} else if (job->graphics) {
 			CompileGraphics(*job);
+		} else if (job->forced_lds) {
+			auto forced                = m_compute_records[job->record];
+			forced.compute.lds_storage = true;
+			Compile(forced, job->key, job->warm, true);
 		} else {
 			Compile(m_compute_records[job->record], job->key, job->warm);
 		}
@@ -2311,7 +2428,7 @@ void ShaderPrecompiler::Worker(uint32_t index) {
 // permutation already.
 bool ShaderPrecompiler::CompileModule(const PrecompileStageRecord& record, uint64_t key, bool need_module,
                                       vk::ShaderModule& module, ShaderRecompiler::IR::CompiledShaderInfo& info,
-                                      size_t& spirv_words) {
+                                      size_t& spirv_words, bool forced_lds) {
 	const Common::StartupTrace::Scope startup_scope(Common::StartupTrace::Counter::ShaderBackground);
 	ShaderVertexInputInfo  vertex  = record.vertex;
 	ShaderPixelInputInfo   pixel   = record.pixel;
@@ -2353,7 +2470,7 @@ bool ShaderPrecompiler::CompileModule(const PrecompileStageRecord& record, uint6
 	bool                                     disk_hit          = false;
 	if (disk_mode != 0 && m_disk->Contains(key)) {
 		disk_hit = m_disk->Load(key, disk_spirv, disk_info, disk_translate_ms, disk_compile_ms) &&
-		           !(record.revision == Revision() &&
+		           !(!forced_lds && record.revision == Revision() &&
 		             XXH3_64bits(disk_spirv.data(), disk_spirv.size() * sizeof(uint32_t)) != record.spirv_hash);
 		if (!disk_hit) g_reuse.disk_load_failed.fetch_add(1, std::memory_order_relaxed);
 	}
@@ -2376,7 +2493,8 @@ bool ShaderPrecompiler::CompileModule(const PrecompileStageRecord& record, uint6
 					return false;
 				}
 			}
-			info = disk_info;
+			info             = disk_info;
+			info.spirv_words = static_cast<uint32_t>(disk_spirv.size());
 			if (keep) {
 				StoreReuse(record, key, program, std::move(disk_plan), std::move(disk_spirv), info, disk_translate_ms,
 				           disk_compile_ms);
@@ -2470,7 +2588,8 @@ bool ShaderPrecompiler::CompileModule(const PrecompileStageRecord& record, uint6
 				return false;
 			}
 		}
-		info = disk_info;
+		info             = disk_info;
+		info.spirv_words = static_cast<uint32_t>(disk_spirv.size());
 		// The plan this translation made goes to the disk too (a frame of its own: the permutation's is there).
 		if (plan.has_value()) {
 			m_disk->Store(key, program, disk_spirv, info, &*plan, translate_ms, disk_compile_ms);
@@ -2490,7 +2609,7 @@ bool ShaderPrecompiler::CompileModule(const PrecompileStageRecord& record, uint6
 	g_reuse.compile_us.fetch_add(static_cast<uint64_t>(compile_ms * 1000.0), std::memory_order_relaxed);
 	spirv_words           = result.spirv.size();
 	const auto spirv_hash = XXH3_64bits(result.spirv.data(), result.spirv.size() * sizeof(uint32_t));
-	if (record.revision == Revision() && spirv_hash != record.spirv_hash) {
+	if (!forced_lds && record.revision == Revision() && spirv_hash != record.spirv_hash) {
 		// The same build made other SPIR-V from the recorded inputs: an input is missing from the record (or a
 		// SPIR-V-changing KYTY_ switch differs from the recording run).
 		std::fprintf(stderr, "SHADER_PRECOMPILE_MISMATCH hash=0x%016llx stage=%s key=%s (the game's SPIR-V differs)\n",
@@ -2519,7 +2638,8 @@ bool ShaderPrecompiler::CompileModule(const PrecompileStageRecord& record, uint6
 			return false;
 		}
 	}
-	info = std::move(result.program).TakeCompiledInfo();
+	info             = std::move(result.program).TakeCompiledInfo();
+	info.spirv_words = static_cast<uint32_t>(result.spirv.size());
 	if (disk_mode != 0) {
 		if (!disk_hit) {
 			m_disk->Store(key, program, result.spirv, info, plan.has_value() ? &*plan : nullptr, translate_ms, compile_ms);
@@ -2569,7 +2689,7 @@ bool ShaderPrecompiler::CompileModule(const PrecompileStageRecord& record, uint6
 	return true;
 }
 
-void ShaderPrecompiler::Compile(const PrecompileStageRecord& record, uint64_t key, bool warm) {
+void ShaderPrecompiler::Compile(const PrecompileStageRecord& record, uint64_t key, bool warm, bool forced_lds) {
 	// A warm job (the shader reuse) makes no pipeline: nothing to do once the store does not want it.
 	if (warm && !ReuseWanted(key)) {
 		return;
@@ -2578,7 +2698,7 @@ void ShaderPrecompiler::Compile(const PrecompileStageRecord& record, uint64_t ke
 	vk::ShaderModule                         module = nullptr;
 	ShaderRecompiler::IR::CompiledShaderInfo program;
 	size_t                                   spirv_words = 0;
-	if (!CompileModule(record, key, !warm, module, program, spirv_words) || warm) {
+	if (!CompileModule(record, key, !warm, module, program, spirv_words, forced_lds) || warm) {
 		return;
 	}
 	// Bindless images need the bindless table's layout; without it (KYTY_BINDLESS off) the GPU thread would not
@@ -2611,7 +2731,17 @@ void ShaderPrecompiler::Compile(const PrecompileStageRecord& record, uint64_t ke
 		g_progress.compiled.fetch_add(1, std::memory_order_relaxed);
 	}
 	const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
-	if (ms >= 1000.0) {
+	if (Common::EnvRead::PerfLines()) {
+		const uint32_t threads = std::max(record.compute.threads_num[0], 1u) * std::max(record.compute.threads_num[1], 1u) *
+		                         std::max(record.compute.threads_num[2], 1u);
+		std::fprintf(stderr,
+		             "SHADER_PRECOMPILE hash=0x%016llx %.0fms (driver %.0fms) spirv_words=%zu key=%s kind=compute form=%s "
+		             "lds=%s lds_dwords=%u threads=%u wave=%u forced_lds=%d created=%d\n",
+		             static_cast<unsigned long long>(record.shader_hash), ms, create_ms, spirv_words, HexKey(key).c_str(),
+		             ShaderRecompiler::IR::EmitFormName(program.emit_form), ShaderRecompiler::IR::EmitLdsName(program.emit_lds),
+		             record.compute.lds_size_dwords, threads, program.wave_size, forced_lds ? 1 : 0, created ? 1 : 0);
+		std::fflush(stderr);
+	} else if (ms >= 1000.0) {
 		std::fprintf(stderr, "SHADER_PRECOMPILE hash=0x%016llx %.0fms (driver %.0fms) spirv_words=%zu\n",
 		             static_cast<unsigned long long>(record.shader_hash), ms, create_ms, spirv_words);
 		std::fflush(stderr);

@@ -77,7 +77,7 @@ namespace Common::EnvRead {
 }
 
 [[nodiscard]] inline bool Perf() {
-	const char* value = std::getenv("KYTY_TRACE_PERF");
+	const char* value = ShaderEnv::Read("KYTY_TRACE_PERF");
 	return value != nullptr && value[0] == '1';
 }
 

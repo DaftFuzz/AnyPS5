@@ -307,6 +307,7 @@ void Shutdown(Aps5GpuBackend* /*backend*/) {
 		Common::LockGuard lock(renderer->GetMutex());
 		renderer->GetPipelineCache().Save();
 		Log("shutdown: pipeline cache saved");
+		renderer->GetPipelineCache().ExportHints("shutdown");
 	}
 }
 

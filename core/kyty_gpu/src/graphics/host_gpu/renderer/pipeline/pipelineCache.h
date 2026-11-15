@@ -157,6 +157,7 @@ public:
 	// True when the driver cache was written; a background save returns true once its thread is started.
 	bool Save(bool background = false);
 	void SaveIfDue();
+	void ExportHints(const char* when);
 	// --precompile-only (WindowPrecompileOnly): starts the background compiles of the journals at once on `threads`
 	// workers (0: KYTY_SHADER_PRECOMPILE_THREADS) and prints PRECOMPILE_* lines on stdout (start, progress every
 	// second, periodic saves, done) until every job is through or `stop` is set (the running compiles finish; the queued
@@ -351,6 +352,8 @@ private:
 	std::string                        m_hints_line;
 	bool                               m_hints_export = false;
 	bool                               m_hints_failed = false;
+	std::filesystem::path              m_hints_journal;
+	std::filesystem::path              m_hints_graphics_journal;
 	std::atomic<uint32_t>              m_precompiled_since_save {0}; // pipelines it created since the last save
 	std::filesystem::path         m_driver_cache_path;
 	uint64_t                      m_driver_cache_loaded_bytes = 0; // the payload loaded from its file (0: none)

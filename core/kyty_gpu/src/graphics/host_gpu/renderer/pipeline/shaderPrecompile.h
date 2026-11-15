@@ -114,7 +114,8 @@ bool PrecompileHintsExport(const std::filesystem::path& journal, const std::file
 // hints file, is for another emulator layout, another shader mode or another game.
 bool PrecompileHintsImport(const GraphicContext& graphics, const std::filesystem::path& hints,
                            const std::filesystem::path& game_dir, const std::filesystem::path& journal,
-                           const std::filesystem::path& graphics_journal, std::string& summary);
+                           const std::filesystem::path& graphics_journal, std::string& summary,
+                           bool any_version = false);
 
 // The user-data base and wave size of a stage's recompiler options, from options.stage and options.input_info, as
 // the program cache sets them (ProgramCache::Get); the background compiles use the same.
@@ -330,6 +331,7 @@ private:
 		// The shader reuse: `key` is a recorded graphics stage no recorded pipeline uses; the job compiles it for
 		// the reuse store only (after every other job, not in m_job_index).
 		bool     stage_only  = false;
+		bool     forced_lds  = false;
 	};
 	// A recorded graphics stage: compiled by the first job that needs it, its module destroyed after the last one.
 	struct Stage {
@@ -362,8 +364,8 @@ private:
 	void Worker(uint32_t index);
 	// `key`: the record's key. `need_module`: false for a warm job's permutation (no pipeline is made from it).
 	bool CompileModule(const PrecompileStageRecord& record, uint64_t key, bool need_module, vk::ShaderModule& module,
-	                   ShaderRecompiler::IR::CompiledShaderInfo& info, size_t& spirv_words);
-	void Compile(const PrecompileStageRecord& record, uint64_t key, bool warm);
+	                   ShaderRecompiler::IR::CompiledShaderInfo& info, size_t& spirv_words, bool forced_lds = false);
+	void Compile(const PrecompileStageRecord& record, uint64_t key, bool warm, bool forced_lds = false);
 	// The shader reuse (workers). `any_size`: wanted also with the store at its budget.
 	[[nodiscard]] bool ReuseWanted(uint64_t key, bool any_size = false) const;
 	[[nodiscard]] bool ReusePlanWanted(uint64_t program) const;

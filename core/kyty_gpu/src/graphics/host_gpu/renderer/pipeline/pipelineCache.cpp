@@ -750,6 +750,7 @@ struct PipelineCache::ProgramCache {
 			result.spirv = std::move(reused->spirv);
 		}
 		auto program = reused != nullptr ? std::move(reused->info) : std::move(result.program).TakeCompiledInfo();
+		program.spirv_words = static_cast<uint32_t>(result.spirv.size());
 		last_compile_ms  = MillisecondsSince(compile_begin);
 		last_spirv_words = result.spirv.size();
 		if (precompiler != nullptr) {
@@ -1501,6 +1502,23 @@ private:
 	std::vector<std::thread>          m_threads;
 };
 
+static std::filesystem::path HintsEnvPath(Common::ShaderEnv::Name name) {
+	const char* value = Common::ShaderEnv::Read(name);
+	return value != nullptr && value[0] != '\0' ? std::filesystem::path(value) : std::filesystem::path();
+}
+
+static std::filesystem::path HintsGameDir() {
+	auto dir = HintsEnvPath("KYTY_SHADER_HINTS_GAME_DIR");
+	if (!dir.empty()) return dir;
+	std::error_code ec;
+	return std::filesystem::current_path(ec) / "app0";
+}
+
+static bool HintsAnyVersion() {
+	const char* value = Common::ShaderEnv::Read("KYTY_SHADER_HINTS_ANY_VERSION");
+	return value != nullptr && value[0] == '1';
+}
+
 PipelineCache::PipelineCache(GraphicContext&                         graphics,
                              ShaderRecompiler::IR::ImageHeapSource* image_heap)
     : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics, image_heap)) {
@@ -1531,18 +1549,39 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
 			                             summary);
 			return;
 		}
-		if (const auto& hints = Config::GetPrecompileImportHints(); Config::PrecompileOnly() && !hints.empty()) {
+		const bool precompile_only = Config::PrecompileOnly();
+		const auto hints = precompile_only ? Config::GetPrecompileImportHints() : HintsEnvPath("KYTY_SHADER_HINTS_IMPORT");
+		if (!hints.empty()) {
 			// --import-hints: the records found are added to the journals before the precompiler loads them.
 			std::string summary;
-			m_hints_failed = !PrecompileHintsImport(m_graphics, hints, Config::GetGameDir(), journal, graphics_journal,
-			                                        summary);
+			const auto  game_dir = precompile_only ? Config::GetGameDir() : HintsGameDir();
+			m_hints_failed = !PrecompileHintsImport(m_graphics, hints, game_dir, journal, graphics_journal, summary,
+			                                        HintsAnyVersion());
 			m_hints_line   = fmt::format("PRECOMPILE_HINTS kind=import status={} {}", m_hints_failed ? "failed" : "ok",
 			                             summary);
+			if (!precompile_only) {
+				std::fprintf(stderr, "%s file=%s game_dir=%s\n", m_hints_line.c_str(), hints.string().c_str(),
+				             game_dir.string().c_str());
+				std::fflush(stderr);
+			}
 		}
+		m_hints_journal          = journal;
+		m_hints_graphics_journal = graphics_journal;
+		if (!precompile_only) ExportHints("boot");
 		m_precompiler = std::make_unique<ShaderPrecompiler>(m_graphics, m_driver_cache, journal, graphics_journal,
 		                                                    m_precompiled_since_save, m_warm.get());
 		m_program_cache->precompiler = m_precompiler.get();
 	}
+}
+
+void PipelineCache::ExportHints(const char* when) {
+	const auto out = HintsEnvPath("KYTY_SHADER_HINTS_EXPORT");
+	if (out.empty() || m_hints_journal.empty()) return;
+	std::string summary;
+	const bool  ok = PrecompileHintsExport(m_hints_journal, m_hints_graphics_journal, out, summary);
+	std::fprintf(stderr, "PRECOMPILE_HINTS kind=export when=%s status=%s %s file=%s\n", when, ok ? "ok" : "failed",
+	             summary.c_str(), out.string().c_str());
+	std::fflush(stderr);
 }
 
 // The renderer is complete once the GPU thread asks for a pipeline (the bindless table is built after this cache).

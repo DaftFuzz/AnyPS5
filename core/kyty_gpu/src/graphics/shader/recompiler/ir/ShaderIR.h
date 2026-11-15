@@ -1036,6 +1036,27 @@ struct ResourceBlock {
 };
 
 // Stable shader metadata consumed by the renderer after native IR has been discarded.
+enum class EmitForm : uint8_t { Unknown, OneLane, TwoLane, Paired };
+enum class EmitLds : uint8_t { None, Function, Workgroup, Storage };
+
+[[nodiscard]] inline const char* EmitFormName(EmitForm form) {
+	switch (form) {
+		case EmitForm::OneLane: return "one-lane";
+		case EmitForm::TwoLane: return "two-lane";
+		case EmitForm::Paired: return "paired";
+		default: return "unknown";
+	}
+}
+
+[[nodiscard]] inline const char* EmitLdsName(EmitLds lds) {
+	switch (lds) {
+		case EmitLds::Function: return "function";
+		case EmitLds::Workgroup: return "workgroup";
+		case EmitLds::Storage: return "storage";
+		default: return "none";
+	}
+}
+
 struct CompiledShaderInfo {
 	ShaderType                    stage               = ShaderType::Unknown;
 	uint64_t                      shader_hash         = 0;
@@ -1047,6 +1068,9 @@ struct CompiledShaderInfo {
 	bool                          has_address_writes  = false;
 	ShaderInfo                    info;
 	Bindings                      bindings;
+	EmitForm                      emit_form           = EmitForm::Unknown;
+	EmitLds                       emit_lds            = EmitLds::None;
+	uint32_t                      spirv_words         = 0;
 };
 
 struct UniformFillPlan {
@@ -1204,6 +1228,8 @@ struct Program: ResourcePlan {
 	bool                          has_address_writes = false;
 	bool                          shader_info_complete = false;
 	Bindings                      bindings;
+	EmitForm                      emit_form = EmitForm::Unknown;
+	EmitLds                       emit_lds  = EmitLds::None;
 
 };
 
