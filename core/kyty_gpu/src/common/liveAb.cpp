@@ -93,6 +93,9 @@ constexpr SwitchInfo Switches[] = {
     // reads at adoption (kernel/memory.cpp FastVerifyLoggedReads) is skipped - the helper's result is taken as unchanged.
     {Switch::DiagAdoptAssume, "KYTY_DIAG_ADOPT_ASSUME_UNCHANGED", 1},
     {Switch::AdoptRuns, "KYTY_PERF_ADOPT_RUNS", 1},
+    // Only how CompareBackingBatch finds each span's backing bytes (the thread's cached slot without the map's shared
+    // lock, or the locked lookup), per call; the bytes compared and the verdict are the same (aps5/memoryShim.cpp).
+    {Switch::CompareLockFree, "KYTY_PERF_COMPARE_LOCKFREE", 1},
     // Project 15 way B P1 (test switch): a read-only buffer binding with a ready plan entry whose proof holds takes the
     // binding the helper computed (handle, aligned offset, range, offset byte, record stride) instead of RebindBuffers'.
 };
