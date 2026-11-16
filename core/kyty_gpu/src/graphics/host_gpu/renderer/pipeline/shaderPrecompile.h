@@ -158,6 +158,9 @@ void EnterBackgroundCompileThread(const char* name);
 // The calling background thread's handle for BoostBackgroundThread (0 where priorities are not set); a thread the
 // GPU thread waits for runs at normal priority until it calls RestoreBackgroundThreadPriority.
 [[nodiscard]] uint64_t CurrentBackgroundThreadHandle();
+// Runs `step` with the emulator's exits turned into a jump back: false (and the exit's text) when the step would have
+// ended the emulator. For background compiles only; what the step had built is left behind.
+[[nodiscard]] bool RunBackgroundGuarded(const std::function<void()>& step, const char*& text);
 void                   BoostBackgroundThread(uint64_t handle);
 void                   RestoreBackgroundThreadPriority();
 

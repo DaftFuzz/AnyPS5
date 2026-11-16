@@ -61,7 +61,24 @@ void FatalExit(const char* report, int status) {
 	std::_Exit(status);
 }
 
+thread_local SoftExitHook t_soft_exit = nullptr;
+
+SoftExitHook ExchangeSoftExitHook(SoftExitHook hook) {
+	const SoftExitHook previous = t_soft_exit;
+	t_soft_exit                 = hook;
+	return previous;
+}
+
+static void SoftExitCheck(std::string_view text) {
+	if (t_soft_exit != nullptr) {
+		thread_local std::string message;
+		message = std::string(text);
+		t_soft_exit(message.c_str());
+	}
+}
+
 static int DbgReport(const char* title, std::string_view text, const char* file, int line) {
+	SoftExitCheck(text);
 	PrintFatalFrames();
 	g_fatal_report = BuildFatalReport(title, text, file, line);
 	Log::WriteFatal(g_fatal_report);
@@ -79,6 +96,7 @@ int DbgNotImplementedHandler(const char* expr, const char* file, int line) {
 }
 
 int DbgExitHandler(const char* file, int line, std::string_view text) {
+	SoftExitCheck(text);
 	PrintFatalFrames();
 	g_fatal_report = BuildFatalReport("--- Error ---", text, file, line);
 	Log::WriteFatal(g_fatal_report);
@@ -86,6 +104,7 @@ int DbgExitHandler(const char* file, int line, std::string_view text) {
 }
 
 int DbgExitHandler(const char* file, int line, fmt::text_style style, std::string_view text) {
+	SoftExitCheck(text);
 	PrintFatalFrames();
 	g_fatal_report = BuildFatalReport("--- Error ---", text, file, line);
 	Log::WriteFatal(style, g_fatal_report);

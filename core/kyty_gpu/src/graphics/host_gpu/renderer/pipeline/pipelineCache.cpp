@@ -4463,11 +4463,17 @@ void PipelineCache::QueueFirstUsePrebuild(const ResolvedStages& results, std::sp
 		if (ps_active) programs.pixel = {.id = ~uint64_t {0} - 6u, .module = modules[pi]};
 		t_describe_soft   = true;
 		t_describe_failed = false;
-		const auto key = MakeGraphicsPipelineKeyFrom(std::span {colors.data(), color_count}, in->depth,
-		                                             std::span<const ShaderVertexInputInfo>(&vertex, 1), in->ctx, in->user_config,
-		                                             ps_active ? &pixel : nullptr, in->topology, in->restart, programs, true);
+		GraphicsPipelineKey key {};
+		const char*         exit_text = nullptr;
+		const bool          keyed     = RunBackgroundGuarded(
+            [&] {
+                key = MakeGraphicsPipelineKeyFrom(std::span {colors.data(), color_count}, in->depth,
+		                                                       std::span<const ShaderVertexInputInfo>(&vertex, 1), in->ctx, in->user_config,
+		                                                       ps_active ? &pixel : nullptr, in->topology, in->restart, programs, true);
+            },
+            exit_text);
 		t_describe_soft = false;
-		if (std::exchange(t_describe_failed, false)) return finish(&prebuilds->key_fail);
+		if (std::exchange(t_describe_failed, false) || !keyed) return finish(&prebuilds->key_fail);
 		auto pipeline = std::make_unique<Pipeline>();
 		CreatePipelineInternal(m_graphics, *pipeline, key.rendering, key.vertex_input, std::span<const ShaderVertexInputInfo>(&vertex, 1),
 		                       ps_active ? &pixel : nullptr, programs, key.static_params, m_driver_cache);

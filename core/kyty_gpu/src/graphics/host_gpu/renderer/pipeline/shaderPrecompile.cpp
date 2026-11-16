@@ -2,6 +2,7 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderPrecompile.h"
 
 #include "common/archive.h"
+#include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/envDefaults.h"
@@ -25,6 +26,7 @@
 #include <bit>
 #include <charconv>
 #include <chrono>
+#include <csetjmp>
 #include <cstdlib>
 #include <cstring>
 #include <cwchar>
@@ -101,6 +103,43 @@ constexpr uint32_t PipelineRecordMagic     = 0x50495047u; // "GPIP"
 constexpr size_t   GraphicsHeaderBytes = sizeof(GraphicsJournalMagic) + sizeof(uint32_t) + 2 * sizeof(uint64_t);
 
 thread_local bool  g_background_thread = false;
+
+// A background compile's step that would end the emulator (any EXIT / EXIT_IF / EXIT_NOT_IMPLEMENTED reached from it)
+// jumps back here instead: RunGuarded returns false with the exit's text and the caller skips its record. Objects the
+// step had built are left (a leak per rejected record); no lock is held across these steps.
+thread_local std::jmp_buf* t_soft_jump = nullptr;
+thread_local const char*   t_soft_text = nullptr;
+
+[[noreturn]] void SoftExitJump(const char* text) {
+	t_soft_text = text;
+	std::longjmp(*t_soft_jump, 1);
+}
+
+bool RunGuarded(const std::function<void()>& step, const char*& text) {
+	std::jmp_buf                 buf;
+	std::jmp_buf* const          outer_jump = t_soft_jump;
+	const Common::SoftExitHook   outer_hook = Common::ExchangeSoftExitHook(&SoftExitJump);
+	t_soft_jump                             = &buf;
+	if (setjmp(buf) != 0) {
+		t_soft_jump = outer_jump;
+		Common::ExchangeSoftExitHook(outer_hook);
+		text = t_soft_text;
+		return false;
+	}
+	step();
+	t_soft_jump = outer_jump;
+	Common::ExchangeSoftExitHook(outer_hook);
+	return true;
+}
+
+} // namespace
+
+bool RunBackgroundGuarded(const std::function<void()>& step, const char*& text) {
+	return RunGuarded(step, text);
+}
+
+namespace {
+
 ShaderPrecompiler* g_quick_exit_target = nullptr; // the live precompiler, for the at_quick_exit handler
 // GetPrecompileProgress's values (written by Start, the workers and the last worker).
 struct ProgressAtomics {
@@ -2857,11 +2896,31 @@ bool ShaderPrecompiler::CompileModule(const PrecompileStageRecord& record, uint6
 		}
 	}
 	const auto     translate_begin = std::chrono::steady_clock::now();
-	auto source = ShaderRecompiler::PrepareShaderSource(record.code, options);
+	const auto reject_exit = [&](const char* text) {
+		m_rejected.fetch_add(1, std::memory_order_relaxed);
+		static std::atomic_uint logged {0};
+		if (logged.fetch_add(1) < 32u) {
+			std::fprintf(stderr, "SHADER_PRECOMPILE_EXIT_REJECT hash=0x%016llx stage=%s key=%s reason=%s (skipped; the GPU thread "
+			             "compiles it from its own state)\n",
+			             static_cast<unsigned long long>(record.shader_hash), StageName(record.stage), HexKey(record.Key()).c_str(),
+			             text != nullptr ? text : "?");
+			std::fflush(stderr);
+		}
+		return false;
+	};
+	std::optional<ShaderRecompiler::ShaderSource> prepared;
+	if (const char* text = nullptr; !RunGuarded([&] { prepared.emplace(ShaderRecompiler::PrepareShaderSource(record.code, options)); }, text)) {
+		return reject_exit(text);
+	}
+	auto& source = *prepared;
 	if (!source.calls.empty() || source.unsupported_call_pc != UINT32_MAX) {
 		return false; // programs with a scalar call read their callee from guest memory: never recorded
 	}
-	auto translated = ShaderRecompiler::TranslateProgram(source.decoded, options);
+	std::optional<ShaderRecompiler::TranslateResult> translated_holder;
+	if (const char* text = nullptr; !RunGuarded([&] { translated_holder.emplace(ShaderRecompiler::TranslateProgram(source.decoded, options)); }, text)) {
+		return reject_exit(text);
+	}
+	auto& translated = *translated_holder;
 	// A record whose stage input count does not cover the program's attribute reads (its register snapshot was taken
 	// with another draw's interpolator or vertex-input count) would end the emulator in CollectShaderInfo: no module.
 	if (uint32_t bad_index = 0, input_count = 0;
@@ -2940,7 +2999,9 @@ bool ShaderPrecompiler::CompileModule(const PrecompileStageRecord& record, uint6
 	std::optional<ShaderRecompiler::IR::ResourcePlan> plan;
 	const double translated_ms = MillisecondsSince(translate_begin);
 	if (keep && ReusePlanWanted(program)) {
-		plan.emplace(ShaderRecompiler::IR::ExtractResourcePlan(translated.program));
+		if (const char* text = nullptr; !RunGuarded([&] { plan.emplace(ShaderRecompiler::IR::ExtractResourcePlan(translated.program)); }, text)) {
+			return reject_exit(text);
+		}
 		g_reuse.plans.fetch_add(1, std::memory_order_relaxed);
 	}
 	const double translate_ms  = MillisecondsSince(translate_begin);
@@ -2974,7 +3035,11 @@ bool ShaderPrecompiler::CompileModule(const PrecompileStageRecord& record, uint6
 	std::optional<ShaderRecompiler::CompileResult> compiled;
 	{
 		const ShaderRecompiler::IR::ShaderInfoSoftFailScope soft_fail;
-		compiled.emplace(ShaderRecompiler::CompileProgram(std::move(translated), options, record.specialization, record.push_data_start));
+		if (const char* text = nullptr; !RunGuarded([&] {
+			    compiled.emplace(ShaderRecompiler::CompileProgram(std::move(translated), options, record.specialization, record.push_data_start));
+		    }, text)) {
+			return reject_exit(text);
+		}
 		if (soft_fail.Failed()) {
 		const char* rejected_message = soft_fail.Message();
 		m_rejected.fetch_add(1, std::memory_order_relaxed);
@@ -3484,8 +3549,17 @@ bool ShaderPrecompiler::MaterializeFirstUse(PrecompileStageRecord& record, uint6
 	options.profile           = &profile;
 	auto source               = ShaderRecompiler::PrepareShaderSource(record.code, options);
 	if (!source.calls.empty() || source.unsupported_call_pc != UINT32_MAX) return false;
-	auto       translated = ShaderRecompiler::TranslateProgram(source.decoded, options);
-	const auto plan       = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+	std::optional<ShaderRecompiler::IR::ResourcePlan> plan_holder;
+	if (const char* text = nullptr; !RunGuarded(
+	        [&] {
+		        auto translated = ShaderRecompiler::TranslateProgram(source.decoded, options);
+		        plan_holder.emplace(ShaderRecompiler::IR::ExtractResourcePlan(translated.program));
+	        },
+	        text)) {
+		m_rejected.fetch_add(1, std::memory_order_relaxed);
+		return false;
+	}
+	const auto& plan = *plan_holder;
 	ShaderRecompiler::IR::SrtRuntime runtime {
 	    .user_data                  = std::span<const uint32_t>(record.user_data),
 	    .shader_base                = shader_base,
@@ -3497,8 +3571,17 @@ bool ShaderPrecompiler::MaterializeFirstUse(PrecompileStageRecord& record, uint6
 	ShaderRecompiler::IR::ResourceSnapshot       snapshot;
 	ShaderRecompiler::IR::ResourceSpecialization specialization;
 	ShaderRecompiler::IR::ReadLog                log;
-	if (!ShaderRecompiler::IR::MaterializeResourcesAhead(plan, runtime, snapshot, specialization, log)) return false;
-	ShaderRecompiler::IR::PeekNullFormattedShare(plan, plan.scratch[Slot].null_share_kinds, specialization);
+	bool materialized = false;
+	if (const char* text = nullptr; !RunGuarded(
+	        [&] {
+		        materialized = ShaderRecompiler::IR::MaterializeResourcesAhead(plan, runtime, snapshot, specialization, log);
+		        if (materialized) ShaderRecompiler::IR::PeekNullFormattedShare(plan, plan.scratch[Slot].null_share_kinds, specialization);
+	        },
+	        text)) {
+		m_rejected.fetch_add(1, std::memory_order_relaxed);
+		return false;
+	}
+	if (!materialized) return false;
 	record.specialization = std::move(specialization);
 	return true;
 }
@@ -3523,14 +3606,24 @@ bool ShaderPrecompiler::PrepareFirstUseStage(
 	SetStageCompileOptions(options);
 	static const auto profile = ShaderCompileProfile(m_graphics);
 	options.profile           = &profile;
-	auto source               = ShaderRecompiler::PrepareShaderSource(record.code, options);
-	if (!source.calls.empty() || source.unsupported_call_pc != UINT32_MAX) return false;
-	auto translated = ShaderRecompiler::TranslateProgram(source.decoded, options);
-	if (uint32_t bad_index = 0, input_count = 0;
-	    !ShaderRecompiler::IR::StageInputsFit(translated.program, stage_input, bad_index, input_count)) {
+	std::optional<ShaderRecompiler::IR::ResourcePlan> plan_holder;
+	bool                                              fits = false;
+	if (const char* text = nullptr; !RunGuarded(
+	        [&] {
+		        auto source = ShaderRecompiler::PrepareShaderSource(record.code, options);
+		        if (!source.calls.empty() || source.unsupported_call_pc != UINT32_MAX) return;
+		        auto translated = ShaderRecompiler::TranslateProgram(source.decoded, options);
+		        uint32_t bad_index = 0, input_count = 0;
+		        if (!ShaderRecompiler::IR::StageInputsFit(translated.program, stage_input, bad_index, input_count)) return;
+		        plan_holder.emplace(ShaderRecompiler::IR::ExtractResourcePlan(translated.program));
+		        fits = true;
+	        },
+	        text)) {
+		m_rejected.fetch_add(1, std::memory_order_relaxed);
 		return false;
 	}
-	auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+	if (!fits) return false;
+	auto& plan = *plan_holder;
 	{
 		const PrecompileReuseIdentity identity = {.stage           = record.stage,
 		                                          .shader_hash     = record.shader_hash,
@@ -3556,8 +3649,17 @@ bool ShaderPrecompiler::PrepareFirstUseStage(
 	ShaderRecompiler::IR::ResourceSnapshot       snapshot;
 	ShaderRecompiler::IR::ResourceSpecialization specialization;
 	ShaderRecompiler::IR::ReadLog                log;
-	if (!ShaderRecompiler::IR::MaterializeResourcesAhead(plan, runtime, snapshot, specialization, log)) return false;
-	ShaderRecompiler::IR::PeekNullFormattedShare(plan, plan.scratch[Slot].null_share_kinds, specialization);
+	bool materialized = false;
+	if (const char* text = nullptr; !RunGuarded(
+	        [&] {
+		        materialized = ShaderRecompiler::IR::MaterializeResourcesAhead(plan, runtime, snapshot, specialization, log);
+		        if (materialized) ShaderRecompiler::IR::PeekNullFormattedShare(plan, plan.scratch[Slot].null_share_kinds, specialization);
+	        },
+	        text)) {
+		m_rejected.fetch_add(1, std::memory_order_relaxed);
+		return false;
+	}
+	if (!materialized) return false;
 	record.specialization = std::move(specialization);
 	return true;
 }

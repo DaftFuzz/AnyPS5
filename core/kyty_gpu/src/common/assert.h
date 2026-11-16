@@ -37,6 +37,10 @@ using FatalHook = void (*)(const char* report, int status);
 void SetFatalHook(FatalHook hook);
 // A fatal error outside the assert machinery (PageManager): the hook with this report if one is set, else _Exit(status).
 [[noreturn]] void FatalExit(const char* report, int status);
+// A background compile's guard (calling thread only): while set, EXIT, EXIT_IF and EXIT_NOT_IMPLEMENTED call the hook
+// (which must not return: it jumps back to the compile, which skips its record) instead of reporting and exiting.
+using SoftExitHook = void (*)(const char* text);
+SoftExitHook ExchangeSoftExitHook(SoftExitHook hook);
 
 } // namespace Common
 
