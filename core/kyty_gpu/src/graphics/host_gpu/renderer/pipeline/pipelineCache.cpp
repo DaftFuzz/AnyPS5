@@ -125,6 +125,26 @@ uint32_t NullSlotPrewarmMinWords() {
 	}();
 	return words;
 }
+constexpr uint32_t CsChurnDefaultWindow = 32;
+uint32_t CsChurnLimit() {
+	static const uint32_t limit = [] {
+		const char*    value = std::getenv("KYTY_PERF_CS_CHURN");
+		const long     n     = value != nullptr ? std::strtol(value, nullptr, 10) : 0L;
+		const uint32_t l     = n <= 0L ? 0u : n == 1L ? CsChurnDefaultWindow : static_cast<uint32_t>(std::min(n, 1000000L));
+		if (l != 0u) {
+			std::fprintf(stderr, "PERF_CS_CHURN on (window %u: a compute shader whose last %u compile-ahead jobs went unused is queued 1 in %u)\n",
+			             l, l, l);
+		}
+		return l;
+	}();
+	return limit;
+}
+struct CsChurnStats {
+	std::atomic<uint64_t> admitted {0}, admitted_scout {0}, flagged {0}, candidates_flagged {0}, suppressed {0}, suppressed_scout {0};
+	std::atomic<uint64_t> probes {0}, served {0}, served_flagged {0}, needed {0}, gpu_compiles_flagged {0};
+} g_cs_churn;
+std::mutex                      g_cs_churn_fields_mutex;
+std::map<std::string, uint64_t> g_cs_churn_fields;
 // Project 15 S2d (KYTY_CHECK_PEEK=2, diagnostic): PeekAdopt's prediction against what Adopt did (execution thread).
 struct PeekAdoptStats {
 	uint64_t calls = 0, keep = 0, refind = 0, compile = 0, not_adoptable = 0, reads_changed = 0, bad = 0, injected = 0, detected = 0;
@@ -1365,6 +1385,7 @@ struct PipelineCache::ProgramCache {
 			                               static_cast<uint32_t>(params.code.size()), lookup_key.static_state,
 			                               push_data_cursor, entry->second.specialization);
 			if (stage == ShaderType::Compute) {
+				NoteCsChurnCompile(params.hash, precompile_key);
 				queued_dropped = precompiler->BeforeCompile(precompile_key);
 			}
 		}
@@ -1566,6 +1587,82 @@ struct PipelineCache::ProgramCache {
 		});
 	}
 
+	bool CsChurnAdmit(uint64_t hash, uint64_t mark, std::span<const uint32_t> static_state, uint32_t push_cursor,
+	                  const ShaderRecompiler::IR::ResourceSpecialization& specialization) {
+		const uint32_t limit  = CsChurnLimit();
+		const uint32_t window = limit != 0u ? limit : CsChurnDefaultWindow;
+		const bool     scout  = t_scouting;
+		const uint64_t sh     = XXH3_64bits(static_state.data(), static_state.size_bytes());
+		auto&          c      = cs_churn[hash];
+		PermutationDiff diff;
+		if (c.has_last) {
+			if (c.last_push != push_cursor) diff.Add("push_start");
+			if (c.last_static != sh) diff.Add("static_key");
+			DiffSpecialization(c.last, specialization, diff);
+		}
+		c.has_last    = true;
+		c.last_push   = push_cursor;
+		c.last_static = sh;
+		c.last        = specialization;
+		bool admit    = true;
+		if (c.flagged) {
+			g_cs_churn.candidates_flagged.fetch_add(1, std::memory_order_relaxed);
+			{
+				std::lock_guard fields_lock(g_cs_churn_fields_mutex);
+				g_cs_churn_fields[diff.Text()]++;
+			}
+			if (limit != 0u) {
+				if (++c.skipped < window) {
+					admit = false;
+				} else {
+					c.skipped = 0;
+					g_cs_churn.probes.fetch_add(1, std::memory_order_relaxed);
+				}
+			}
+		} else if (++c.pending >= window) {
+			c.flagged = true;
+			c.skipped = 0;
+			if (!c.ever) {
+				c.ever           = true;
+				const auto count = g_cs_churn.flagged.fetch_add(1, std::memory_order_relaxed);
+				if (count < 64u) {
+					std::fprintf(stderr, "CS_CHURN flagged hash=0x%016llx unused=%u scout=%d acting=%d diff=%s slots=%s\n",
+					             static_cast<unsigned long long>(hash), c.pending, scout ? 1 : 0, limit != 0u ? 1 : 0,
+					             diff.Text().c_str(), diff.slots.empty() ? "none" : diff.slots.c_str());
+				}
+			}
+		}
+		if (!admit) {
+			g_cs_churn.suppressed.fetch_add(1, std::memory_order_relaxed);
+			if (scout) g_cs_churn.suppressed_scout.fetch_add(1, std::memory_order_relaxed);
+			cs_churn_keys[mark] = 2;
+			return false;
+		}
+		g_cs_churn.admitted.fetch_add(1, std::memory_order_relaxed);
+		if (scout) g_cs_churn.admitted_scout.fetch_add(1, std::memory_order_relaxed);
+		cs_churn_keys[mark] = 1;
+		return true;
+	}
+
+	void NoteCsChurnCompile(uint64_t hash, uint64_t key) {
+		std::lock_guard lock(runtime_jobs_mutex);
+		const auto c       = cs_churn.find(hash);
+		const bool flagged = c != cs_churn.end() && c->second.ever;
+		if (flagged) g_cs_churn.gpu_compiles_flagged.fetch_add(1, std::memory_order_relaxed);
+		const auto k = cs_churn_keys.find(key);
+		if (k == cs_churn_keys.end()) return;
+		if (k->second != 1u) {
+			g_cs_churn.needed.fetch_add(1, std::memory_order_relaxed);
+			return;
+		}
+		g_cs_churn.served.fetch_add(1, std::memory_order_relaxed);
+		if (flagged) g_cs_churn.served_flagged.fetch_add(1, std::memory_order_relaxed);
+		if (c != cs_churn.end()) {
+			c->second.pending = 0;
+			c->second.flagged = false;
+		}
+	}
+
 	void QueueRuntimeCompile(const ShaderParams& params, const ShaderComputeInputInfo& input_info, uint32_t push_cursor,
 	                         std::span<const uint32_t> static_state,
 	                         const ShaderRecompiler::IR::ResourceSpecialization* specialization) {
@@ -1580,6 +1677,7 @@ struct PipelineCache::ProgramCache {
 		{
 			std::lock_guard lock(runtime_jobs_mutex);
 			if (!runtime_jobs_seen.insert(mark).second) return;
+			if (specialization != nullptr && !CsChurnAdmit(params.hash, mark, static_state, push_cursor, *specialization)) return;
 		}
 		PrecompileStageRecord record;
 		record.stage           = ShaderType::Compute;
@@ -1936,6 +2034,18 @@ struct PipelineCache::ProgramCache {
 	std::unordered_map<uint64_t, PrecompileStage> precompile_stages;
 	std::mutex                                    runtime_jobs_mutex;
 	std::unordered_set<uint64_t>                  runtime_jobs_seen;
+	struct CsChurn {
+		uint32_t                                     pending  = 0;
+		uint32_t                                     skipped  = 0;
+		bool                                         flagged  = false;
+		bool                                         ever     = false;
+		bool                                         has_last = false;
+		uint32_t                                     last_push   = 0;
+		uint64_t                                     last_static = 0;
+		ShaderRecompiler::IR::ResourceSpecialization last;
+	};
+	std::unordered_map<uint64_t, CsChurn> cs_churn;
+	std::unordered_map<uint64_t, uint8_t> cs_churn_keys;
 	// Inserts into `programs` and appends to a program's permutations take it exclusively (execution thread), the resolve
 	// thread's finds and permutation searches shared. The execution thread's own reads are unlocked: it is the only writer.
 	std::shared_mutex                                           programs_mutex;
@@ -3966,6 +4076,24 @@ void PipelineCache::ReportCompileJobs() const {
 	const auto& g = g_ahead_graphics;
 	std::fprintf(stderr, "PERF compile_ahead_graphics queued=%llu taken=%llu waited=%llu wait_ms=%.0f failed=%llu\n", n(g.queued),
 	             n(g.taken), n(g.waited), static_cast<double>(n(g.wait_us)) / 1000.0, n(g.failed));
+	{
+		const auto& c = g_cs_churn;
+		std::string fields;
+		{
+			std::lock_guard fields_lock(g_cs_churn_fields_mutex);
+			for (const auto& [name, count]: g_cs_churn_fields) {
+				if (fields.size() >= 400u) break;
+				fields += fmt::format("{}{}:{}", fields.empty() ? "" : ";", name, count);
+			}
+		}
+		std::fprintf(stderr,
+		             "PERF cs_churn window=%u acting=%d admitted=%llu admitted_scout=%llu flagged_hashes=%llu candidates_flagged=%llu "
+		             "suppressed=%llu suppressed_scout=%llu probes=%llu served=%llu served_flagged=%llu suppressed_needed=%llu "
+		             "gpu_compiles_flagged=%llu fields=%s\n",
+		             CsChurnLimit() != 0u ? CsChurnLimit() : CsChurnDefaultWindow, CsChurnLimit() != 0u ? 1 : 0, n(c.admitted),
+		             n(c.admitted_scout), n(c.flagged), n(c.candidates_flagged), n(c.suppressed), n(c.suppressed_scout), n(c.probes),
+		             n(c.served), n(c.served_flagged), n(c.needed), n(c.gpu_compiles_flagged), fields.empty() ? "none" : fields.c_str());
+	}
 	if (m_precompiler != nullptr) m_precompiler->ReportRuntimePerf();
 }
 
