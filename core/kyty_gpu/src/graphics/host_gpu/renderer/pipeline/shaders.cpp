@@ -1615,9 +1615,12 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		if (PerfEnabled()) {
 			const auto& vs       = *vs_input_info.stage.program;
 			const auto* ps       = ps_active && ps_input_info->stage ? ps_input_info->stage.program : nullptr;
+			double      miss_age = 0.0;
+			const char* miss     = MissPairName(stats_vs, ps_active ? stats_ps : 0u, miss_age);
 			std::fprintf(stderr,
 			             "PIPELINE_TIME %s vs=0x%016llx ps=0x%016llx %.0fms created_ago=%.0f/%.0fms kind=graphics source=%s "
-			             "vs_spirv_words=%u ps_spirv_words=%u vs_form=%s vs_lds=%s vs_inlined=%u/%u ps_inlined=%u/%u gpl=%s\n",
+			             "vs_spirv_words=%u ps_spirv_words=%u vs_form=%s vs_lds=%s vs_inlined=%u/%u ps_inlined=%u/%u gpl=%s "
+			             "miss=%s miss_age=%.0f\n",
 			             background ? "graphics-background" : "graphics", static_cast<unsigned long long>(stats_vs),
 			             static_cast<unsigned long long>(stats_ps), create_ms, ShaderCreatedMsAgo(stats_vs),
 			             ShaderCreatedMsAgo(stats_ps), t_gpl_monolithic ? "gpl-optimize" : background ? "precompile" : "runtime",
@@ -1625,7 +1628,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 			             ShaderRecompiler::IR::EmitLdsName(vs.emit_lds), static_cast<unsigned>(vs.helper_inline.inlined),
 			             static_cast<unsigned>(vs.helper_inline.helpers),
 			             ps != nullptr ? static_cast<unsigned>(ps->helper_inline.inlined) : 0u,
-			             ps != nullptr ? static_cast<unsigned>(ps->helper_inline.helpers) : 0u, gpl_form);
+			             ps != nullptr ? static_cast<unsigned>(ps->helper_inline.helpers) : 0u, gpl_form, miss, miss_age);
 		} else {
 			std::fprintf(stderr, "PIPELINE_TIME %s vs=0x%016llx ps=0x%016llx %.0fms created_ago=%.0f/%.0fms\n",
 			             background ? "graphics-background" : "graphics", static_cast<unsigned long long>(stats_vs),

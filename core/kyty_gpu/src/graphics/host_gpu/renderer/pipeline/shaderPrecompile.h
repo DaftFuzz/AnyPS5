@@ -124,6 +124,10 @@ struct PrecompileGraphicsMiss {
 // halves' hashes). A permutation is recorded only when its code still has the hash it was looked up by.
 [[nodiscard]] uint64_t PrecompileCodeHash(std::span<const uint32_t> code, std::span<const uint32_t> back_code);
 
+enum class MissPairState : uint8_t { None, Queued, Running, Known, Created, Failed };
+void                      NoteMissPair(uint64_t vs_hash, uint64_t ps_hash, MissPairState state);
+[[nodiscard]] const char* MissPairName(uint64_t vs_hash, uint64_t ps_hash, double& queued_ms_ago);
+
 // --export-hints <file> (PipelineCache, with --precompile-only): the shader journals of this mode written as a hints file
 // without the game's code (shaderPrecompile.cpp, before PrecompileHintsExport's body: the format). False when there is
 // no journal or the file cannot be written; `summary` holds the counts or the reason.

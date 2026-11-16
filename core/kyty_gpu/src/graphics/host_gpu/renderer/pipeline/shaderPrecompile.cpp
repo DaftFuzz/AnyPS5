@@ -3334,9 +3334,48 @@ struct RuntimeJobStats {
 	std::atomic<uint64_t> first_use_known {0}, skipped_taken {0}, dropped {0}, waited {0}, wait_us {0}, ready {0};
 	std::atomic<uint64_t> lead_us {0}, lead_n {0};
 	std::atomic<uint64_t> miss_queued {0}, miss_known {0}, miss_failed {0}, miss_created {0}, miss_stages {0}, miss_ms {0};
+	std::atomic<uint64_t> miss_known_journal {0}, miss_wait_us {0};
 } g_runtime_jobs;
 constexpr size_t RuntimeQueueMax = 1024;
+
+struct MissPairEntry {
+	std::chrono::steady_clock::time_point queued;
+	MissPairState                         state = MissPairState::None;
+};
+std::mutex                                  g_miss_pairs_mutex;
+std::unordered_map<uint64_t, MissPairEntry> g_miss_pairs;
+
+uint64_t MissPairKey(uint64_t vs_hash, uint64_t ps_hash) {
+	return vs_hash * 0x9e3779b97f4a7c15ull ^ ps_hash;
+}
 } // namespace
+
+void NoteMissPair(uint64_t vs_hash, uint64_t ps_hash, MissPairState state) {
+	std::lock_guard lock(g_miss_pairs_mutex);
+	auto&           entry = g_miss_pairs[MissPairKey(vs_hash, ps_hash)];
+	if (state == MissPairState::Queued) {
+		if (entry.state != MissPairState::None) return;
+		entry.queued = std::chrono::steady_clock::now();
+	}
+	if (entry.state == MissPairState::Created && state != MissPairState::Created) return;
+	entry.state = state;
+}
+
+const char* MissPairName(uint64_t vs_hash, uint64_t ps_hash, double& queued_ms_ago) {
+	queued_ms_ago = 0.0;
+	std::lock_guard lock(g_miss_pairs_mutex);
+	const auto      found = g_miss_pairs.find(MissPairKey(vs_hash, ps_hash));
+	if (found == g_miss_pairs.end()) return "none";
+	queued_ms_ago = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - found->second.queued).count();
+	switch (found->second.state) {
+		case MissPairState::Queued: return "queued";
+		case MissPairState::Running: return "running";
+		case MissPairState::Known: return "known";
+		case MissPairState::Created: return "created";
+		case MissPairState::Failed: return "failed";
+		default: return "none";
+	}
+}
 
 void ShaderPrecompiler::EnqueueRuntime(PrecompileStageRecord record) {
 	if (!m_runtime) return;
@@ -3431,16 +3470,31 @@ void ShaderPrecompiler::EnqueueGraphicsMiss(std::unique_ptr<PrecompileGraphicsMi
 			g_runtime_jobs.full.fetch_add(1, std::memory_order_relaxed);
 			return;
 		}
-		m_runtime_queue.push_back(job.get());
+		m_runtime_queue.push_front(job.get());
 		m_runtime_jobs.push_back(std::move(job));
 	}
 	g_runtime_jobs.miss_queued.fetch_add(1, std::memory_order_relaxed);
 	m_runtime_wake.notify_one();
 }
 
+namespace {
+std::pair<uint64_t, uint64_t> MissHashes(const PrecompileGraphicsMiss& m) {
+	uint64_t vs = 0, ps = 0;
+	for (uint32_t i = 0; i < (m.ps_active ? 2u : 1u); i++) {
+		(m.stages[i].record.stage == ShaderType::Pixel ? ps : vs) = m.stages[i].record.shader_hash;
+	}
+	return {vs, ps};
+}
+} // namespace
+
 void ShaderPrecompiler::RunGraphicsMiss(RuntimeJob& job) {
 	auto&      m     = *job.miss;
 	const auto begin = std::chrono::steady_clock::now();
+	const auto [miss_vs, miss_ps] = MissHashes(m);
+	g_runtime_jobs.miss_wait_us.fetch_add(
+	    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(begin - job.queued_at).count()),
+	    std::memory_order_relaxed);
+	NoteMissPair(miss_vs, miss_ps, MissPairState::Running);
 	std::array<ShaderRecompiler::IR::CompiledShaderInfo, 2> compiled;
 	std::array<const ShaderRecompiler::IR::CompiledShaderInfo*, 2> infos {};
 	std::array<vk::ShaderModule, 2> modules {};
@@ -3459,6 +3513,7 @@ void ShaderPrecompiler::RunGraphicsMiss(RuntimeJob& job) {
 			size_t words             = 0;
 			if (!CompileModule(s.record, keys[i], true, modules[i], compiled[i], words)) {
 				g_runtime_jobs.miss_failed.fetch_add(1, std::memory_order_relaxed);
+				NoteMissPair(miss_vs, miss_ps, MissPairState::Failed);
 				destroy();
 				return;
 			}
@@ -3484,8 +3539,11 @@ void ShaderPrecompiler::RunGraphicsMiss(RuntimeJob& job) {
 	const auto key       = record.Key();
 	{
 		std::lock_guard lock(m_mutex);
-		if (m_job_index.contains(key) || m_runtime_index.contains(key)) {
+		const bool in_jobs = m_job_index.contains(key);
+		if (in_jobs || m_runtime_index.contains(key)) {
 			g_runtime_jobs.miss_known.fetch_add(1, std::memory_order_relaxed);
+			if (in_jobs) g_runtime_jobs.miss_known_journal.fetch_add(1, std::memory_order_relaxed);
+			NoteMissPair(miss_vs, miss_ps, MissPairState::Known);
 			destroy();
 			return;
 		}
@@ -3507,6 +3565,7 @@ void ShaderPrecompiler::RunGraphicsMiss(RuntimeJob& job) {
 		g_runtime_jobs.miss_created.fetch_add(1, std::memory_order_relaxed);
 		m_created.fetch_add(1);
 	}
+	NoteMissPair(miss_vs, miss_ps, pipeline.pipeline != nullptr ? MissPairState::Created : MissPairState::Failed);
 	if (pipeline.pipeline != nullptr) m_graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
 	if (pipeline.pipeline_layout != nullptr) m_graphics.device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
 	if (pipeline.descriptor_set_layout != nullptr) m_graphics.device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout, nullptr);
@@ -3553,12 +3612,14 @@ void ShaderPrecompiler::ReportRuntimePerf() const {
 	std::fprintf(stderr,
 	             "PERF compile_jobs queued=%llu first_use=%llu duplicate=%llu full=%llu started=%llu compiled=%llu "
 	             "first_use_failed=%llu first_use_known=%llu skipped_taken=%llu dropped=%llu waited=%llu wait_ms=%.0f "
-	             "ready=%llu lead_ms_avg=%.0f miss[queued|known|failed|created|stages|ms]=%llu|%llu|%llu|%llu|%llu|%llu\n",
+	             "ready=%llu lead_ms_avg=%.0f miss[queued|known|failed|created|stages|ms]=%llu|%llu|%llu|%llu|%llu|%llu "
+	             "miss_known_journal=%llu miss_queue_wait_ms=%.0f\n",
 	             n(s.queued), n(s.first_use), n(s.duplicate), n(s.full), n(s.started), n(s.compiled), n(s.first_use_failed),
 	             n(s.first_use_known), n(s.skipped_taken), n(s.dropped), n(s.waited),
 	             static_cast<double>(n(s.wait_us)) / 1000.0, n(s.ready),
 	             n(s.lead_n) != 0 ? static_cast<double>(n(s.lead_us)) / 1000.0 / static_cast<double>(n(s.lead_n)) : 0.0,
-	             n(s.miss_queued), n(s.miss_known), n(s.miss_failed), n(s.miss_created), n(s.miss_stages), n(s.miss_ms));
+	             n(s.miss_queued), n(s.miss_known), n(s.miss_failed), n(s.miss_created), n(s.miss_stages), n(s.miss_ms),
+	             n(s.miss_known_journal), static_cast<double>(n(s.miss_wait_us)) / 1000.0);
 }
 
 bool ShaderPrecompiler::BeforeCompile(uint64_t key) {

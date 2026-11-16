@@ -116,6 +116,7 @@ struct StageCompileStats {
 };
 std::array<StageCompileStats, 2> g_stage_compile;
 std::atomic<uint64_t>            g_null_slot_prewarm {0};
+std::array<std::atomic<uint64_t>, 4> g_miss_reject {};
 StageCompileStats                g_graphics_create;
 uint32_t NullSlotPrewarmMinWords() {
 	static const uint32_t words = [] {
@@ -3824,10 +3825,11 @@ void PipelineCache::ReportCompileJobs() const {
 		ReportIndirectCover();
 		const auto u = [](const std::atomic<uint64_t>& v) { return static_cast<unsigned long long>(v.load(std::memory_order_relaxed)); };
 		const auto watches = ShaderRecompiler::IR::NullSlotWatchCounts();
-		std::fprintf(stderr, "PERF stage_compile graphics=%llu/%.0fms(reused %llu) compute=%llu/%.0fms(reused %llu) null_slot_prewarm=%llu null_slot_watch=%llu/%llu graphics_create=%llu/%.0fms\n",
+		std::fprintf(stderr, "PERF stage_compile graphics=%llu/%.0fms(reused %llu) compute=%llu/%.0fms(reused %llu) null_slot_prewarm=%llu null_slot_watch=%llu/%llu miss_reject[shape|stages|seen|code]=%llu|%llu|%llu|%llu graphics_create=%llu/%.0fms\n",
 		             u(g_stage_compile[0].count), static_cast<double>(u(g_stage_compile[0].us)) / 1000.0, u(g_stage_compile[0].reused),
 		             u(g_stage_compile[1].count), static_cast<double>(u(g_stage_compile[1].us)) / 1000.0, u(g_stage_compile[1].reused),
 		             u(g_null_slot_prewarm), static_cast<unsigned long long>(watches[0]), static_cast<unsigned long long>(watches[1]),
+		             u(g_miss_reject[0]), u(g_miss_reject[1]), u(g_miss_reject[2]), u(g_miss_reject[3]),
 		             u(g_graphics_create.count), static_cast<double>(u(g_graphics_create.us)) / 1000.0);
 	}
 	if (!PerfEnabled() || !CompileJobsEnabled()) return;
@@ -3983,25 +3985,36 @@ bool PipelineCache::PeekStandIn(ResolvedStages& results) {
 void PipelineCache::QueueAheadGraphicsMiss(const ResolvedStages& results, const GraphicsPipelineKey& key,
                                            std::span<const ShaderVertexInputInfo> vertex_info,
                                            const ShaderPixelInputInfo* ps_input_info) {
-	if (m_precompiler == nullptr || vertex_info.size() != 1u || vertex_info[0].logical_stage != ShaderType::Vertex) return;
+	if (m_precompiler == nullptr) return;
+	if (vertex_info.size() != 1u || vertex_info[0].logical_stage != ShaderType::Vertex) {
+		g_miss_reject[0].fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
 	const bool ps_active = ps_input_info != nullptr;
-	if (results.count != (ps_active ? 2u : 1u)) return;
-	uint32_t pixel_stages = 0;
+	uint32_t   pixel_stages = 0;
 	for (uint32_t i = 0; i < results.count; i++) pixel_stages += results.stages[i].stage == ShaderType::Pixel ? 1u : 0u;
-	if (pixel_stages != (ps_active ? 1u : 0u)) return;
+	if (results.count != (ps_active ? 2u : 1u) || pixel_stages != (ps_active ? 1u : 0u)) {
+		g_miss_reject[1].fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
 	uint64_t mark = GraphicsPipelineKeyHash {}(key) ^ (uint64_t {results.push_start} << 1u);
 	for (uint32_t i = 0; i < results.count; i++) {
 		mark = mark * 0x9e3779b97f4a7c15ull ^ results.stages[i].shader_hash ^ (results.standin_missing[i] ? 0x55u : 0u);
 		if (!results.standin_missing[i]) {
 			mark ^= reinterpret_cast<uintptr_t>(results.standin_permutations[i]);
 		} else {
-			mark ^= XXH3_64bits(results.stages[i].specialization.buffers.data(),
-			                    results.stages[i].specialization.buffers.size() * sizeof(results.stages[i].specialization.buffers[0]));
+			const auto& s = results.stages[i].specialization;
+			mark ^= XXH3_64bits(s.buffers.data(), s.buffers.size() * sizeof(s.buffers[0]));
+			mark = mark * 0x9e3779b97f4a7c15ull ^ XXH3_64bits(s.images.data(), s.images.size() * sizeof(s.images[0]));
+			mark = mark * 0x9e3779b97f4a7c15ull ^ XXH3_64bits(s.samplers.data(), s.samplers.size() * sizeof(s.samplers[0]));
 		}
 	}
 	{
 		std::lock_guard lock(m_ahead_workers_mutex);
-		if (!m_ahead_miss_seen.insert(mark).second) return;
+		if (!m_ahead_miss_seen.insert(mark).second) {
+			g_miss_reject[2].fetch_add(1, std::memory_order_relaxed);
+			return;
+		}
 	}
 	auto miss           = std::make_unique<PrecompileGraphicsMiss>();
 	miss->ps_active     = ps_active;
@@ -4028,9 +4041,15 @@ void PipelineCache::QueueAheadGraphicsMiss(const ResolvedStages& results, const 
 		rec.revision    = ShaderPrecompiler::Revision();
 		if (s.missing) {
 			const auto* code = reinterpret_cast<const uint32_t*>(r.shader_base);
-			if (code == nullptr || r.code_size == 0u) return;
+			if (code == nullptr || r.code_size == 0u) {
+				g_miss_reject[3].fetch_add(1, std::memory_order_relaxed);
+				return;
+			}
 			rec.code.assign(code, code + r.code_size);
-			if (PrecompileCodeHash(rec.code, {}) != r.shader_hash) return;
+			if (PrecompileCodeHash(rec.code, {}) != r.shader_hash) {
+				g_miss_reject[3].fetch_add(1, std::memory_order_relaxed);
+				return;
+			}
 			rec.specialization = r.specialization;
 			if (!r.null_share_kinds.empty()) ShaderRecompiler::IR::PeekNullFormattedShare(*r.plan, r.null_share_kinds, rec.specialization);
 			if (r.stage == ShaderType::Pixel) {
@@ -4044,6 +4063,9 @@ void PipelineCache::QueueAheadGraphicsMiss(const ResolvedStages& results, const 
 			s.module           = results.ahead_handles[i].module;
 		}
 	}
+	uint64_t miss_vs = 0, miss_ps = 0;
+	for (uint32_t i = 0; i < results.count; i++) (results.stages[i].stage == ShaderType::Pixel ? miss_ps : miss_vs) = results.stages[i].shader_hash;
+	NoteMissPair(miss_vs, miss_ps, MissPairState::Queued);
 	m_precompiler->EnqueueGraphicsMiss(std::move(miss));
 }
 
