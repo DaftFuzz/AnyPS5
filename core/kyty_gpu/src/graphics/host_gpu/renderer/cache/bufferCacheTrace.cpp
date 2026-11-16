@@ -244,7 +244,7 @@ BufferCache::C0Event BufferCache::C0PageHistory(uint64_t page, std::string& text
 	return changer;
 }
 
-bool BufferCache::C0ByteChangedAfter(uint64_t address, uint64_t tick) {
+bool BufferCache::C0ByteChangedAfter(uint64_t address, uint64_t tick, uint64_t verify_tick) {
 	const uint64_t page   = address & ~(TRACKER_PAGE_SIZE - 1u);
 	const auto     offset = static_cast<uint16_t>(address - page);
 	std::scoped_lock lock(m_c0_log_mutex);
@@ -255,6 +255,7 @@ bool BufferCache::C0ByteChangedAfter(uint64_t address, uint64_t tick) {
 	for (uint32_t i = 0; i < n; ++i) {
 		const auto& e = log.events[(log.head - n + i) % log.events.size()];
 		if (e.tick <= tick || offset < e.lo || offset > e.hi) continue;
+		if (e.kind != C0Event::BdaStore && e.tick > verify_tick) continue; // recorded after the verify: not what it saw
 		switch (e.kind) {
 			case C0Event::ShaderWrite:
 			case C0Event::DirectWrite:

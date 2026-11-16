@@ -1023,9 +1023,10 @@ private:
 		uint64_t address = 0;
 		uint64_t tick    = 0;
 		uint32_t frame   = 0;
+		uint64_t verify  = 0; // the tick at the verify: an event other than a BDA store report must not be newer
 	};
 	std::vector<HandbackLate> m_handback_late;
-	[[nodiscard]] bool        C0ByteChangedAfter(uint64_t address, uint64_t tick);
+	[[nodiscard]] bool        C0ByteChangedAfter(uint64_t address, uint64_t tick, uint64_t verify_tick);
 	// True when an unfinished eager readback is copying one of the bytes of the range.
 	[[nodiscard]] bool PendingReadbackCovers(uint64_t vaddr, uint64_t size) const;
 	[[nodiscard]] uint32_t InFlightReadbackKinds(uint64_t vaddr, uint64_t size) const;
