@@ -96,6 +96,10 @@ constexpr SwitchInfo Switches[] = {
     // Only how CompareBackingBatch finds each span's backing bytes (the thread's cached slot without the map's shared
     // lock, or the locked lookup), per call; the bytes compared and the verdict are the same (aps5/memoryShim.cpp).
     {Switch::CompareLockFree, "KYTY_PERF_COMPARE_LOCKFREE", 1},
+    // Only where a split pixel descriptor set comes from, per draw: the content cache (a set already written with the same
+    // descriptor bytes and layout) or a fresh heap set written with them. Cache entries stay valid either way (the object
+    // destroy observer drops entries in both phases), so the GPU reads the same descriptors in both.
+    {Switch::GplSetCache, "KYTY_PERF_GPL_SET_CACHE", 1},
     // Project 15 way B P1 (test switch): a read-only buffer binding with a ready plan entry whose proof holds takes the
     // binding the helper computed (handle, aligned offset, range, offset byte, record stride) instead of RebindBuffers'.
 };

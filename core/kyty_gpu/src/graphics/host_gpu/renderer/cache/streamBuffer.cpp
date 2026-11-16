@@ -295,6 +295,7 @@ Buffer::~Buffer() {
 		// A command in the ring may still name this buffer (VMA does not go through the
 		// dispatcher's destroy functions).
 		CommandRecorder::DrainBeforeDestroy();
+		CommandRecorder::NoteDestroyed(reinterpret_cast<uint64_t>(static_cast<VkBuffer>(m_buffer)));
 		vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
 	}
 }

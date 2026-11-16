@@ -3,6 +3,9 @@
 
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <atomic>
+#include <cstdint>
+
 // The driver cost of recording the render scheduler's Vulkan commands (the vkCmd* calls) moves off the GPU thread (stage 1
 // of the multithreading plan: the GPU thread ~8 ms per frame less).
 //
@@ -82,6 +85,14 @@ inline void DrainBeforeDestroy() {
 	if (detail::g_active) {
 		detail::DrainBeforeDestroySlow();
 	}
+}
+
+// KYTY_PERF_GPL_SET_CACHE: told the handle of every object a destroy function of the dispatcher is about to destroy
+// (and of VMA's buffers, NoteDestroyed), from the destroying thread, before the object goes. One observer.
+using DestroyObserver = void (*)(uint64_t handle);
+inline std::atomic<DestroyObserver> g_destroy_observer {nullptr};
+inline void NoteDestroyed(uint64_t handle) {
+	if (auto* observer = g_destroy_observer.load(std::memory_order_acquire); observer != nullptr && handle != 0) observer(handle);
 }
 
 } // namespace Libs::Graphics::CommandRecorder

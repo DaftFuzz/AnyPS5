@@ -96,6 +96,8 @@ inline constexpr const char* OutputOnlyNames[] = {
     "KYTY_DIAG_SKIP_UNSUPPORTED_CS",
     "KYTY_PERF_COMPILE_JOBS",
     "KYTY_PERF_COMPILE_SCOUT",
+    // Where a split pixel descriptor set comes from (a content cache or the heap); the same descriptors either way.
+    "KYTY_PERF_GPL_SET_CACHE",
     "KYTY_PERF_INDIRECT_COVER",
     "KYTY_PERF_NULL_SLOT_RUNTIME_FORMAT",
     "KYTY_PERF_NULL_SLOT_SEED",

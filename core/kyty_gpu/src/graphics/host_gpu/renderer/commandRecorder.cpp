@@ -36,6 +36,7 @@
 #include <immintrin.h>
 #include <new>
 #include <thread>
+#include <tuple>
 #include <type_traits>
 #include <vector>
 
@@ -1002,6 +1003,13 @@ struct DrainHook<Tag, Why, R(VKAPI_PTR*)(A...)> {
 	static inline R(VKAPI_PTR* real)(A...) = nullptr;
 
 	static R VKAPI_PTR Call(A... args) {
+		if constexpr (Why == Reason::Destroy && sizeof...(A) >= 2) {
+			using Handle = std::tuple_element_t<1, std::tuple<A...>>;
+			if constexpr (std::is_pointer_v<Handle> || std::is_same_v<Handle, uint64_t>) {
+				const auto handle = std::get<1>(std::forward_as_tuple(args...));
+				NoteDestroyed((uint64_t)(handle));
+			}
+		}
 		g_recorder->DrainForObjects(Why);
 		return real(args...);
 	}

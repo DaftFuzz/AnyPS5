@@ -493,6 +493,8 @@ enum class GplOptimizeEvent : uint8_t { Queued, Swapped, Failed, Discarded };
 void GplCountOptimize(GplOptimizeEvent event, uint64_t us);
 // Destroys the stage libraries and their layouts (after every thread that creates pipelines stopped).
 void GplDestroyLibraries(GraphicContext& graphics);
+// KYTY_PERF_GPL_SET_CACHE: destroys the cached split pixel descriptor sets' pools (descriptors.cpp).
+void GplSetCacheDestroy(vk::Device device);
 // KYTY_PERF_GPL_SPLIT: the descriptor-set update template of a shared set layout (made once from `entries`, kept until
 // GplDestroyLibraries), and the bytes of descriptor infos it reads.
 [[nodiscard]] vk::DescriptorUpdateTemplate GplSetTemplate(GraphicContext& graphics, vk::DescriptorSetLayout layout,

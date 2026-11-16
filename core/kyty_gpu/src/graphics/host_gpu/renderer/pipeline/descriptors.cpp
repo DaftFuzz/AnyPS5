@@ -52,6 +52,7 @@
 
 #include <optional>
 #include <mutex>
+#include <deque>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -5929,6 +5930,8 @@ void RunCommitPacket(const void* blob) {
 			    static_cast<VkCommandBuffer>(header.buffer), static_cast<VkDescriptorUpdateTemplate>(header.push_template),
 			    static_cast<VkPipelineLayout>(header.layout), header.set_index, descriptors);
 		}
+	} else if (header.set) { // KYTY_PERF_GPL_SET_CACHE: a set written earlier, only bound
+		header.buffer.bindDescriptorSets(header.bind_point, header.layout, header.set_index, 1, &header.set, 0, nullptr);
 	}
 	if (header.bindless_set) {
 		header.buffer.bindDescriptorSets(header.bind_point, header.layout, header.bindless_index, 1, &header.bindless_set, 0,
@@ -6042,7 +6045,241 @@ uint32_t FillCommitPacket(RenderContext& context, uint8_t* out, std::span<Prepar
 	return slot * CommitPacketStride;
 }
 
+// KYTY_PERF_GPL_SET_CACHE (with KYTY_PERF_GPL_SPLIT): split pixel descriptor sets kept across draws and frames, keyed by
+// their set layout and the exact descriptor infos the template writes (the bytes are compared on a hit, not only the
+// hash). A set is written once, when it is made, and only bound afterwards. Every object a descriptor info names is
+// watched (CommandRecorder::g_destroy_observer): its destroy drops the entries that name it (any non-zero first or second
+// word of an info counts, so an offset only costs a reuse), so a set never names a destroyed or reused handle. A dropped
+// or evicted set is rewritten for a new entry of its layout only after the tick of its last bind completed.
+// =1 cache, =2 shadow (lookups and counts, the heap set is bound), 0 off; a live A/B switch.
+uint32_t GplSetCacheFixed() {
+	static const uint32_t value = [] {
+		const char* text = Common::ShaderEnv::Read("KYTY_PERF_GPL_SET_CACHE");
+		const uint32_t v = text != nullptr && (text[0] == '1' || text[0] == '2') ? static_cast<uint32_t>(text[0] - '0') : 0u;
+		if (v != 0u) std::fprintf(stderr, "PERF_GPL_SET_CACHE=%u: split pixel descriptor sets %s\n", v, v == 1u ? "cached by content" : "looked up (shadow)");
+		return v;
+	}();
+	return value;
+}
+
+class PixelSetCache {
+public:
+	static PixelSetCache& Get() {
+		static PixelSetCache cache;
+		return cache;
+	}
+
+	static void Observe(uint64_t handle) { Get().Drop(handle); }
+
+	vk::DescriptorSet Lookup(RenderContext& context, vk::DescriptorSetLayout layout, vk::DescriptorUpdateTemplate update_template,
+	                         std::span<const uint8_t> bytes, bool shadow) {
+		auto&          master = context.GetCommandScheduler().GetMasterSemaphore();
+		const uint64_t tick   = master.CurrentTick();
+		const auto     hash   = Key(layout, bytes);
+		std::lock_guard lock(m_mutex);
+		Report();
+		Reclaim(master);
+		if (const auto found = m_by_key.find(hash); found != m_by_key.end()) {
+			auto& entry = m_entries[found->second];
+			if (!entry.dead && entry.layout == layout && entry.bytes.size() == bytes.size() &&
+			    std::memcmp(entry.bytes.data(), bytes.data(), bytes.size()) == 0) {
+				m_hits++;
+				if (shadow) return nullptr;
+				entry.last_tick = tick;
+				return entry.set;
+			}
+			m_collisions++;
+		}
+		m_misses++;
+		if (shadow) return nullptr;
+		const vk::DescriptorSet set = TakeSet(context.GetGraphics(), layout);
+		VULKAN_HPP_DEFAULT_DISPATCHER.vkUpdateDescriptorSetWithTemplate(
+		    static_cast<VkDevice>(context.GetGraphics().device), static_cast<VkDescriptorSet>(set),
+		    static_cast<VkDescriptorUpdateTemplate>(update_template), bytes.data());
+		uint32_t index = 0;
+		if (!m_free_slots.empty()) {
+			index = m_free_slots.back();
+			m_free_slots.pop_back();
+		} else {
+			index = static_cast<uint32_t>(m_entries.size());
+			m_entries.emplace_back();
+		}
+		auto& entry     = m_entries[index];
+		entry.set       = set;
+		entry.layout    = layout;
+		entry.last_tick = tick;
+		entry.dead      = false;
+		entry.hash      = hash;
+		entry.bytes.assign(bytes.begin(), bytes.end());
+		entry.handles.clear();
+		for (size_t at = 0; at + CommitPacketStride <= bytes.size(); at += CommitPacketStride) {
+			for (size_t word = 0; word < 2; word++) {
+				uint64_t value = 0;
+				std::memcpy(&value, bytes.data() + at + word * 8u, sizeof(value));
+				if (value != 0 && std::find(entry.handles.begin(), entry.handles.end(), value) == entry.handles.end()) {
+					entry.handles.push_back(value);
+				}
+			}
+		}
+		for (const auto handle: entry.handles) m_by_handle.emplace(handle, index);
+		m_by_key[hash] = index;
+		m_order.push_back(index);
+		m_live++;
+		while (m_live > MaxEntries && !m_order.empty()) {
+			const uint32_t oldest = m_order.front();
+			m_order.pop_front();
+			if (!m_entries[oldest].dead) {
+				Kill(oldest);
+				m_evicted++;
+			}
+		}
+		return set;
+	}
+
+	void Destroy(vk::Device device) {
+		std::lock_guard lock(m_mutex);
+		for (const auto pool: m_pools) device.destroyDescriptorPool(pool, nullptr);
+		m_pools.clear();
+		m_entries.clear();
+		m_by_key.clear();
+		m_by_handle.clear();
+		m_free_sets.clear();
+		m_pending.clear();
+		m_order.clear();
+		m_free_slots.clear();
+		m_live = 0;
+	}
+
+private:
+	struct Entry {
+		vk::DescriptorSet       set    = nullptr;
+		vk::DescriptorSetLayout layout = nullptr;
+		uint64_t                last_tick = 0;
+		uint64_t                hash      = 0;
+		bool                    dead      = true;
+		std::vector<uint8_t>    bytes;
+		std::vector<uint64_t>   handles;
+	};
+	static constexpr size_t   MaxEntries = 16384;
+	static constexpr uint32_t PoolSets   = 4096;
+
+	static uint64_t Key(vk::DescriptorSetLayout layout, std::span<const uint8_t> bytes) {
+		const auto handle = reinterpret_cast<uint64_t>(static_cast<VkDescriptorSetLayout>(layout));
+		return XXH3_64bits_withSeed(bytes.data(), bytes.size(), handle);
+	}
+
+	void Kill(uint32_t index) {
+		auto& entry = m_entries[index];
+		entry.dead  = true;
+		if (const auto found = m_by_key.find(entry.hash); found != m_by_key.end() && found->second == index) m_by_key.erase(found);
+		m_pending.push_back(index);
+		m_live--;
+	}
+
+	void Drop(uint64_t handle) {
+		std::lock_guard lock(m_mutex);
+		auto [begin, end] = m_by_handle.equal_range(handle);
+		if (begin == end) return;
+		for (auto it = begin; it != end; ++it) {
+			if (!m_entries[it->second].dead) {
+				Kill(it->second);
+				m_invalidated++;
+			}
+		}
+	}
+
+	void Reclaim(MasterSemaphore& master) {
+		if (m_pending.empty()) return;
+		size_t kept = 0;
+		for (const uint32_t index: m_pending) {
+			auto& entry = m_entries[index];
+			if (!master.IsFree(entry.last_tick)) {
+				m_pending[kept++] = index;
+				continue;
+			}
+			for (const auto handle: entry.handles) {
+				auto [begin, end] = m_by_handle.equal_range(handle);
+				for (auto it = begin; it != end;) it = it->second == index ? m_by_handle.erase(it) : std::next(it);
+			}
+			m_free_sets[static_cast<VkDescriptorSetLayout>(entry.layout)].push_back(entry.set);
+			entry = Entry {};
+			m_free_slots.push_back(index);
+			m_recycled++;
+		}
+		m_pending.resize(kept);
+		if (m_order.size() > MaxEntries * 4u) {
+			std::erase_if(m_order, [&](uint32_t index) { return m_entries[index].dead; });
+		}
+	}
+
+	vk::DescriptorSet TakeSet(GraphicContext& graphics, vk::DescriptorSetLayout layout) {
+		auto& free = m_free_sets[static_cast<VkDescriptorSetLayout>(layout)];
+		if (!free.empty()) {
+			const auto set = free.back();
+			free.pop_back();
+			return set;
+		}
+		vk::DescriptorSetAllocateInfo allocate {};
+		allocate.descriptorSetCount = 1;
+		allocate.pSetLayouts        = &layout;
+		vk::DescriptorSet set       = nullptr;
+		if (!m_pools.empty()) {
+			allocate.descriptorPool = m_pools.back();
+			if (graphics.device.allocateDescriptorSets(&allocate, &set) == vk::Result::eSuccess) return set;
+		}
+		constexpr std::array sizes = {
+		    vk::DescriptorPoolSize {vk::DescriptorType::eStorageBuffer, PoolSets * 8u},
+		    vk::DescriptorPoolSize {vk::DescriptorType::eSampledImage, PoolSets * 32u},
+		    vk::DescriptorPoolSize {vk::DescriptorType::eStorageImage, PoolSets * 4u},
+		    vk::DescriptorPoolSize {vk::DescriptorType::eSampler, PoolSets * 8u},
+		    vk::DescriptorPoolSize {vk::DescriptorType::eUniformBuffer, PoolSets * 2u},
+		};
+		vk::DescriptorPoolCreateInfo create {};
+		create.maxSets       = PoolSets;
+		create.poolSizeCount = static_cast<uint32_t>(sizes.size());
+		create.pPoolSizes    = sizes.data();
+		vk::DescriptorPool pool = nullptr;
+		EXIT_IF(graphics.device.createDescriptorPool(&create, nullptr, &pool) != vk::Result::eSuccess);
+		m_pools.push_back(pool);
+		allocate.descriptorPool = pool;
+		EXIT_IF(graphics.device.allocateDescriptorSets(&allocate, &set) != vk::Result::eSuccess);
+		return set;
+	}
+
+	void Report() {
+		if (!PerfEnabled()) return;
+		const auto now = std::chrono::steady_clock::now();
+		if (now - m_window < std::chrono::seconds(5)) return;
+		m_window = now;
+		std::fprintf(stderr,
+		             "PERF gpl_set_cache reused=%llu new=%llu collisions=%llu invalidated=%llu evicted=%llu recycled=%llu live=%zu "
+		             "pending=%zu pools=%zu (5 s)\n",
+		             static_cast<unsigned long long>(m_hits), static_cast<unsigned long long>(m_misses),
+		             static_cast<unsigned long long>(m_collisions), static_cast<unsigned long long>(m_invalidated),
+		             static_cast<unsigned long long>(m_evicted), static_cast<unsigned long long>(m_recycled), m_live,
+		             m_pending.size(), m_pools.size());
+		m_hits = m_misses = m_collisions = m_invalidated = m_evicted = m_recycled = 0;
+	}
+
+	std::mutex                                                          m_mutex;
+	std::vector<Entry>                                                  m_entries;
+	std::vector<uint32_t>                                               m_free_slots;
+	std::unordered_map<uint64_t, uint32_t>                              m_by_key;
+	std::unordered_multimap<uint64_t, uint32_t>                         m_by_handle;
+	std::unordered_map<VkDescriptorSetLayout, std::vector<vk::DescriptorSet>> m_free_sets;
+	std::vector<uint32_t>                                               m_pending;
+	std::deque<uint32_t>                                                m_order;
+	std::vector<vk::DescriptorPool>                                     m_pools;
+	size_t                                                              m_live = 0;
+	uint64_t m_hits = 0, m_misses = 0, m_collisions = 0, m_invalidated = 0, m_evicted = 0, m_recycled = 0;
+	std::chrono::steady_clock::time_point m_window = std::chrono::steady_clock::now();
+};
+
 } // namespace
+
+void GplSetCacheDestroy(vk::Device device) {
+	PixelSetCache::Get().Destroy(device);
+}
 
 // Binds what a stage list was prepared with: barriers of the bound resources, push constants, descriptors.
 //
@@ -6527,6 +6764,34 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			BuildCommitPacketEntries(std::span<PreparedBindings* const>(&split_pixel, 1), entries);
 			uint32_t   pixel_bytes    = 0;
 			const auto pixel_template = GplSetTemplate(m_context.GetGraphics(), pipeline.pixel_set_layout, entries, pixel_bytes);
+			vk::DescriptorSet cached_set;
+			if (const uint32_t cache_mode = Common::LiveAb::Gate(Common::LiveAb::Switch::GplSetCache, GplSetCacheFixed());
+			    cache_mode != 0u) {
+				if (CommandRecorder::g_destroy_observer.load(std::memory_order_acquire) == nullptr) {
+					CommandRecorder::g_destroy_observer.store(&PixelSetCache::Observe, std::memory_order_release);
+				}
+				static thread_local std::vector<uint8_t> cache_bytes;
+				cache_bytes.resize(pixel_bytes);
+				const uint32_t cache_filled =
+				    FillCommitPacket(m_context, cache_bytes.data(), std::span<PreparedBindings* const>(&split_pixel, 1));
+				EXIT_IF(cache_filled != pixel_bytes);
+				cached_set = PixelSetCache::Get().Lookup(m_context, pipeline.pixel_set_layout, pixel_template, cache_bytes,
+				                                         cache_mode == 2u);
+			}
+			if (cached_set) {
+				CommitPacketHeader bind_header;
+				bind_header.buffer     = vk_buffer;
+				bind_header.layout     = pipeline.pipeline_layout;
+				bind_header.bind_point = pipeline_bind_point;
+				bind_header.set_index  = ShaderRecompiler::IR::SplitPixelSet;
+				bind_header.set        = cached_set;
+				if (auto* out = static_cast<uint8_t*>(CommandRecorder::ReserveCall(vk_buffer, sizeof(bind_header))); out != nullptr) {
+					std::memcpy(out, &bind_header, sizeof(bind_header));
+					CommandRecorder::CommitCall(RunCommitPacket);
+				} else {
+					RunCommitPacket(&bind_header);
+				}
+			} else {
 			CommitPacketHeader pixel_header;
 			pixel_header.buffer           = vk_buffer;
 			pixel_header.layout           = pipeline.pipeline_layout;
@@ -6560,6 +6825,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				RunCommitPacket(out);
 			} else {
 				CommandRecorder::CommitCall(RunCommitPacket);
+			}
 			}
 		}
 		CommitPacketHeader header;

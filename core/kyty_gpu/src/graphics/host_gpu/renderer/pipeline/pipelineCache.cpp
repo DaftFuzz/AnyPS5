@@ -71,6 +71,8 @@
 #include <vector>
 #include <xxhash.h>
 
+#include "graphics/host_gpu/renderer/commandRecorder.h"
+
 namespace Libs::Graphics {
 
 namespace {
@@ -2107,6 +2109,8 @@ PipelineCache::~PipelineCache() {
 	}
 	destroy(m_graphics_pipelines);
 	destroy(m_compute_pipelines);
+	CommandRecorder::g_destroy_observer.store(nullptr, std::memory_order_release);
+	GplSetCacheDestroy(m_graphics.device);
 	GplDestroyLibraries(m_graphics);
 	if (m_driver_cache != nullptr) {
 		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);

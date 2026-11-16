@@ -49,6 +49,7 @@ enum class Switch : uint32_t {
 	DiagAdoptAssume,           // KYTY_DIAG_ADOPT_ASSUME_UNCHANGED (measurement only, APPROXIMATION)
 	AdoptRuns,
 	CompareLockFree,       // KYTY_PERF_COMPARE_LOCKFREE (aps5/memoryShim.cpp, CompareBackingBatch)
+	GplSetCache,           // KYTY_PERF_GPL_SET_CACHE (pipeline/descriptors.cpp, split pixel set cache)
 	Count
 };
 
