@@ -1128,6 +1128,28 @@ static TextureDescribe DescribeTexture(const ShaderRecompiler::IR::ImageResource
 			             static_cast<unsigned long long>(desc.info.data.size >> 20u), words[0], words[1], words[2],
 			             words[3], words[4], words[5], words[6], words[7]);
 	}
+	static const uint64_t soft_texture_max_bytes = [] {
+		const char*    value = std::getenv("KYTY_FIX_SOFT_TEXTURE_MAX_MB");
+		const uint64_t mb    = value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {512};
+		std::fprintf(stderr, "FIX_SOFT_TEXTURE_MAX_MB %llu (soft-resolved textures larger than this bind null; 0 off)\n",
+		             static_cast<unsigned long long>(mb));
+		return mb << 20u;
+	}();
+	if (soft_resolve && soft_texture_max_bytes != 0u && desc.info.data.size > soft_texture_max_bytes) {
+		static std::atomic<uint32_t> logged {0};
+		const auto                   n = logged.fetch_add(1) + 1u;
+		if (n <= 16u || (n & (n - 1u)) == 0u) {
+			std::fprintf(stderr,
+			             "FIX_SOFT_TEXTURE_TOO_LARGE soft null n=%u: address=0x%016llx MiB=%llu extent=%ux%u layers=%u "
+			             "levels=%u depth=%u max_mip=%u words4-7=%08x %08x %08x %08x\n",
+			             n, static_cast<unsigned long long>(desc.info.data.address),
+			             static_cast<unsigned long long>(desc.info.data.size >> 20u), desc.info.extent.width,
+			             desc.info.extent.height, desc.info.resources.layers, desc.info.resources.levels,
+			             static_cast<uint32_t>(descriptor.Depth()), static_cast<uint32_t>(max_mip), descriptor.fields[4], descriptor.fields[5],
+			             descriptor.fields[6], descriptor.fields[7]);
+		}
+		return TextureDescribe::SoftNull;
+	}
 	if (soft_resolve && desc.info.data.size != 0 &&
 	    Libs::LibKernel::Memory::TryClampReservedRangeSize(desc.info.data.address, reserved_needed) < reserved_needed) {
 		static std::atomic<uint32_t> logged {0};
