@@ -992,7 +992,9 @@ private:
 	// KYTY_PERF_BAR_GPU_COPY_VERIFY=1 with a hand-back copy: when the finished readback is applied, its bytes in the
 	// backing are compared with the buffer's mapping, interval by interval; intervals a GPU write was recorded over
 	// since are GPU-dirty again and are skipped (PERF bar_gpu_copy verified / mismatched).
-	void                      VerifyCopyReadback(const EagerReadback& entry);
+	void                      VerifyCopyReadback(const EagerReadback& entry, bool at_landing = false);
+	[[nodiscard]] static bool HandbackVerifyOn(const EagerReadback& entry);
+	void                      HandbackLanded(const EagerReadback& entry) const; // marks a landed hand-back copy done (verify first)
 	void                      RedoHandbackWrittenDuringFlight(const EagerReadback& entry); // KYTY_FIX_HANDBACK_REDO
 	// KYTY_PERF_COPY_PREDICT (G4, design-gpuwait 2.2; default 0; 1 on, 2 check; with KYTY_PERF_COPY_HANDBACK), GPU thread.
 	// A 64 KiB granule that retried guest read faults took in at least 2 of the last 4 frames is predicted, with the
