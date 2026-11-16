@@ -510,6 +510,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	// KYTY_CHECK_CHUNKS=2 (project 15, the oracle v2): a chunk-member dispatch is prepared once more before its preparation;
 	// the two preparations' prints must be equal (renderDraw.cpp ChunkCheckFirst; the commit uses the second).
 	const bool chunk_check = ChunkCensus::CheckOn() && ChunkCensus::t_member;
+	const bool dispatch_plan = !chunk_check && DispatchPlanBegin();
 	for (uint32_t preparation = chunk_check ? 0u : 1u; preparation < 2u; preparation++) {
 		// The first preparation (the oracle's) into bindings of its own.
 		auto&             prepared       = preparation == 0u ? ChunkScratchBindings(4) : bindings;
@@ -541,6 +542,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		sub_timer.reset();
 		if (preparation == 0u) ChunkCheckFirst(std::span {&prepared_stage, 1u}, nullptr);
 	}
+	if (dispatch_plan) DispatchPlanEnd();
 	if (chunk_check) ChunkCheckSecond(std::span {&descriptor_stage, 1u}, nullptr, true);
 	census_timer.Mark(5);
 	floor_phase.Next(ChunkLead::FpD6);

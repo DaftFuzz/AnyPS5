@@ -347,6 +347,8 @@ public:
 	void ScoutResolve(const ResolveTask& task);
 	// The helper, taking a task: pending -> running; false when the execution thread stole it (the slot is freed then).
 	[[nodiscard]] static bool BeginResolveTask(ResolvedDraw* slot) noexcept;
+	[[nodiscard]] static bool DispatchPlanPossible();
+	static void               NoteDispatchPlanLead(bool built);
 	// The execution thread: one look at a slot. Ready / Empty: resolved; Stolen: it was pending and is now the execution
 	// thread's to do itself (the helper frees the slot); Running: a helper resolves it now (or, with steal false, pending).
 	enum class ResolvedClaim : uint8_t { Ready, Empty, Stolen, Running };
@@ -554,6 +556,9 @@ private:
 	[[nodiscard]] DrawRenderState* TakeResolvedState(const ShaderIndirectDrawInfo& indirect_draw);
 	// The same for a direct dispatch: `input_info` and `program` as GetComputeProgram would leave them (false: it runs).
 	[[nodiscard]] bool TakeResolvedDispatch(ShaderComputeInputInfo& input_info, ShaderProgram& program);
+	void               PeekAheadDispatch(ResolvedDraw* slot, uint32_t distance);
+	[[nodiscard]] bool DispatchPlanBegin();
+	void               DispatchPlanEnd();
 	ResolvedDraw* m_resolved_draw  = nullptr; // the operation's
 	uint64_t      m_plan_set_version = 0;      // N4.2a: the table set a plan names for the stage being prepared
 	bool          m_slot_taken       = false;  // N4.2: TakeResolvedState took the running draw's slot (UseResolvedDraw clears it)

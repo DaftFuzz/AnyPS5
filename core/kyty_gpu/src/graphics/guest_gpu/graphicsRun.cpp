@@ -1852,6 +1852,7 @@ void GuestGpu::ResolveHelperThread(uint32_t index) {
 		return !(oracle != nullptr && oracle[0] == '2');
 	}();
 	constexpr uint64_t PlanMargin = 32;
+	static const bool  dispatch_plans = RenderExecutor::DispatchPlanPossible();
 	while (auto task = tasks.Pop()) {
 		if (helper_plans && task->member && !task->dispatch) {
 			const uint64_t claimed = m_tasks_claimed.load(std::memory_order_relaxed);
@@ -1859,6 +1860,12 @@ void GuestGpu::ResolveHelperThread(uint32_t index) {
 			task->lead             = static_cast<uint32_t>(std::min<uint64_t>(lead, UINT32_MAX));
 			task->build_plan       = lead >= PlanMargin;
 			(task->build_plan ? hs.plans : hs.plans_short).fetch_add(1, std::memory_order_relaxed);
+		} else if (helper_plans && dispatch_plans && task->dispatch && !task->indirect) {
+			const uint64_t claimed = m_tasks_claimed.load(std::memory_order_relaxed);
+			const uint64_t lead    = task->seq > claimed ? task->seq - claimed : 0u;
+			task->lead             = static_cast<uint32_t>(std::min<uint64_t>(lead, UINT32_MAX));
+			task->build_plan       = lead >= PlanMargin;
+			RenderExecutor::NoteDispatchPlanLead(task->build_plan);
 		}
 		if (!RenderExecutor::BeginResolveTask(task->slot)) {
 			hs.skipped.fetch_add(1, std::memory_order_relaxed);

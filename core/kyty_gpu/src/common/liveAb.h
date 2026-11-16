@@ -62,6 +62,7 @@ enum class Switch : uint32_t {
 	CountGuest,            // KYTY_PERF_COUNT_GUEST (cache/bufferCache.cpp, ReadGpuCopy)
 	DeferReadProtect,      // KYTY_PERF_DEFER_READ_PROTECT (graphics/host_gpu/faultPath.h)
 	LogBuffer,
+	DispatchPlan,
 	Count
 };
 

@@ -4119,7 +4119,137 @@ bool RenderExecutor::TakeResolvedDispatch(ShaderComputeInputInfo& input_info, Sh
 	input_info             = resolved->compute;
 	program                = resolved->compute_program;
 	t_compute_program_path = 3u; // KYTY_TRACE_DISPATCH_CENSUS
+	if (DispatchPlanPossible()) m_slot_taken = true;
 	return true;
+}
+
+namespace {
+uint32_t DispatchPlanFixed() {
+	static const uint32_t value = [] {
+		const char*    text = std::getenv("KYTY_PERF_DISPATCH_PLAN");
+		const uint32_t v    = text != nullptr ? static_cast<uint32_t>(std::strtoul(text, nullptr, 10)) : 0u;
+		if (v != 0) {
+			std::fprintf(stderr, "KYTY_PERF_DISPATCH_PLAN=%u: the resolve helpers build buffer plans for direct dispatches%s\n", v,
+			             BufferCache::PlanBufferCheck() ? " (KYTY_CHECK_PLAN_BUFFERS=2: checked, not used)" : "");
+		}
+		return v;
+	}();
+	return value;
+}
+
+struct DispatchPlanHelperStats {
+	std::atomic<uint64_t> lead_ok {0}, lead_short {0}, built {0}, gated {0}, compile {0}, entries {0}, ready {0};
+};
+DispatchPlanHelperStats g_dispatch_plan_helper;
+
+struct DispatchPlanExecStats {
+	uint64_t taken = 0, absent = 0, programs_differ = 0, off = 0, used = 0, checked = 0, entries = 0, ready = 0, answered = 0;
+	std::chrono::steady_clock::time_point window = std::chrono::steady_clock::now();
+};
+DispatchPlanExecStats g_dispatch_plan_exec;
+
+void DispatchPlanReport() {
+	auto&      e   = g_dispatch_plan_exec;
+	const auto now = std::chrono::steady_clock::now();
+	if (now - e.window < std::chrono::seconds(5)) return;
+	e.window       = now;
+	auto&      h   = g_dispatch_plan_helper;
+	const auto get = [](const std::atomic<uint64_t>& a) { return static_cast<unsigned long long>(a.load(std::memory_order_relaxed)); };
+	const auto u   = [](uint64_t v) { return static_cast<unsigned long long>(v); };
+	std::fprintf(stderr,
+	             "PERF dispatch_plan helper[lead_ok|lead_short|built|gated|compile|entries|ready]=%llu|%llu|%llu|%llu|%llu|%llu|%llu "
+	             "exec[taken|absent|programs_differ|off|used|checked]=%llu|%llu|%llu|%llu|%llu|%llu entries=%llu ready=%llu answered=%llu\n",
+	             get(h.lead_ok), get(h.lead_short), get(h.built), get(h.gated), get(h.compile), get(h.entries), get(h.ready), u(e.taken),
+	             u(e.absent), u(e.programs_differ), u(e.off), u(e.used), u(e.checked), u(e.entries), u(e.ready), u(e.answered));
+}
+} // namespace
+
+bool RenderExecutor::DispatchPlanPossible() {
+	static const bool possible = Common::LiveAb::Possible(Common::LiveAb::Switch::DispatchPlan, DispatchPlanFixed());
+	return possible;
+}
+
+void RenderExecutor::NoteDispatchPlanLead(bool built) {
+	(built ? g_dispatch_plan_helper.lead_ok : g_dispatch_plan_helper.lead_short).fetch_add(1, std::memory_order_relaxed);
+}
+
+void RenderExecutor::PeekAheadDispatch(ResolvedDraw* slot, uint32_t distance) {
+	auto& h = g_dispatch_plan_helper;
+	slot->ahead.planned  = false;
+	slot->ahead.distance = distance;
+	slot->ahead.buffers.clear();
+	if (slot->empty || !slot->is_compute || !PipelineCache::StagesAdoptable(*slot->stages)) {
+		h.gated.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	auto&             pc   = m_context.GetPipelineCache();
+	static const bool slim = std::getenv("KYTY_CHECK_PEEK") == nullptr && std::getenv("KYTY_CHECK_CHUNKS") == nullptr;
+	t_peek_slim            = slim;
+	++t_translator;
+	if (!pc.PeekAdoptAhead(*slot->stages, distance)) {
+		--t_translator;
+		h.compile.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	PipelineCache::AheadSaved saved;
+	PipelineCache::InstallAhead(*slot->stages, saved);
+	for (uint32_t i = 0; i < PipelineCache::StageCount(*slot->stages); i++) {
+		const auto* program   = PipelineCache::AheadProgram(*slot->stages, i);
+		const auto* resources = PipelineCache::StageResources(*slot->stages, i);
+		if (program == nullptr || resources == nullptr) continue;
+		PeekStageBuffers(*program, *resources, PipelineCache::StageRecord(*slot->stages, i), distance, slot->ahead.buffers);
+	}
+	PipelineCache::RestoreAhead(*slot->stages, saved);
+	--t_translator;
+	if (!GuestGpu::IsGpuThread()) {
+		for (size_t i = 0; i < t_translator_writes.size(); i++) {
+			if (t_translator_writes[i] != 0) g_helper_translator_writes[i].fetch_add(t_translator_writes[i], std::memory_order_relaxed);
+			t_translator_writes[i] = 0;
+		}
+	}
+	uint64_t ready = 0;
+	for (const auto& entry: slot->ahead.buffers) ready += entry.ready ? 1u : 0u;
+	slot->ahead.planned = true;
+	h.built.fetch_add(1, std::memory_order_relaxed);
+	h.entries.fetch_add(slot->ahead.buffers.size(), std::memory_order_relaxed);
+	h.ready.fetch_add(ready, std::memory_order_relaxed);
+}
+
+bool RenderExecutor::DispatchPlanBegin() {
+	if (!DispatchPlanPossible() || ChunkCensus::CheckOn()) return false;
+	auto& e = g_dispatch_plan_exec;
+	e.taken++;
+	if (!PlanPresent()) {
+		e.absent++;
+		DispatchPlanReport();
+		return false;
+	}
+	if (!PlanProgramsHold()) {
+		e.programs_differ++;
+		DispatchPlanReport();
+		return false;
+	}
+	const bool check = BufferCache::PlanBufferCheck();
+	if (!check && Common::LiveAb::Gate(Common::LiveAb::Switch::DispatchPlan, DispatchPlanFixed()) == 0u) {
+		e.off++;
+		DispatchPlanReport();
+		return false;
+	}
+	(check ? e.checked : e.used)++;
+	for (auto& entry: m_resolved_draw->ahead.buffers) entry.used = false;
+	BufferCache::SetPlanBuffers(&m_resolved_draw->ahead.buffers);
+	return true;
+}
+
+void RenderExecutor::DispatchPlanEnd() {
+	BufferCache::SetPlanBuffers(nullptr);
+	auto& e = g_dispatch_plan_exec;
+	for (const auto& entry: m_resolved_draw->ahead.buffers) {
+		e.entries++;
+		if (entry.ready) e.ready++;
+		if (entry.used) e.answered++;
+	}
+	DispatchPlanReport();
 }
 
 void RenderExecutor::ReleaseResolvedDraw(ResolvedDraw* resolved) noexcept {
@@ -4160,6 +4290,7 @@ bool RenderExecutor::ResolveTaskInto(ResolvedDraw& slot, const ResolveTask& task
 		slot.fault = task.fault;
 	}
 	slot.empty = !ok;
+	if (ok && task.dispatch && task.build_plan) PeekAheadDispatch(&slot, std::min(task.lead, 127u));
 	if (ok && !task.dispatch && task.build_plan) {
 		// N5.3: the helper builds the draw's plan while the slot is still its own (before it is marked ready).
 		PeekAhead(&slot, *task.context, *task.user_config, *task.shaders, task.indexed, task.draw_count, 1u, task.index_type,
