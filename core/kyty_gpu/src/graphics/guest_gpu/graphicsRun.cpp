@@ -1411,9 +1411,8 @@ static std::atomic<GuestGpu*> g_scout_gpu {nullptr};
 #if defined(_WIN32)
 static std::atomic<uint64_t> g_cxx_throws_gcc {0};
 static std::atomic<uint64_t> g_cxx_throws_msvc {0};
-extern "C" __declspec(dllimport) void* __stdcall AddVectoredExceptionHandler(unsigned long first, long(__stdcall* handler)(void*));
-static long __stdcall CountCxxThrows(void* pointers) {
-	const auto code = **static_cast<const uint32_t* const*>(pointers);
+static LONG CALLBACK CountCxxThrows(PEXCEPTION_POINTERS info) {
+	const auto code = static_cast<uint32_t>(info->ExceptionRecord->ExceptionCode);
 	if (code == 0x20474343u) g_cxx_throws_gcc.fetch_add(1, std::memory_order_relaxed);
 	else if (code == 0xE06D7363u) g_cxx_throws_msvc.fetch_add(1, std::memory_order_relaxed);
 	return 0;
