@@ -16,6 +16,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCacheTrace.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/passes/NullSlot.h"
+#include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kytyGitVersion.h"
 #include "loader/systemContent.h"
@@ -2830,6 +2831,22 @@ bool ShaderPrecompiler::CompileModule(const PrecompileStageRecord& record, uint6
 		return false; // programs with a scalar call read their callee from guest memory: never recorded
 	}
 	auto translated = ShaderRecompiler::TranslateProgram(source.decoded, options);
+	// A record whose stage input count does not cover the program's attribute reads (its register snapshot was taken
+	// with another draw's interpolator or vertex-input count) would end the emulator in CollectShaderInfo: no module.
+	if (uint32_t bad_index = 0, input_count = 0;
+	    !ShaderRecompiler::IR::StageInputsFit(translated.program, stage_input, bad_index, input_count)) {
+		m_rejected.fetch_add(1, std::memory_order_relaxed);
+		static std::atomic_uint logged {0};
+		if (logged.fetch_add(1) < 16u) {
+			std::fprintf(stderr,
+			             "SHADER_PRECOMPILE_INPUT_MISMATCH hash=0x%016llx stage=%s key=%s attribute=%u inputs=%u (skipped; the "
+			             "GPU thread compiles it from its own registers)\n",
+			             static_cast<unsigned long long>(record.shader_hash), StageName(record.stage), HexKey(record.Key()).c_str(),
+			             bad_index, input_count);
+			std::fflush(stderr);
+		}
+		return false;
+	}
 	// A record whose specialization does not fit the resources this build and these switches give the program (a
 	// switch that changes the resource layout, such as KYTY_PERF_BINDLESS_CLASSES, differed in the recording run)
 	// would end the emulator in ApplyResourceSpecialization: such a job makes no module.

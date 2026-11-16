@@ -587,6 +587,29 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 
 } // namespace
 
+bool StageInputsFit(const Program& program, ShaderStageInputInfo input_info, uint32_t& index, uint32_t& count) {
+	const bool vertex = program.stage == ShaderType::Vertex || program.stage == ShaderType::Local;
+	const bool pixel  = program.stage == ShaderType::Pixel;
+	if ((!vertex || input_info.vertex == nullptr) && (!pixel || input_info.pixel == nullptr)) return true;
+	count = vertex ? static_cast<uint32_t>(std::max(input_info.vertex->resources_num, 0)) : input_info.pixel->input_num;
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			const auto opcode = inst.GetOpcode();
+			if (opcode != ValueOpcode::GetAttribute && opcode != ValueOpcode::GetAttributeF16) continue;
+			if (!inst.Arg(0).IsImmediate() || inst.Arg(0).GetType() != Type::U32 || !inst.Arg(1).IsImmediate() ||
+			    inst.Arg(1).GetType() != Type::U32) {
+				index = UINT32_MAX;
+				return false;
+			}
+			if (inst.Arg(1).U32() >= 4u || inst.Arg(0).U32() >= count) {
+				index = inst.Arg(0).U32();
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
 void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	if (!program.resource_tracking_complete || program.shader_info_complete) {
 		return Fail(!program.resource_tracking_complete ? "shader resources were not tracked"
