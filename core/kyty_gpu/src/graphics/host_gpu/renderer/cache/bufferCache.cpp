@@ -6000,7 +6000,7 @@ bool BarGpuCopyVerify() {
 // pages stay GPU-modified and the next read downloads the newest bytes.
 bool HandbackRedoOn() {
 	static const bool on = [] {
-		const char* value = std::getenv("KYTY_FIX_HANDBACK_REDO");
+		const char* value = Common::EnvOrDefault("KYTY_FIX_HANDBACK_REDO");
 		const bool  set   = value != nullptr && value[0] == '1';
 		if (set) std::fprintf(stderr, "KYTY_FIX_HANDBACK_REDO=1: hand-back intervals written during the flight are GPU-dirty again at apply\n");
 		return set;
@@ -6265,7 +6265,7 @@ bool BarGpuRead(GraphicContext& graphics, CommandScheduler& scheduler, Buffer& b
 // KYTY_PERF_COPY_HANDBACK (barGpuCopy.h): the switch's start value.
 uint32_t CopyHandbackFixed() {
 	static const uint32_t value = [] {
-		const char* text = std::getenv("KYTY_PERF_COPY_HANDBACK");
+		const char* text = Common::EnvOrDefault("KYTY_PERF_COPY_HANDBACK");
 		const bool  on   = text != nullptr && text[0] == '1';
 		if (on) std::fprintf(stderr, "PERF_COPY_HANDBACK=1: the faulting thread waits for the GPU copy of its download\n");
 		return on ? 1u : 0u;

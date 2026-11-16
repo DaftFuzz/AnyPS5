@@ -61,6 +61,13 @@ inline constexpr EnvDefault EnvDefaults[] = {
     // table read does not mark a direct-range page clean for its walk while a GPU write is still pending elsewhere on
     // the page (cache/bufferCache.h).
     {"KYTY_FIX_DIRECT_PAGE_MARK", "1", "config", ""},
+    // Measured performance switch, exact (row 119: +6.07 % +- 1.92 Teshio; landing-time verify of every hand-back copy:
+    // 0 mismatches of 1,279,246 Teshio and 579,472 cutscene, 0 pages opened before a copy was done, rows 141e/148): guest
+    // fault reads are copied on the second queue without the GPU thread waiting (cache/barGpuCopy.h).
+    {"KYTY_PERF_COPY_HANDBACK", "1", "config", ""},
+    // Exactness fix for hand-back (on in the verified runs above): at apply, copied intervals whose granule write tick
+    // rose during the flight are GPU-dirty again on pages still GPU-modified (cache/bufferCache.cpp).
+    {"KYTY_FIX_HANDBACK_REDO", "1", "config", ""},
     // Probably hardware behaviour, exactness check open (M48):
     {"KYTY_FIX_TEXTURE_CLAMP_LAST_LEVEL", "1", "unproven", "M48"},
     {"KYTY_FIX_RT_11_11_10_FLOAT", "1", "unproven", "M48"},
