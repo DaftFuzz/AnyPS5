@@ -382,6 +382,9 @@ void LaneShareClassify(EmitterState& state);
 bool LaneShareReuse(ValueEmitContext& low, ValueEmitContext& high, const IR::Inst& inst,
                     size_t low_words);
 void LaneShareReport(EmitterState& state);
+// KYTY_PERF_HALF_LOOP: an ALU instruction whose emitter reads nothing but its IR operands (no lane id, no half state,
+// no memory), so one copy run once per lane half computes what the two copies compute.
+bool HalfLoopPure(const EmitterState& state, const IR::Inst& inst);
 
 enum class VertexInputScalarKind { Float, Sint, Uint };
 

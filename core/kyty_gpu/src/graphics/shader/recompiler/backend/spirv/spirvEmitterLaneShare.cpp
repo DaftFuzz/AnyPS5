@@ -393,6 +393,24 @@ bool LaneShareReuse(ValueEmitContext& low, ValueEmitContext& high, const IR::Ins
 	return true;
 }
 
+bool HalfLoopPure(const EmitterState& state, const IR::Inst& inst) {
+	using Op = IR::ValueOpcode;
+	switch (inst.GetOpcode()) {
+		case Op::ReadConst:
+		case Op::ReadConstBuffer:
+		case Op::LoadAddressU8:
+		case Op::LoadAddressU16:
+		case Op::LoadAddressU32:
+		case Op::LoadBufferU8:
+		case Op::LoadBufferU16:
+		case Op::LoadBufferU32:
+		case Op::LoadBufferU32x2:
+		case Op::LoadBufferU32x3:
+		case Op::LoadBufferU32x4: return false;
+		default: return inst.GetType() != IR::Type::Void && RuleFor(state, inst) == Rule::Pure;
+	}
+}
+
 void LaneShareReport(EmitterState& state) {
 	const auto& share = state.lane_share;
 	if (!share.active) return;

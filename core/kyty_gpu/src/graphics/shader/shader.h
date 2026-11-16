@@ -210,6 +210,7 @@ struct ShaderVertexInputInfo {
 
 inline constexpr uint8_t ComputeVariantPairOff     = 2u;
 inline constexpr uint8_t ComputeVariantPairSpin    = 4u; // KYTY_DIAG_TWIN_DISPATCH: spin exchanges
+inline constexpr uint8_t ComputeVariantHalfLoopOff = 8u; // KYTY_DIAG_TWIN_DISPATCH: without KYTY_PERF_HALF_LOOP
 
 struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 	bool               async_compute              = false;

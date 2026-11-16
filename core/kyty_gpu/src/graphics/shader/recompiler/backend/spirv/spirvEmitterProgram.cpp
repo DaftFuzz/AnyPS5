@@ -439,13 +439,216 @@ void EmitDispatcherInstruction(ValueEmitContext& ctx, const DispatcherFunctionSt
 	}
 }
 
+// KYTY_PERF_HALF_LOOP=<IR instructions>: in a two-lane compute program of at least that many IR instructions, a run of
+// consecutive ALU instructions whose emitters read only their operands (HalfLoopPure) is emitted once, inside a loop of
+// two iterations (DontUnroll) whose counter is the lane half: an operand defined outside the run is selected by the
+// counter from its two halves' values, and each result used after the run is carried out of the loop per half. Each
+// iteration computes exactly what that half's copy computes, so the output is unchanged; the driver sees half the ALU.
+// KYTY_PERF_HALF_LOOP_RUN: the shortest run looped (default 8 instructions).
+struct HalfLoopSettings {
+	uint32_t min_instructions = 0;
+	uint32_t min_run          = 8;
+};
+
+const HalfLoopSettings& GetHalfLoopSettings() {
+	static const HalfLoopSettings settings = [] {
+		HalfLoopSettings s;
+		const auto number = [](const char* value, uint32_t fallback) {
+			if (value == nullptr || value[0] == '\0') return fallback;
+			char*               end    = nullptr;
+			const unsigned long result = std::strtoul(value, &end, 10);
+			return end == value || *end != '\0' ? fallback : static_cast<uint32_t>(result);
+		};
+		s.min_instructions = number(Common::ShaderEnv::Read("KYTY_PERF_HALF_LOOP"), 0u);
+		s.min_run          = std::max(2u, number(Common::ShaderEnv::Read("KYTY_PERF_HALF_LOOP_RUN"), 8u));
+		if (s.min_instructions != 0)
+			std::fprintf(stderr, "PERF_HALF_LOOP enabled min_instructions=%u min_run=%u\n", s.min_instructions, s.min_run);
+		return s;
+	}();
+	return settings;
+}
+
+bool HalfLoopEnabled(const EmitterState& state) {
+	const auto& s = GetHalfLoopSettings();
+	if (s.min_instructions == 0 || state.lane_count != 2u || state.program.stage != ShaderType::Compute ||
+	    state.program.dispatcher_fallback)
+		return false;
+	if (state.input_info.compute != nullptr && (state.input_info.compute->compute_variant & ComputeVariantHalfLoopOff) != 0)
+		return false;
+	size_t count = 0;
+	for (const auto* block: state.program.blocks) count += std::distance(block->begin(), block->end());
+	return count >= s.min_instructions;
+}
+
+uint32_t HalfLoopInitial(EmitterState& state, IR::Type type) {
+	switch (type) {
+		case IR::Type::U1: return ConstantBool(state, false);
+		case IR::Type::U8:
+		case IR::Type::U16:
+		case IR::Type::U32:
+		case IR::Type::F16: return ConstantU32(state, 0);
+		case IR::Type::F32: return ConstantF32(state, 0);
+		case IR::Type::U64: return ConstantU64(state, 0);
+		default: return 0;
+	}
+}
+
+bool HalfLoopScalar(IR::Type type) {
+	switch (type) {
+		case IR::Type::U1:
+		case IR::Type::U8:
+		case IR::Type::U16:
+		case IR::Type::U32:
+		case IR::Type::F16:
+		case IR::Type::F32:
+		case IR::Type::U64: return true;
+		default: return false;
+	}
+}
+
+bool HalfLoopMember(const EmitterState& state, const IR::Inst& inst) {
+	if (!HalfLoopPure(state, inst) || !HalfLoopScalar(inst.GetType()) || inst.Definition(0) != 0 || inst.Definition(1) != 0)
+		return false;
+	for (size_t index = 0; index < inst.NumArgs(); index++) {
+		const auto arg = inst.Arg(index).Resolve();
+		if (arg.IsImmediate()) {
+			const auto type = arg.GetType();
+			if (type == IR::Type::ScalarReg || type == IR::Type::VectorReg) return false;
+			continue;
+		}
+		const auto* operand = arg.TryInstruction();
+		if (operand == nullptr || !HalfLoopScalar(operand->GetType())) return false;
+	}
+	return true;
+}
+
+struct HalfLoopStats {
+	uint64_t runs = 0, instructions = 0, live_in = 0, live_out = 0;
+};
+
 template <typename EmitInstruction>
-void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& emit_instruction) {
+void EmitHalfLoop(ValueEmitContext& ctx, const IR::Block* block, const std::vector<const IR::Inst*>& run_list,
+                  EmitInstruction&& emit_instruction, HalfLoopStats& stats) {
+	auto&                               state = ctx.state;
+	auto&                               high  = *ctx.other_half;
+	const std::unordered_set<const IR::Inst*> run(run_list.begin(), run_list.end());
+	struct LiveIn {
+		const IR::Inst* inst;
+		uint32_t        low, high, saved;
+	};
+	std::vector<LiveIn>                 live_in;
+	std::unordered_set<const IR::Inst*> seen;
+	for (const auto* inst: run_list) {
+		for (size_t index = 0; index < inst->NumArgs(); index++) {
+			const auto arg = inst->Arg(index).Resolve();
+			if (arg.IsImmediate()) continue;
+			const auto* operand = arg.TryInstruction();
+			if (run.contains(operand) || !seen.insert(operand).second) continue;
+			const auto low_id  = ctx.Def(arg);
+			const auto high_id = high.Def(arg);
+			if (low_id != high_id) live_in.push_back({operand, low_id, high_id, 0});
+		}
+	}
+	const auto* condition = block->condition.IsImmediate() ? nullptr : block->condition.Resolve().TryInstruction();
+	const auto* target    = block->indirect_target.IsImmediate() ? nullptr : block->indirect_target.Resolve().TryInstruction();
+	struct LiveOut {
+		const IR::Inst* inst;
+		uint32_t        type, acc_low, acc_high, next_low, next_high;
+	};
+	std::vector<LiveOut> live_out;
+	for (const auto* inst: run_list) {
+		const bool outside = inst == condition || inst == target || std::ranges::any_of(inst->Uses(), [&](const IR::Use& use) {
+			                     return !run.contains(use.user);
+		                     });
+		if (outside) {
+			live_out.push_back({inst, TypeId(state, inst->GetType()), state.builder.AllocateId(), state.builder.AllocateId(),
+			                    state.builder.AllocateId(), state.builder.AllocateId()});
+		}
+	}
+	const auto u32 = TypeU32(state), boolean = TypeBool(state);
+	const auto pre = state.current_label;
+	const auto header = state.builder.AllocateId(), body = state.builder.AllocateId();
+	const auto cont = state.builder.AllocateId(), merge = state.builder.AllocateId();
+	const auto counter = state.builder.AllocateId(), next_counter = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpBranch, header);
+	EmitLabel(state, header);
+	state.builder.AddFunction(spv::OpPhi, u32, counter, ConstantU32(state, 0), pre, next_counter, cont);
+	for (const auto& out: live_out) {
+		const auto initial = HalfLoopInitial(state, out.inst->GetType());
+		state.builder.AddFunction(spv::OpPhi, out.type, out.acc_low, initial, pre, out.next_low, cont);
+		state.builder.AddFunction(spv::OpPhi, out.type, out.acc_high, initial, pre, out.next_high, cont);
+	}
+	state.builder.AddFunction(spv::OpLoopMerge, merge, cont, spv::LoopControlDontUnrollMask);
+	state.builder.AddFunction(spv::OpBranch, body);
+	EmitLabel(state, body);
+	const auto is_high = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpIEqual, boolean, is_high, counter, ConstantU32(state, 1));
+	for (auto& in: live_in) {
+		const auto selected = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpSelect, TypeId(state, in.inst->GetType()), selected, is_high, in.high, in.low);
+		in.saved = in.inst->Definition(0);
+		in.inst->SetDefinition(0, selected);
+	}
+	state.lane_half = 0;
+	for (const auto* inst: run_list) emit_instruction(ctx, *inst);
+	for (const auto& in: live_in) in.inst->SetDefinition(0, in.saved);
+	for (const auto& out: live_out) {
+		const auto value = out.inst->Definition(0);
+		state.builder.AddFunction(spv::OpSelect, out.type, out.next_low, is_high, out.acc_low, value);
+		state.builder.AddFunction(spv::OpSelect, out.type, out.next_high, is_high, value, out.acc_high);
+	}
+	state.builder.AddFunction(spv::OpBranch, cont);
+	EmitLabel(state, cont);
+	state.builder.AddFunction(spv::OpIAdd, u32, next_counter, counter, ConstantU32(state, 1));
+	const auto again = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpULessThan, boolean, again, next_counter, ConstantU32(state, 2));
+	state.builder.AddFunction(spv::OpBranchConditional, again, header, merge);
+	EmitLabel(state, merge);
+	for (const auto& out: live_out) {
+		out.inst->SetDefinition(0, out.next_low);
+		out.inst->SetDefinition(1, out.next_high);
+	}
+	stats.runs++;
+	stats.instructions += run_list.size();
+	stats.live_in += live_in.size();
+	stats.live_out += live_out.size();
+}
+
+template <typename EmitInstruction>
+void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& emit_instruction,
+               HalfLoopStats* half_loop = nullptr) {
 	ctx.state.current_block = block;
 	EmitLabel(ctx.state, block->Definition());
 	bool emitted_non_phi = false;
 	const bool lane_share = ctx.state.lane_share.active;
+	std::vector<const IR::Inst*> pending;
+	const auto flush = [&]() {
+		if (pending.size() >= GetHalfLoopSettings().min_run) {
+			EmitHalfLoop(ctx, block, pending, emit_instruction, *half_loop);
+		} else {
+			for (const auto* inst: pending) {
+				size_t low_words = 0;
+				for (uint32_t half = 0; half < ctx.state.lane_count; half++) {
+					auto& lane          = half == 0 ? ctx : *ctx.other_half;
+					ctx.state.lane_half = half;
+					if (lane_share && half != 0 && LaneShareReuse(ctx, lane, *inst, low_words)) continue;
+					const size_t begin = ctx.state.builder.FunctionWordCount();
+					emit_instruction(lane, *inst);
+					if (half == 0) low_words = ctx.state.builder.FunctionWordCount() - begin;
+				}
+				ctx.state.lane_half = 0;
+			}
+		}
+		pending.clear();
+	};
+	const bool loops = half_loop != nullptr && !block->terminator.loop_header;
 	for (const auto& inst: *block) {
+		if (loops && inst.GetOpcode() != IR::ValueOpcode::Phi && HalfLoopMember(ctx.state, inst)) {
+			emitted_non_phi = true;
+			pending.push_back(&inst);
+			continue;
+		}
+		if (!pending.empty()) flush();
 		if (inst.GetOpcode() == IR::ValueOpcode::Phi) {
 			if (emitted_non_phi) {
 				ctx.Fail(inst, "appears after a non-Phi instruction");
@@ -469,6 +672,7 @@ void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& 
 		}
 		ctx.state.lane_half = 0;
 	}
+	if (!pending.empty()) flush();
 }
 
 void PatchStructuredPhis(ValueEmitContext& ctx, StructuredFunctionState& structured) {
@@ -570,17 +774,26 @@ void EmitStructuredFunction(ValueEmitContext& ctx) {
 	const auto& program = ctx.state.program;
 	StructuredFunctionState structured;
 	ctx.state.builder.AddFunction(spv::OpBranch, program.blocks.front()->Definition());
+	HalfLoopStats half_loop;
+	const bool    half_loop_on = HalfLoopEnabled(ctx.state);
 	for (size_t index = 0; index < program.blocks.size(); index++) {
 		const auto* block = program.blocks[index];
-		EmitBlock(ctx, block, [&](ValueEmitContext& lane, const IR::Inst& inst) {
-			EmitStructuredInstruction(lane, structured, inst);
-		});
+		EmitBlock(
+		    ctx, block,
+		    [&](ValueEmitContext& lane, const IR::Inst& inst) { EmitStructuredInstruction(lane, structured, inst); },
+		    half_loop_on ? &half_loop : nullptr);
 		EmitBackEdgeGuard(ctx, block);
 		EmitWatchdogTripReport(ctx, block); // KYTY_DIAG_RT_TRIPS
 		structured.block_exit_labels.emplace(block, ctx.state.current_label);
 		EmitStructuredTerminator(ctx, block);
 	}
 	PatchStructuredPhis(ctx, structured);
+	if (half_loop_on) {
+		std::fprintf(stderr, "HALF_LOOP hash=%016llx runs=%llu instructions=%llu live_in=%llu live_out=%llu\n",
+		             static_cast<unsigned long long>(program.shader_hash), static_cast<unsigned long long>(half_loop.runs),
+		             static_cast<unsigned long long>(half_loop.instructions),
+		             static_cast<unsigned long long>(half_loop.live_in), static_cast<unsigned long long>(half_loop.live_out));
+	}
 }
 
 void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState& dispatcher) {
