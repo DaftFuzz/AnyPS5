@@ -6600,9 +6600,17 @@ void BufferCache::RedoHandbackWrittenDuringFlight(const EagerReadback& entry) {
 			if (!tick || *tick <= entry.tick) continue;
 			const uint64_t a = std::max(start, key << 16u);
 			const uint64_t b = std::min(end, (key + 1u) << 16u);
-			GpuDirtyAdd(a, b - a);
-			redone.fetch_add(1, std::memory_order_relaxed);
-			redone_bytes.fetch_add(b - a, std::memory_order_relaxed);
+			// Only on pages still GPU-modified and not CPU-dirty: a page another download opened (its copy had landed) and the
+			// guest wrote since holds the newest bytes in guest memory, and a CPU-dirty page never holds GPU-dirty bytes.
+			for (uint64_t lo = a; lo < b;) {
+				const uint64_t hi = std::min(b, (lo & ~(TRACKER_PAGE_SIZE - 1)) + TRACKER_PAGE_SIZE);
+				if (m_memory_tracker.IsRegionGpuModified(lo, hi - lo) && !m_memory_tracker.IsRegionCpuModified(lo, hi - lo)) {
+					GpuDirtyAdd(lo, hi - lo);
+					redone.fetch_add(1, std::memory_order_relaxed);
+					redone_bytes.fetch_add(hi - lo, std::memory_order_relaxed);
+				}
+				lo = hi;
+			}
 		}
 	}
 	if ((applied.load(std::memory_order_relaxed) & 0xffu) == 0 && Common::EnvRead::PerfLines()) {
@@ -6624,7 +6632,7 @@ void BufferCache::VerifyCopyReadback(const EagerReadback& entry) {
 		std::erase_if(m_handback_late, [&](const HandbackLate& late) {
 			if (now < late.frame + 3u) return false;
 			any = true;
-			if (C0ByteChangedAfter(late.address, late.tick)) {
+			if (C0ByteChangedAfter(late.address, late.tick, late.verify)) {
 				explained++;
 			} else {
 				confirmed++;
@@ -6660,19 +6668,30 @@ void BufferCache::VerifyCopyReadback(const EagerReadback& entry) {
 		if (!buffer.IsCoherent()) buffer.Invalidate(0, buffer.Size());
 		if (from_mapping.size() < size) from_mapping.resize(size);
 		CopyFromWriteCombined(from_mapping.data(), buffer.Mapped().data() + (start - buffer.CpuAddress()), size);
+		// Pages the guest wrote since another download opened them (that download waited for this copy first, which marked it
+		// done before this apply): guest memory holds newer bytes there, so they are not compared.
+		static std::atomic<uint64_t> cpu_pages_skipped {0};
+		for (uint64_t lo = start; lo < end;) {
+			const uint64_t hi = std::min(end, (lo & ~(TRACKER_PAGE_SIZE - 1)) + TRACKER_PAGE_SIZE);
+			if (m_memory_tracker.IsRegionCpuModified(lo, hi - lo)) {
+				std::memcpy(from_mapping.data() + (lo - start), reinterpret_cast<const uint8_t*>(view + backing + (lo - start)), hi - lo);
+				cpu_pages_skipped.fetch_add(1, std::memory_order_relaxed);
+			}
+			lo = hi;
+		}
 		verified++;
 		if (std::memcmp(from_mapping.data(), reinterpret_cast<const uint8_t*>(view + backing), size) != 0) {
 			static std::atomic_uint logged {0};
 			if (mismatched++ == 0 && logged.fetch_add(1) < 16u) {
-				std::fprintf(stderr, "PERF_COPY_HANDBACK_MISMATCH addr=0x%llx size=%llu frame=%u\n",
+				std::fprintf(stderr, "PERF_COPY_HANDBACK_MISMATCH addr=0x%llx size=%llu frame=%u cpu_pages_skipped_total=%llu\n",
 				             static_cast<unsigned long long>(start), static_cast<unsigned long long>(size),
-				             DebugPresentCount().load());
+				             DebugPresentCount().load(), static_cast<unsigned long long>(cpu_pages_skipped.load()));
 			}
 			if (BarGpuCopyVerifyMode() == 2u && UploadClobberCheck()) {
 				const auto* g = reinterpret_cast<const uint8_t*>(view + backing);
 				uint64_t    i = 0;
 				while (i < size && from_mapping[i] == g[i]) i++;
-				if (m_handback_late.size() < 4096u) m_handback_late.push_back({start + i, entry.tick, DebugPresentCount().load()});
+				if (m_handback_late.size() < 4096u) m_handback_late.push_back({start + i, entry.tick, DebugPresentCount().load(), m_scheduler.CurrentTick()});
 			}
 			if (detail_lines.fetch_add(1) < 64u) {
 				const auto* guest = reinterpret_cast<const uint8_t*>(view + backing);
