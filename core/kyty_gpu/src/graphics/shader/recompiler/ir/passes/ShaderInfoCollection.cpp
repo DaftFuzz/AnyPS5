@@ -10,7 +10,10 @@
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
 
+thread_local bool t_soft_fail = false;
+
 [[noreturn]] void Fail(std::string_view message) {
+	if (t_soft_fail) throw ShaderInfoRejected {message.data()};
 	EXIT("shader info collection failed: %s", std::string(message).c_str());
 	std::abort();
 }
@@ -586,6 +589,14 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 }
 
 } // namespace
+
+ShaderInfoSoftFailScope::ShaderInfoSoftFailScope(): m_previous(t_soft_fail) {
+	t_soft_fail = true;
+}
+
+ShaderInfoSoftFailScope::~ShaderInfoSoftFailScope() {
+	t_soft_fail = m_previous;
+}
 
 bool StageInputsFit(const Program& program, ShaderStageInputInfo input_info, uint32_t& index, uint32_t& count) {
 	const bool vertex = program.stage == ShaderType::Vertex || program.stage == ShaderType::Local;

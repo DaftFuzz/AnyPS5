@@ -2971,8 +2971,23 @@ bool ShaderPrecompiler::CompileModule(const PrecompileStageRecord& record, uint6
 		return true;
 	}
 	const auto   compile_begin = std::chrono::steady_clock::now();
-	auto result = ShaderRecompiler::CompileProgram(std::move(translated), options, record.specialization,
-	                                               record.push_data_start);
+	std::optional<ShaderRecompiler::CompileResult> compiled;
+	try {
+		const ShaderRecompiler::IR::ShaderInfoSoftFailScope soft_fail;
+		compiled.emplace(ShaderRecompiler::CompileProgram(std::move(translated), options, record.specialization, record.push_data_start));
+	} catch (const ShaderRecompiler::IR::ShaderInfoRejected& rejected) {
+		m_rejected.fetch_add(1, std::memory_order_relaxed);
+		static std::atomic_uint logged {0};
+		if (logged.fetch_add(1) < 16u) {
+			std::fprintf(stderr, "SHADER_PRECOMPILE_INFO_REJECT hash=0x%016llx stage=%s key=%s reason=%s (skipped; the GPU thread compiles it "
+			             "from its own state)\n",
+			             static_cast<unsigned long long>(record.shader_hash), StageName(record.stage), HexKey(record.Key()).c_str(),
+			             rejected.message != nullptr ? rejected.message : "?");
+			std::fflush(stderr);
+		}
+		return false;
+	}
+	auto&        result     = *compiled;
 	const double compile_ms = MillisecondsSince(compile_begin);
 	g_reuse.jobs.fetch_add(1, std::memory_order_relaxed);
 	g_reuse.translate_us.fetch_add(static_cast<uint64_t>(translated_ms * 1000.0), std::memory_order_relaxed);
