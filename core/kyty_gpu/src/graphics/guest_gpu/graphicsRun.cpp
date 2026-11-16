@@ -1511,6 +1511,46 @@ static uint32_t ResolveFaultEvery() {
 // Based on TheCruZ/KytyPS5-GTA daaf45201 (graphicsRun.cpp), GPL-2.0.
 static std::atomic<GuestGpu*> g_scout_gpu {nullptr};
 
+#if defined(_WIN32)
+static std::atomic<uint64_t> g_cxx_throws_gcc {0};
+static std::atomic<uint64_t> g_cxx_throws_msvc {0};
+extern "C" __declspec(dllimport) void* __stdcall AddVectoredExceptionHandler(unsigned long first, long(__stdcall* handler)(void*));
+static long __stdcall CountCxxThrows(void* pointers) {
+	const auto code = **static_cast<const uint32_t* const*>(pointers);
+	if (code == 0x20474343u) g_cxx_throws_gcc.fetch_add(1, std::memory_order_relaxed);
+	else if (code == 0xE06D7363u) g_cxx_throws_msvc.fetch_add(1, std::memory_order_relaxed);
+	return 0;
+}
+static bool CxxThrowCountOn() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_TRACE_CXX_THROWS");
+		if (value == nullptr || value[0] != '1') return false;
+		AddVectoredExceptionHandler(0, CountCxxThrows);
+		std::fprintf(stderr, "TRACE_CXX_THROWS on: C++ throws counted by a vectored handler (first chance)\n");
+		return true;
+	}();
+	return on;
+}
+static void ReportCxxThrows() {
+	static uint64_t last_gcc = 0, last_msvc = 0;
+	static uint32_t last_present = 0;
+	const uint64_t  gcc     = g_cxx_throws_gcc.load(std::memory_order_relaxed);
+	const uint64_t  msvc    = g_cxx_throws_msvc.load(std::memory_order_relaxed);
+	const uint32_t  present = DebugPresentCount().load(std::memory_order_relaxed);
+	const uint32_t  frames  = present - last_present;
+	std::fprintf(stderr, "PERF cxx_throws gcc=%llu msvc=%llu window_gcc=%llu window_msvc=%llu presents=%u per_present=%.2f\n",
+	             static_cast<unsigned long long>(gcc), static_cast<unsigned long long>(msvc),
+	             static_cast<unsigned long long>(gcc - last_gcc), static_cast<unsigned long long>(msvc - last_msvc), frames,
+	             frames != 0u ? static_cast<double>((gcc - last_gcc) + (msvc - last_msvc)) / frames : 0.0);
+	last_gcc     = gcc;
+	last_msvc    = msvc;
+	last_present = present;
+}
+#else
+static bool CxxThrowCountOn() { return false; }
+static void ReportCxxThrows() {}
+#endif
+
 void GuestGpu::ResolveThread() {
 	KYTY_PROFILER_THREAD("Thread_GpuResolve");
 	// The command processor's SMT sibling: the operations it writes are in that core's caches; the helper resolves.
@@ -1604,11 +1644,12 @@ void GuestGpu::ResolveThread() {
 		}
 	};
 	for (;;) {
-		if (scout && CompileJobsEnabled()) {
+		if ((scout && CompileJobsEnabled()) || CxxThrowCountOn()) {
 			const auto now = std::chrono::steady_clock::now();
 			if (now - jobs_report_at >= std::chrono::seconds(10)) {
 				jobs_report_at = now;
 				m_renderer.GetPipelineCache().ReportCompileJobs();
+				if (CxxThrowCountOn()) ReportCxxThrows();
 			}
 		}
 		auto operation = m_operations.TryPop();
