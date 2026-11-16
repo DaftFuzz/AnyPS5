@@ -1298,6 +1298,15 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 		MemoryTracker::s_census_hook = [](uint64_t vaddr, uint64_t size, uint32_t kind, uint64_t site) {
 			constexpr std::array<C0Event, 4> map {C0Event::Mark, C0Event::CleanMark, C0Event::Unmark, C0Event::Release};
 			g_c0_census->C0Note(vaddr, size, map[kind & 3u], site);
+			// A GPU-modified mark removed off the GPU thread (the buffer cache's tracker state is the GPU thread's).
+			if ((kind & 3u) >= 2u && !GuestGpu::IsGpuThread()) {
+				static std::atomic_uint logged {0};
+				if (logged.fetch_add(1, std::memory_order_relaxed) < 32u) {
+					std::fprintf(stderr, "TRACKER_UNMARK_OFF_GPU_THREAD kind=%u addr=0x%llx size=0x%llx site=0x%llx frame=%u\n", kind & 3u,
+					             static_cast<unsigned long long>(vaddr), static_cast<unsigned long long>(size),
+					             static_cast<unsigned long long>(site), DebugPresentCount().load());
+				}
+			}
 		};
 		// The tag of a tracker event is a return address: this anchor's address lets the link map name the caller.
 		std::fprintf(stderr, "D6_C0 census site anchor C0SiteAnchor=0x%llx\n",
@@ -6689,6 +6698,33 @@ void BufferCache::VerifyCopyReadback(const EagerReadback& entry) {
 		}
 		verified++;
 		if (std::memcmp(from_mapping.data(), reinterpret_cast<const uint8_t*>(view + backing), size) != 0) {
+			// After the compare: a differing page another thread opened (or the guest wrote) meanwhile is a race with the guest,
+			// not stale bytes; one still GPU-modified and CPU-clean is a mismatch (e.g. an older publish written after the copy).
+			bool     live_diff = false;
+			uint64_t raced_at  = 0;
+			for (uint64_t lo = start; lo < end && !live_diff;) {
+				const uint64_t hi = std::min(end, (lo & ~(TRACKER_PAGE_SIZE - 1)) + TRACKER_PAGE_SIZE);
+				if (std::memcmp(from_mapping.data() + (lo - start), reinterpret_cast<const uint8_t*>(view + backing + (lo - start)), hi - lo) != 0) {
+					if (m_memory_tracker.IsRegionGpuModified(lo, hi - lo) && !m_memory_tracker.IsRegionCpuModified(lo, hi - lo)) {
+						live_diff = true;
+					} else if (raced_at == 0) {
+						raced_at = lo;
+					}
+				}
+				lo = hi;
+			}
+			if (!live_diff) {
+				static std::atomic<uint64_t> raced {0};
+				static std::atomic_uint      raced_lines {0};
+				const uint64_t               n = raced.fetch_add(1, std::memory_order_relaxed) + 1u;
+				if (raced_lines.fetch_add(1, std::memory_order_relaxed) < 16u) {
+					std::fprintf(stderr, "HANDBACK_VERIFY_RACED page=0x%llx write_tick=%llu cur=%llu frame=%u total=%llu\n",
+					             static_cast<unsigned long long>(raced_at & ~(TRACKER_PAGE_SIZE - 1)),
+					             static_cast<unsigned long long>(entry.tick), static_cast<unsigned long long>(m_scheduler.CurrentTick()),
+					             DebugPresentCount().load(), static_cast<unsigned long long>(n));
+				}
+				continue;
+			}
 			static std::atomic_uint logged {0};
 			if (mismatched++ == 0 && logged.fetch_add(1) < 16u) {
 				std::fprintf(stderr, "PERF_COPY_HANDBACK_MISMATCH addr=0x%llx size=%llu frame=%u cpu_pages_skipped_total=%llu\n",
