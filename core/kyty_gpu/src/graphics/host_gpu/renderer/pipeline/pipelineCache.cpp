@@ -3936,6 +3936,9 @@ void PipelineCache::QueueAheadGraphicsMiss(const ResolvedStages& results, const 
 	if (m_precompiler == nullptr || vertex_info.size() != 1u || vertex_info[0].logical_stage != ShaderType::Vertex) return;
 	const bool ps_active = ps_input_info != nullptr;
 	if (results.count != (ps_active ? 2u : 1u)) return;
+	uint32_t pixel_stages = 0;
+	for (uint32_t i = 0; i < results.count; i++) pixel_stages += results.stages[i].stage == ShaderType::Pixel ? 1u : 0u;
+	if (pixel_stages != (ps_active ? 1u : 0u)) return;
 	uint64_t mark = GraphicsPipelineKeyHash {}(key) ^ (uint64_t {results.push_start} << 1u);
 	for (uint32_t i = 0; i < results.count; i++) {
 		mark = mark * 0x9e3779b97f4a7c15ull ^ results.stages[i].shader_hash ^ (results.standin_missing[i] ? 0x55u : 0u);
@@ -3980,10 +3983,10 @@ void PipelineCache::QueueAheadGraphicsMiss(const ResolvedStages& results, const 
 			if (PrecompileCodeHash(rec.code, {}) != r.shader_hash) return;
 			rec.specialization = r.specialization;
 			if (!r.null_share_kinds.empty()) ShaderRecompiler::IR::PeekNullFormattedShare(*r.plan, r.null_share_kinds, rec.specialization);
-			if (i == 0) {
-				rec.vertex       = miss->vertex;
-			} else {
+			if (r.stage == ShaderType::Pixel) {
 				rec.pixel        = miss->pixel;
+			} else {
+				rec.vertex       = miss->vertex;
 			}
 		} else {
 			rec.specialization = *ProgramCache::PermutationSpecialization(results.standin_permutations[i]);

@@ -3456,9 +3456,11 @@ void ShaderPrecompiler::RunGraphicsMiss(RuntimeJob& job) {
 		}
 		infos[i]->bindings.AdvancePushData(cursor);
 	}
+	const uint32_t vi = m.ps_active && m.stages[0].record.stage == ShaderType::Pixel ? 1u : 0u;
+	const uint32_t pi = 1u - vi;
 	PrecompileGraphicsRecord record;
-	record.vertex[0]     = keys[0];
-	record.pixel         = m.ps_active ? keys[1] : 0u;
+	record.vertex[0]     = keys[vi];
+	record.pixel         = m.ps_active ? keys[pi] : 0u;
 	record.rendering     = m.rendering;
 	record.vertex_input  = m.vertex_input;
 	record.static_params = m.static_params;
@@ -3475,12 +3477,12 @@ void ShaderPrecompiler::RunGraphicsMiss(RuntimeJob& job) {
 	}
 	const ShaderRecompiler::IR::ResourceSnapshot no_resources {};
 	ShaderVertexInputInfo                        vertex = m.vertex;
-	vertex.stage                                        = {.program = infos[0], .resources = &no_resources};
+	vertex.stage                                        = {.program = infos[vi], .resources = &no_resources};
 	ShaderPixelInputInfo pixel                          = m.pixel;
-	if (m.ps_active) pixel.stage = {.program = infos[1], .resources = &no_resources};
+	if (m.ps_active) pixel.stage = {.program = infos[pi], .resources = &no_resources};
 	PipelineCache::GraphicsPrograms programs;
-	programs.vertex[0] = {.id = ~uint64_t {0} - 1u, .module = modules[0]};
-	if (m.ps_active) programs.pixel = {.id = ~uint64_t {0} - 2u, .module = modules[1]};
+	programs.vertex[0] = {.id = ~uint64_t {0} - 1u, .module = modules[vi]};
+	if (m.ps_active) programs.pixel = {.id = ~uint64_t {0} - 2u, .module = modules[pi]};
 	PipelineCache::Pipeline pipeline;
 	CreatePipelineInternal(m_graphics, pipeline, m.rendering, m.vertex_input, std::span<const ShaderVertexInputInfo>(&vertex, 1),
 	                       m.ps_active ? &pixel : nullptr, programs, m.static_params, m_driver_cache);
