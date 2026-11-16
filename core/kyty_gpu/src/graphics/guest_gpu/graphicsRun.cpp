@@ -1852,7 +1852,7 @@ void GuestGpu::ResolveHelperThread(uint32_t index) {
 		return !(oracle != nullptr && oracle[0] == '2');
 	}();
 	constexpr uint64_t PlanMargin = 32;
-	static const bool  dispatch_plans = RenderExecutor::DispatchPlanPossible();
+	static const bool  dispatch_plans = RenderExecutor::DispatchPlanPossible() || RenderExecutor::DispatchPrepPossible();
 	while (auto task = tasks.Pop()) {
 		if (helper_plans && task->member && !task->dispatch) {
 			const uint64_t claimed = m_tasks_claimed.load(std::memory_order_relaxed);

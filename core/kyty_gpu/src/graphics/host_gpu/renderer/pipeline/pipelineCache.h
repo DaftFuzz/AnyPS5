@@ -397,6 +397,7 @@ public:
 	// N4.3: a plan's pipeline taken as GetGraphicsPipeline[Async] takes a found one (housekeeping, last_used); null when its
 	// objects were given back (today's lookup recreates them).
 	[[nodiscard]] Pipeline* TakePlannedPipeline(Pipeline* planned);
+	[[nodiscard]] Pipeline* FindComputePipelineEntry(uint64_t program_id) const;
 	[[nodiscard]] size_t GraphicsPipelineCount() const { return m_graphics_pipelines.size() + m_table_pending.size(); }
 	void QueueAheadGraphicsPipeline(const GraphicsPipelineKey& key, std::span<const ShaderVertexInputInfo> vertex_info,
 	                                const ShaderPixelInputInfo* ps_input_info, const GraphicsPrograms& programs);

@@ -3453,6 +3453,12 @@ PipelineCache::Pipeline* PipelineCache::TakePlannedPipeline(Pipeline* planned) {
 	return planned;
 }
 
+PipelineCache::Pipeline* PipelineCache::FindComputePipelineEntry(uint64_t program_id) const {
+	const std::shared_lock pipelines_lock(m_pipelines_mutex);
+	const auto             iter = m_compute_pipelines.find(program_id);
+	return iter != m_compute_pipelines.end() ? iter->second.get() : nullptr;
+}
+
 std::pair<PipelineCache::Pipeline*, PipelineCache::PipelineFind> PipelineCache::FindGraphicsPipeline(
     const GraphicsPipelineKey& key, bool read_object) const {
 	const std::shared_lock pipelines_lock(m_pipelines_mutex); // N5.1: a resolve helper may ask
@@ -4940,7 +4946,9 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	}
 
 	cached->last_used     = static_cast<uint32_t>(DebugPresentCount().load());
+	std::unique_lock insert_lock(m_pipelines_mutex);
 	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
+	insert_lock.unlock();
 	EXIT_IF(!inserted);
 	// (Upstream 959bee479 checkpoints the driver cache here; ours saves it with SaveIfDue, m_pipelines_since_save.)
 

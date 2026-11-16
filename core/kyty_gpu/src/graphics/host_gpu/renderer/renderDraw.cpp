@@ -4008,6 +4008,10 @@ struct RenderExecutor::ResolvedDraw {
 		std::pair<PipelineCache::Pipeline*, PipelineCache::PipelineFind> find {nullptr, PipelineCache::PipelineFind::Count};
 		std::vector<std::pair<const void*, PeekStageImagesResult>>      images;
 		std::vector<PlanBuffer>                                          buffers; // N4.2b
+		PipelineCache::Pipeline*                                         compute_pipeline   = nullptr;
+		uint64_t                                                         compute_program_id = 0;
+		uint64_t                                                         meta_generation    = 0;
+		bool                                                             meta_free          = false;
 	} ahead;
 };
 
@@ -4041,6 +4045,9 @@ RenderExecutor::ResolvedDraw& RenderExecutor::NextResolvedDraw() {
 	draw.ahead.planned   = false;
 	draw.ahead.images.clear();
 	draw.ahead.buffers.clear();
+	draw.ahead.compute_pipeline   = nullptr;
+	draw.ahead.compute_program_id = 0;
+	draw.ahead.meta_free          = false;
 	draw.empty    = false;
 	draw.check    = nullptr;
 	draw.fault    = 0;
@@ -4119,7 +4126,7 @@ bool RenderExecutor::TakeResolvedDispatch(ShaderComputeInputInfo& input_info, Sh
 	input_info             = resolved->compute;
 	program                = resolved->compute_program;
 	t_compute_program_path = 3u; // KYTY_TRACE_DISPATCH_CENSUS
-	if (DispatchPlanPossible()) m_slot_taken = true;
+	if (DispatchPlanPossible() || DispatchPrepPossible()) m_slot_taken = true;
 	return true;
 }
 
@@ -4178,6 +4185,9 @@ void RenderExecutor::PeekAheadDispatch(ResolvedDraw* slot, uint32_t distance) {
 	slot->ahead.planned  = false;
 	slot->ahead.distance = distance;
 	slot->ahead.buffers.clear();
+	slot->ahead.compute_pipeline   = nullptr;
+	slot->ahead.compute_program_id = 0;
+	slot->ahead.meta_free          = false;
 	if (slot->empty || !slot->is_compute || !PipelineCache::StagesAdoptable(*slot->stages)) {
 		h.gated.fetch_add(1, std::memory_order_relaxed);
 		return;
@@ -4193,12 +4203,15 @@ void RenderExecutor::PeekAheadDispatch(ResolvedDraw* slot, uint32_t distance) {
 	}
 	PipelineCache::AheadSaved saved;
 	PipelineCache::InstallAhead(*slot->stages, saved);
-	for (uint32_t i = 0; i < PipelineCache::StageCount(*slot->stages); i++) {
-		const auto* program   = PipelineCache::AheadProgram(*slot->stages, i);
-		const auto* resources = PipelineCache::StageResources(*slot->stages, i);
-		if (program == nullptr || resources == nullptr) continue;
-		PeekStageBuffers(*program, *resources, PipelineCache::StageRecord(*slot->stages, i), distance, slot->ahead.buffers);
+	if (DispatchPlanPossible()) {
+		for (uint32_t i = 0; i < PipelineCache::StageCount(*slot->stages); i++) {
+			const auto* program   = PipelineCache::AheadProgram(*slot->stages, i);
+			const auto* resources = PipelineCache::StageResources(*slot->stages, i);
+			if (program == nullptr || resources == nullptr) continue;
+			PeekStageBuffers(*program, *resources, PipelineCache::StageRecord(*slot->stages, i), distance, slot->ahead.buffers);
+		}
 	}
+	if (DispatchPrepPossible()) PeekPrepDispatch(slot);
 	PipelineCache::RestoreAhead(*slot->stages, saved);
 	--t_translator;
 	if (!GuestGpu::IsGpuThread()) {
@@ -4250,6 +4263,248 @@ void RenderExecutor::DispatchPlanEnd() {
 		if (entry.used) e.answered++;
 	}
 	DispatchPlanReport();
+}
+
+namespace {
+bool DispatchPrepCheck() {
+	static const bool on = [] {
+		const char* text = std::getenv("KYTY_CHECK_DISPATCH_PREP");
+		return text != nullptr && text[0] == '2';
+	}();
+	return on;
+}
+
+uint64_t DispatchPrepFaultEvery() {
+	static const uint64_t every = [] {
+		const char*    text  = std::getenv("KYTY_CHECK_DISPATCH_PREP_FAULT");
+		const uint64_t value = text != nullptr ? std::strtoull(text, nullptr, 10) : 997u;
+		return value;
+	}();
+	return every;
+}
+
+uint32_t DispatchPrepFixed() {
+	static const uint32_t value = [] {
+		const char*    text = std::getenv("KYTY_PERF_DISPATCH_PREP");
+		const uint32_t v    = text != nullptr ? static_cast<uint32_t>(std::strtoul(text, nullptr, 10)) : 0u;
+		if (v != 0) {
+			std::fprintf(stderr,
+			             "KYTY_PERF_DISPATCH_PREP=%u: the resolve helpers find the compute pipeline and the metadata answer of direct "
+			             "dispatches%s\n",
+			             v, DispatchPrepCheck() ? " (KYTY_CHECK_DISPATCH_PREP=2: checked, not used)" : "");
+		}
+		return v;
+	}();
+	return value;
+}
+
+struct DispatchPrepHelperStats {
+	std::atomic<uint64_t> built {0}, no_program {0}, pipeline {0}, no_pipeline {0}, meta_free {0}, meta_has {0}, meta_busy {0},
+	    meta_shape {0}, meta_mode2 {0};
+};
+DispatchPrepHelperStats g_dispatch_prep_helper;
+
+struct DispatchPrepExecStats {
+	uint64_t taken = 0, absent = 0, programs_differ = 0, off = 0, checked = 0, shape = 0;
+	uint64_t pipeline_used = 0, pipeline_no_entry = 0, pipeline_id_differ = 0, pipeline_evicted = 0;
+	uint64_t meta_used = 0, meta_not_free = 0, meta_moved = 0;
+	uint64_t pipeline_compared = 0, pipeline_bad = 0, meta_compared = 0, meta_bad = 0, injected = 0, detected = 0, faults = 0;
+	uint64_t pipeline_today_ns = 0, pipeline_prep_ns = 0, pipeline_timed = 0, meta_today_ns = 0, meta_timed = 0;
+	std::chrono::steady_clock::time_point window = std::chrono::steady_clock::now();
+};
+DispatchPrepExecStats g_dispatch_prep_exec;
+
+void DispatchPrepReport() {
+	auto&      e   = g_dispatch_prep_exec;
+	const auto now = std::chrono::steady_clock::now();
+	if (now - e.window < std::chrono::seconds(5)) return;
+	e.window       = now;
+	auto&      h   = g_dispatch_prep_helper;
+	const auto get = [](const std::atomic<uint64_t>& a) { return static_cast<unsigned long long>(a.load(std::memory_order_relaxed)); };
+	const auto u   = [](uint64_t v) { return static_cast<unsigned long long>(v); };
+	const double pipeline_today = e.pipeline_timed != 0 ? static_cast<double>(e.pipeline_today_ns) / static_cast<double>(e.pipeline_timed) : 0.0;
+	const double pipeline_prep  = e.pipeline_timed != 0 ? static_cast<double>(e.pipeline_prep_ns) / static_cast<double>(e.pipeline_timed) : 0.0;
+	const double meta_today     = e.meta_timed != 0 ? static_cast<double>(e.meta_today_ns) / static_cast<double>(e.meta_timed) : 0.0;
+	const double saved_us       = (static_cast<double>(e.pipeline_used + e.pipeline_timed) * (pipeline_today - pipeline_prep) +
+                             static_cast<double>(e.meta_used + e.meta_timed) * meta_today) /
+	                        1000.0;
+	std::fprintf(stderr,
+	             "PERF dispatch_prep helper[built|no_program|pipeline|no_pipeline|meta_free|meta_has|meta_busy|meta_shape|meta_mode2]="
+	             "%llu|%llu|%llu|%llu|%llu|%llu|%llu|%llu|%llu exec[taken|absent|programs_differ|off|checked|shape]=%llu|%llu|%llu|%llu|%llu|%llu "
+	             "pipeline[used|no_entry|id_differ|evicted]=%llu|%llu|%llu|%llu meta[used|not_free|moved]=%llu|%llu|%llu "
+	             "check[pipeline_compared|pipeline_bad|meta_compared|meta_bad]=%llu|%llu|%llu|%llu fault[injected|detected]=%llu|%llu "
+	             "ns[pipeline_today|pipeline_prep|meta_today]=%.1f|%.1f|%.1f saved_us_est=%.0f\n",
+	             get(h.built), get(h.no_program), get(h.pipeline), get(h.no_pipeline), get(h.meta_free), get(h.meta_has),
+	             get(h.meta_busy), get(h.meta_shape), get(h.meta_mode2), u(e.taken), u(e.absent), u(e.programs_differ), u(e.off),
+	             u(e.checked), u(e.shape), u(e.pipeline_used), u(e.pipeline_no_entry), u(e.pipeline_id_differ), u(e.pipeline_evicted),
+	             u(e.meta_used), u(e.meta_not_free), u(e.meta_moved), u(e.pipeline_compared), u(e.pipeline_bad), u(e.meta_compared),
+	             u(e.meta_bad), u(e.injected), u(e.detected), pipeline_today, pipeline_prep, meta_today, saved_us);
+}
+
+bool DispatchPrepFault() {
+	auto& e = g_dispatch_prep_exec;
+	return DispatchPrepFaultEvery() != 0 && ++e.faults % DispatchPrepFaultEvery() == 0;
+}
+
+uint64_t DispatchPrepNs(std::chrono::steady_clock::time_point from, std::chrono::steady_clock::time_point to) {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(to - from).count());
+}
+} // namespace
+
+bool RenderExecutor::DispatchPrepPossible() {
+	static const bool possible = Common::LiveAb::Possible(Common::LiveAb::Switch::DispatchPrep, DispatchPrepFixed());
+	return possible;
+}
+
+void RenderExecutor::PeekPrepDispatch(ResolvedDraw* slot) {
+	auto&       h         = g_dispatch_prep_helper;
+	const auto* program   = PipelineCache::AheadProgram(*slot->stages, 0);
+	const auto* resources = PipelineCache::StageResources(*slot->stages, 0);
+	h.built.fetch_add(1, std::memory_order_relaxed);
+	if (PipelineCache::StageCount(*slot->stages) != 1u || program == nullptr || resources == nullptr) {
+		h.no_program.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	slot->ahead.compute_program_id = slot->compute_program.id;
+	if (slot->compute_program.id != 0) {
+		slot->ahead.compute_pipeline = m_context.GetPipelineCache().FindComputePipelineEntry(slot->compute_program.id);
+	}
+	(slot->ahead.compute_pipeline != nullptr ? h.pipeline : h.no_pipeline).fetch_add(1, std::memory_order_relaxed);
+	if (TextureCache::HtileSliceClearMode() == 2u) {
+		h.meta_mode2.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	if (program->info.buffers.size() != resources->buffers.size()) {
+		h.meta_shape.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	thread_local std::vector<uint64_t> addresses;
+	addresses.clear();
+	for (size_t i = 0; i < program->info.buffers.size(); i++) {
+		addresses.push_back(DecodeNativeDescriptor<ShaderBufferResource>(resources->buffers[i]).Base48());
+	}
+	switch (m_context.GetTextureCache().PeekNoMeta(addresses, slot->ahead.meta_generation)) {
+		case TextureCache::MetaPeek::Free:
+			slot->ahead.meta_free = true;
+			h.meta_free.fetch_add(1, std::memory_order_relaxed);
+			break;
+		case TextureCache::MetaPeek::Has: h.meta_has.fetch_add(1, std::memory_order_relaxed); break;
+		case TextureCache::MetaPeek::Busy: h.meta_busy.fetch_add(1, std::memory_order_relaxed); break;
+	}
+}
+
+void RenderExecutor::DispatchPrepBegin() {
+	m_dispatch_prep = 0;
+	if (!DispatchPrepPossible() || ChunkCensus::CheckOn()) return;
+	auto& e = g_dispatch_prep_exec;
+	e.taken++;
+	if (!PlanPresent()) {
+		e.absent++;
+		DispatchPrepReport();
+		return;
+	}
+	if (!PlanProgramsHold()) {
+		e.programs_differ++;
+		DispatchPrepReport();
+		return;
+	}
+	const bool check = DispatchPrepCheck();
+	if (!check && Common::LiveAb::Gate(Common::LiveAb::Switch::DispatchPrep, DispatchPrepFixed()) == 0u) {
+		e.off++;
+		DispatchPrepReport();
+		return;
+	}
+	if (check) e.checked++;
+	m_dispatch_prep = check ? 2u : 1u;
+}
+
+bool RenderExecutor::DispatchPrepMetaFree(const ShaderComputeInputInfo& input_info) {
+	if (m_dispatch_prep == 0u) return false;
+	auto&       e      = g_dispatch_prep_exec;
+	const auto& ah     = m_resolved_draw->ahead;
+	const auto& stages = *m_resolved_draw->stages;
+	if (input_info.stage.program != PipelineCache::AdoptedProgram(stages, 0) ||
+	    input_info.stage.resources != PipelineCache::StageResources(stages, 0)) {
+		e.shape++;
+		return false;
+	}
+	if (!ah.meta_free) {
+		e.meta_not_free++;
+		return false;
+	}
+	auto& cache = m_context.GetTextureCache();
+	if (cache.MetaGeneration() != ah.meta_generation) {
+		e.meta_moved++;
+		return false;
+	}
+	if (m_dispatch_prep == 1u) {
+		e.meta_used++;
+		return true;
+	}
+	const auto& program   = *input_info.stage.program;
+	const auto& resources = *input_info.stage.resources;
+	const bool  inside    = TextureCache::HtileSliceClearMode() != 0u;
+	const auto  start     = std::chrono::steady_clock::now();
+	bool        today_has = program.info.buffers.size() != resources.buffers.size();
+	for (size_t i = 0; !today_has && i < program.info.buffers.size(); i++) {
+		const uint64_t address = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]).Base48();
+		today_has              = inside ? cache.IsMetaOrInside(address) : cache.IsMeta(address);
+	}
+	e.meta_today_ns += DispatchPrepNs(start, std::chrono::steady_clock::now());
+	e.meta_timed++;
+	e.meta_compared++;
+	if (today_has) e.meta_bad++;
+	if (DispatchPrepFault()) {
+		e.injected++;
+		if (!today_has) e.detected++;
+	}
+	DispatchPrepReport();
+	return false;
+}
+
+PipelineCache::Pipeline& RenderExecutor::DispatchPrepPipeline(const ShaderComputeInputInfo& input_info, const ShaderProgram& program) {
+	auto& pc = m_context.GetPipelineCache();
+	if (m_dispatch_prep == 0u) return pc.GetComputePipeline(input_info, program);
+	auto&                    e         = g_dispatch_prep_exec;
+	const auto&              ah        = m_resolved_draw->ahead;
+	PipelineCache::Pipeline* candidate = nullptr;
+	if (ah.compute_pipeline == nullptr) {
+		e.pipeline_no_entry++;
+	} else if (ah.compute_program_id != program.id) {
+		e.pipeline_id_differ++;
+	} else if (ah.compute_pipeline->pipeline == nullptr) {
+		e.pipeline_evicted++;
+	} else {
+		candidate = ah.compute_pipeline;
+	}
+	if (candidate == nullptr) {
+		DispatchPrepReport();
+		return pc.GetComputePipeline(input_info, program);
+	}
+	if (m_dispatch_prep == 1u) {
+		auto* taken = pc.TakePlannedPipeline(candidate);
+		DispatchPrepReport();
+		if (taken == nullptr) return pc.GetComputePipeline(input_info, program);
+		e.pipeline_used++;
+		return *taken;
+	}
+	const auto start   = std::chrono::steady_clock::now();
+	auto*      taken   = pc.TakePlannedPipeline(candidate);
+	const auto middle  = std::chrono::steady_clock::now();
+	auto&      today   = pc.GetComputePipeline(input_info, program);
+	const auto end     = std::chrono::steady_clock::now();
+	e.pipeline_prep_ns += DispatchPrepNs(start, middle);
+	e.pipeline_today_ns += DispatchPrepNs(middle, end);
+	e.pipeline_timed++;
+	e.pipeline_compared++;
+	if (taken != &today) e.pipeline_bad++;
+	if (DispatchPrepFault()) {
+		e.injected++;
+		const auto* wrong = reinterpret_cast<const PipelineCache::Pipeline*>(reinterpret_cast<uintptr_t>(taken) ^ uintptr_t {64});
+		if (wrong != &today) e.detected++;
+	}
+	DispatchPrepReport();
+	return today;
 }
 
 void RenderExecutor::ReleaseResolvedDraw(ResolvedDraw* resolved) noexcept {

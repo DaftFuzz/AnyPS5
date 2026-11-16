@@ -444,6 +444,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			compute_program = m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
 		}
 	}
+	DispatchPrepBegin();
 	census_timer.Mark(2);
 	floor_phase.Next(ChunkLead::FpD3);
 	// (Upstream also starts its image heap here, ImageHeap::BeginDraw; not in use, RenderContext::ImageHeapEnabled.)
@@ -466,11 +467,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	const auto& resources = *input_info.stage.resources;
 	if (ComputeTrace::ProxyPhaseOn()) ComputeTrace::ProxyPhaseNote(program.shader_hash, &resources);
 	if (DispatchCensusTimer::Enabled()) census_timer.NoteDispatch(input_info, mode); // KYTY_TRACE_DISPATCH_CENSUS
-	RecordHtileRewriteClear(m_context.GetTextureCache(), input_info, buffer);
+	const bool meta_free = DispatchPrepMetaFree(input_info);
+	if (!meta_free) RecordHtileRewriteClear(m_context.GetTextureCache(), input_info, buffer);
 	// upstream 01ce9738: metadata addresses can be reused as ordinary buffers, so a metadata write only records the
 	// clear state and the dispatch still runs (the guest's stores are kept).
 	if (resources.specialization_reads.empty()) {
-		UpdateComputeMetaClears(input_info, buffer);
+		if (!meta_free) UpdateComputeMetaClears(input_info, buffer);
 		if (TryConsumeComputeImageClear(input_info, buffer, thread_group_x, thread_group_y, thread_group_z, mode)) {
 			ResetBindings();
 			return;
@@ -504,7 +506,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	census_timer.Mark(3);
 	floor_phase.Next(ChunkLead::FpD4);
 	std::optional<DispatchSubTimer> sub_timer(std::in_place, DispatchSub::Pipeline); // KYTY_TRACE_DISPATCH_CENSUS
-	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	auto& pipeline = DispatchPrepPipeline(input_info, compute_program);
 	auto& bindings = m_compute_bindings;
 	PreparedBindings* descriptor_stage = &bindings;
 	// KYTY_CHECK_CHUNKS=2 (project 15, the oracle v2): a chunk-member dispatch is prepared once more before its preparation;

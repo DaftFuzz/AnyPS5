@@ -63,6 +63,7 @@ enum class Switch : uint32_t {
 	DeferReadProtect,      // KYTY_PERF_DEFER_READ_PROTECT (graphics/host_gpu/faultPath.h)
 	LogBuffer,
 	DispatchPlan,
+	DispatchPrep,
 	Count
 };
 

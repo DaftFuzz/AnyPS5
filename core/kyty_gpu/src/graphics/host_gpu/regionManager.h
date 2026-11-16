@@ -159,6 +159,14 @@ public:
 		}
 		return true;
 	}
+	[[nodiscard]] bool try_lock_read() noexcept {
+		if (m_lock.test(std::memory_order_relaxed) || m_lock.test_and_set(std::memory_order_acquire)) {
+			return false;
+		}
+		m_owner.store(CurrentThread(), std::memory_order_relaxed);
+		if (m_perf_site == PerfLockSiteTextureCache) t_tc_lock_held++;
+		return true;
+	}
 	void unlock() noexcept {
 		EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) != CurrentThread());
 		if (m_perf_site == PerfLockSiteTextureCache) {

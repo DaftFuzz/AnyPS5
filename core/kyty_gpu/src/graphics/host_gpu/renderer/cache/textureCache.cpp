@@ -486,6 +486,7 @@ void TextureCache::DeleteImage(ImageId id) {
 		    image->info.metadata.kind == ImageMetadataKind::Htile &&
 		    metadata->second.type == MetaDataInfo::Type::HTile) {
 			// A later binding may have reused this address for another metadata type.
+			NoteMetaChange();
 			m_surface_metas.erase(metadata);
 		}
 	}
@@ -2424,6 +2425,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		auto& image         = m_slot_images[id];
 		image.info.metadata = desc.info.metadata;
 		// Native color metadata must not retain a reused HTile/CMask/FMask clear flag.
+		NoteMetaChange();
 		m_surface_metas.erase(range.address);
 		if (range.size == 0 || desc.info.resources.levels != 1) {
 			if (range.size != 0) Common::WorkaroundHits::Note(Common::WorkaroundHits::Hit::DccLevels); // KYTY_TRACE_PERF
@@ -3649,6 +3651,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 		if (inserted) DrawRepeat::NoteImageRegistryChange(desc.info.stencil.address, 1);
 	}
 	if (desc.info.HasMetadata()) {
+		NoteMetaChange();
 		const auto [entry, inserted] =
 		    m_surface_metas.emplace(desc.info.metadata.range.address,
 		                            MetaDataInfo {.type       = MetaDataInfo::Type::HTile,
@@ -4599,6 +4602,22 @@ bool TextureCache::IsMetaOrInside(uint64_t address) {
 	return m_surface_metas.find(address) != m_surface_metas.end() || FindMetaInside(address) != m_surface_metas.end();
 }
 
+TextureCache::MetaPeek TextureCache::PeekNoMeta(std::span<const uint64_t> addresses, uint64_t& generation) {
+	const bool inside = HtileSliceClearMode() != 0u;
+	if (!m_lock.try_lock_read()) return MetaPeek::Busy;
+	generation  = m_meta_generation.load(std::memory_order_acquire);
+	bool found  = false;
+	for (const auto address: addresses) {
+		if (m_surface_metas.find(address) != m_surface_metas.end() ||
+		    (inside && FindMetaInside(address) != m_surface_metas.end())) {
+			found = true;
+			break;
+		}
+	}
+	m_lock.unlock();
+	return found ? MetaPeek::Has : MetaPeek::Free;
+}
+
 bool TextureCache::ClearMetaSlices(uint64_t address, uint64_t size, bool write, uint64_t hash) {
 	const bool check = HtileSliceClearMode() == 2u;
 	auto&      stats = SliceStats();
@@ -4613,6 +4632,7 @@ bool TextureCache::ClearMetaSlices(uint64_t address, uint64_t size, bool write, 
 				             static_cast<unsigned long long>(address), static_cast<unsigned long long>(size),
 				             static_cast<unsigned long long>(meta.size));
 			}
+			NoteMetaChange();
 			m_surface_metas.erase(found);
 			return false;
 		}
@@ -4761,6 +4781,7 @@ bool TextureCache::ClearMetaWrite(uint64_t address, uint64_t size) {
 			             static_cast<unsigned long long>(address), static_cast<unsigned long long>(size),
 			             static_cast<unsigned long long>(found->second.size));
 		}
+		NoteMetaChange();
 		m_surface_metas.erase(found);
 		return false;
 	}
@@ -4821,6 +4842,7 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 	for (auto metadata = m_surface_metas.begin(); metadata != m_surface_metas.end();) {
 		const auto base = metadata->first;
 		if (base >= address && base < address + size) {
+			NoteMetaChange();
 			metadata = m_surface_metas.erase(metadata);
 		} else {
 			++metadata;

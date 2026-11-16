@@ -230,6 +230,9 @@ public:
 	[[nodiscard]] static uint32_t HtileSliceClearMode();
 	// The address is registered metadata, or (KYTY_FIX_HTILE_SLICE_CLEAR) lies inside a registered HTILE's layers.
 	[[nodiscard]] bool IsMetaOrInside(uint64_t address);
+	enum class MetaPeek : uint8_t { Free, Has, Busy };
+	[[nodiscard]] MetaPeek PeekNoMeta(std::span<const uint64_t> addresses, uint64_t& generation);
+	[[nodiscard]] uint64_t MetaGeneration() const noexcept { return m_meta_generation.load(std::memory_order_acquire); }
 	// A read-modify-write clear of [address, address + size) (shader b25b01ff1361e795): off, it is ClearMeta(address);
 	// on, a write at the metadata's first byte clears every layer unless it covers a whole-layer part of it (then those
 	// layers), and a write inside the metadata clears the whole layers it covers.
@@ -643,6 +646,8 @@ private:
 	std::vector<std::unique_ptr<Buffer>>              m_cpu_read_buffers;
 	std::vector<std::unique_ptr<Buffer>>              m_cpu_read_buffers_busy;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
+	std::atomic<uint64_t>                             m_meta_generation {1};
+	void NoteMetaChange() noexcept { m_meta_generation.fetch_add(1, std::memory_order_acq_rel); }
 	// KYTY_WORKAROUND_DCC_FAST_CLEAR: metadata start address -> (filled size, clear key).
 	std::map<uint64_t, std::pair<uint64_t, uint8_t>> m_dcc_fills;
 	// KYTY_FIX_DCC_KNOWN_KEYS: GPU writes reported by the buffer cache, applied to m_dcc_fills
