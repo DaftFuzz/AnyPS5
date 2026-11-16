@@ -194,6 +194,26 @@ struct ResolvedStages {
 	}
 };
 
+struct PipelineCache::FirstUsePrebuilds {
+	struct Job {
+		std::atomic<uint8_t>      state {0}; // 0 queued, 1 running, 2 finished, 3 cancelled by the GPU thread
+		PrecompileGraphicsRecord  record;
+		uint64_t                  vs_spirv = 0, ps_spirv = 0;
+		std::unique_ptr<Pipeline> pipeline;
+		std::vector<vk::ShaderModule>                                             modules;
+		std::array<std::unique_ptr<ShaderRecompiler::IR::CompiledShaderInfo>, 2> infos;
+		std::unique_ptr<ShaderRecompiler::IR::ResourceSnapshot>                   no_resources;
+	};
+	std::mutex                                              mutex;
+	std::unordered_set<uint64_t>                            seen;
+	std::unordered_multimap<uint64_t, std::shared_ptr<Job>> by_pair;
+	std::vector<std::shared_ptr<Job>>                       kept;
+	uint32_t                                                pending = 0;
+	std::atomic<uint64_t> queued {0}, full {0}, plan_fail {0}, stage_fail {0}, key_fail {0}, create_fail {0}, built {0};
+	std::atomic<uint64_t> adopted {0}, waited {0}, wait_us {0}, cancelled {0}, absent {0}, check_match {0}, build_us {0};
+	std::array<std::atomic<uint64_t>, 6> differ {}; // vertex key, pixel key, rendering, vertex input, static params, SPIR-V
+};
+
 ResolvedStages* NewResolvedStages() {
 	return new ResolvedStages;
 }
@@ -1980,6 +2000,7 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
                              ShaderRecompiler::IR::ImageHeapSource* image_heap)
     : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics, image_heap)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	if (CompileJobsMode() >= 3u) m_prebuilds = std::make_shared<FirstUsePrebuilds>();
 	m_share_attachments = SharedPipelineState(m_graphics);
 	InitializeDriverCache();
 	if (m_driver_cache != nullptr && ShaderPrecompiler::Enabled()) {
@@ -4128,26 +4149,6 @@ void PipelineCache::QueueAheadGraphicsMiss(const ResolvedStages& results, const 
 	m_precompiler->EnqueueGraphicsMiss(std::move(miss));
 }
 
-struct PipelineCache::FirstUsePrebuilds {
-	struct Job {
-		std::atomic<uint8_t>      state {0}; // 0 queued, 1 running, 2 finished, 3 cancelled by the GPU thread
-		PrecompileGraphicsRecord  record;
-		uint64_t                  vs_spirv = 0, ps_spirv = 0;
-		std::unique_ptr<Pipeline> pipeline;
-		std::vector<vk::ShaderModule>                                                 modules;
-		std::array<std::unique_ptr<ShaderRecompiler::IR::CompiledShaderInfo>, 2>     infos;
-		std::unique_ptr<ShaderRecompiler::IR::ResourceSnapshot>                       no_resources;
-	};
-	std::mutex                                             mutex;
-	std::unordered_set<uint64_t>                           seen;
-	std::unordered_multimap<uint64_t, std::shared_ptr<Job>> by_pair;
-	std::vector<std::shared_ptr<Job>>                      kept;
-	uint32_t                                               pending = 0;
-	std::atomic<uint64_t> queued {0}, full {0}, plan_fail {0}, stage_fail {0}, key_fail {0}, create_fail {0}, built {0};
-	std::atomic<uint64_t> adopted {0}, waited {0}, wait_us {0}, cancelled {0}, absent {0}, check_match {0}, build_us {0};
-	std::array<std::atomic<uint64_t>, 6> differ {}; // vertex key, pixel key, rendering, vertex input, static params, SPIR-V
-};
-
 namespace {
 uint64_t PrebuildPair(uint64_t vs_hash, uint64_t ps_hash) {
 	return vs_hash * 0x9e3779b97f4a7c15ull ^ ps_hash;
@@ -4239,11 +4240,8 @@ void PipelineCache::QueueFirstUsePrebuild(const ResolvedStages& results, std::sp
 		mark = mark * 0x9e3779b97f4a7c15ull ^ (static_cast<uint64_t>(format) << 8u) ^ slot;
 	}
 	mark ^= static_cast<uint64_t>(depth.format) << 20u;
-	if (m_prebuilds == nullptr) {
-		const std::lock_guard lock(m_ahead_workers_mutex);
-		if (m_prebuilds == nullptr) m_prebuilds = std::make_shared<FirstUsePrebuilds>();
-	}
 	auto prebuilds = m_prebuilds;
+	if (prebuilds == nullptr) return;
 	auto job       = std::make_shared<FirstUsePrebuilds::Job>();
 	{
 		std::lock_guard lock(prebuilds->mutex);
