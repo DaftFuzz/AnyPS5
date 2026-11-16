@@ -12,6 +12,7 @@
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
+#include "common/liveAb.h"
 #include "common/logging/log.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
@@ -36,6 +37,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #ifndef NOMINMAX
@@ -185,12 +187,50 @@ void ReportMaybe() {
 	    u(memory.unknown_misses[0]), u(memory.unknown_misses[1]), u(memory.unknown_misses[2]), u(memory.unknown_misses[3]));
 }
 
+constexpr size_t LogBufferBytes = size_t {256} * 1024u;
+
+void SetLogBuffer(char* storage, bool on) {
+	std::fflush(stderr);
+	if (on) {
+		std::setvbuf(stderr, storage, _IOFBF, LogBufferBytes);
+	} else {
+		std::setvbuf(stderr, nullptr, _IONBF, 0);
+	}
+}
+
+void StartLogBuffer() {
+	const char*    value = std::getenv("KYTY_PERF_LOG_BUFFER");
+	const uint32_t fixed = value != nullptr && value[0] == '1' ? 1u : 0u;
+	if (!Common::LiveAb::Possible(Common::LiveAb::Switch::LogBuffer, fixed)) {
+		return;
+	}
+	char* storage = new char[LogBufferBytes];
+	Log("stderr %s; while buffered (%llu KiB) it is flushed every 100 ms, by every AnyPS5 log line and before every fatal "
+	    "report",
+	    fixed != 0u ? "fully buffered (KYTY_PERF_LOG_BUFFER=1)" : "unbuffered until KYTY_LIVE_AB turns KYTY_PERF_LOG_BUFFER on",
+	    static_cast<unsigned long long>(LogBufferBytes >> 10u));
+	std::thread([storage, fixed] {
+		bool buffered = false;
+		for (;;) {
+			const bool on = Common::LiveAb::Gate(Common::LiveAb::Switch::LogBuffer, fixed) != 0u;
+			if (on != buffered) {
+				SetLogBuffer(storage, on);
+				buffered = on;
+			} else if (buffered) {
+				std::fflush(stderr);
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(100));
+		}
+	}).detach();
+}
+
 int Start(Aps5GpuBackend* /*backend*/) {
 	bool ok = true;
 	std::call_once(B().started, [&] {
 		Common::SetFatalHook(&FatalHook);
 		std::call_once(B().shaders_ready, [] { Graphics::ShaderInit(); });
 		ApplySettings();
+		StartLogBuffer();
 		StartPgoWriter();
 		Config::Initialize();
 		Config::Load(ReleaseConfig());
@@ -309,6 +349,7 @@ void Shutdown(Aps5GpuBackend* /*backend*/) {
 		Log("shutdown: pipeline cache saved");
 		renderer->GetPipelineCache().ExportHints("shutdown");
 	}
+	std::fflush(stderr);
 }
 
 void Destroy(Aps5GpuBackend* /*backend*/) {}
