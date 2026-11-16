@@ -30,6 +30,7 @@
 #include <fmt/format.h>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <numeric>
 #include <tuple>
 #include <optional>
@@ -2454,9 +2455,18 @@ bool NullSlotCheckEnabled() {
 
 } // namespace
 
+uint32_t NullSlotPrewarmMode() {
+	static const uint32_t mode = [] {
+		const char*    value = Common::ShaderEnv::Read("KYTY_PERF_NULL_SLOT_PREWARM");
+		const uint32_t m     = value != nullptr && (value[0] == '1' || value[0] == '2') ? static_cast<uint32_t>(value[0] - '0') : 0u;
+		if (m != 0u) std::fprintf(stderr, "PERF_NULL_SLOT_PREWARM enabled (mode %u: %s)\n", m, m == 1u ? "known guesses" : "known guesses and watched slots");
+		return m;
+	}();
+	return mode;
+}
+
 bool NullSlotPrewarmEnabled() {
-	static const bool on = NullSlotSwitch(Common::ShaderEnv::Read("KYTY_PERF_NULL_SLOT_PREWARM"), "PERF_NULL_SLOT_PREWARM");
-	return on;
+	return NullSlotPrewarmMode() != 0u;
 }
 
 bool NullSlotRuntimeForStage(ShaderType stage) {
@@ -2488,6 +2498,42 @@ struct NullSlotTable {
 	std::unordered_map<uint64_t, NullSlot::Value> coarse;
 };
 NullSlotTable g_null_slot_table;
+
+struct NullSlotWatchEntry {
+	std::atomic_bool                                    fired {false};
+	std::function<void(const std::array<uint32_t, 2>&)> fire;
+};
+struct NullSlotWatchTable {
+	std::mutex                                                                     mutex;
+	bool                                                                           closed = false;
+	std::unordered_map<uint64_t, std::vector<std::shared_ptr<NullSlotWatchEntry>>> precise;
+	std::unordered_map<uint64_t, std::vector<std::shared_ptr<NullSlotWatchEntry>>> coarse;
+	std::atomic<uint64_t>                                                          added {0};
+	std::atomic<uint64_t>                                                          fired {0};
+};
+NullSlotWatchTable g_null_slot_watches;
+
+void NullSlotWatchFire(const std::array<uint64_t, 2>& keys, const NullSlot::Value& value) {
+	std::vector<std::shared_ptr<NullSlotWatchEntry>> due;
+	{
+		std::scoped_lock lock(g_null_slot_watches.mutex);
+		if (g_null_slot_watches.closed) return;
+		const auto take = [&](auto& table, uint64_t key) {
+			if (key == 0u) return;
+			const auto it = table.find(key);
+			if (it == table.end()) return;
+			for (auto& entry: it->second) due.push_back(std::move(entry));
+			table.erase(it);
+		};
+		take(g_null_slot_watches.precise, keys[0]);
+		take(g_null_slot_watches.coarse, keys[1]);
+	}
+	for (const auto& entry: due) {
+		if (entry->fired.exchange(true)) continue;
+		g_null_slot_watches.fired.fetch_add(1, std::memory_order_relaxed);
+		entry->fire(value);
+	}
+}
 
 uint64_t NullSlotMix(uint64_t hash, uint64_t value) {
 	return hash ^ (value + 0x9e3779b97f4a7c15ull + (hash << 6u) + (hash >> 2u));
@@ -2624,10 +2670,13 @@ bool NullSlotOnLive(const ResourcePlan& program, ResourcePlan::NullFormattedLive
 		return true;
 	}
 	if ((NullSlotSeedEnabled() || NullSlotPrewarmEnabled()) && NullSlotUsable(value)) {
-		const auto       keys = NullSlotKeysOf(program, shared, i);
-		std::scoped_lock lock(g_null_slot_table.mutex);
-		if (keys[0] != 0u) g_null_slot_table.precise[keys[0]] = value;
-		g_null_slot_table.coarse[keys[1]] = value;
+		const auto keys = NullSlotKeysOf(program, shared, i);
+		{
+			std::scoped_lock lock(g_null_slot_table.mutex);
+			if (keys[0] != 0u) g_null_slot_table.precise[keys[0]] = value;
+			g_null_slot_table.coarse[keys[1]] = value;
+		}
+		if (NullSlotPrewarmMode() == 2u) NullSlotWatchFire(keys, value);
 	}
 	return false;
 }
@@ -2668,6 +2717,38 @@ std::vector<std::array<uint32_t, 2>> NullSlotGuesses(const ResourcePlan& program
 	take(g_null_slot_table.precise, keys[0]);
 	take(g_null_slot_table.coarse, keys[1]);
 	return out;
+}
+
+bool NullSlotWatch(const ResourcePlan& program, size_t i, std::function<void(const std::array<uint32_t, 2>&)> fire) {
+	if (NullSlotPrewarmMode() != 2u || program.null_formatted_live == nullptr || i >= program.info.buffers.size() ||
+	    !program.info.buffers[i].formatted || program.info.buffers[i].written) {
+		return false;
+	}
+	std::array<uint64_t, 2> keys {};
+	{
+		auto&            shared = *program.null_formatted_live;
+		std::scoped_lock lock(shared.mutex);
+		keys = NullSlotKeysOf(program, shared, i);
+	}
+	auto entry  = std::make_shared<NullSlotWatchEntry>();
+	entry->fire = std::move(fire);
+	std::scoped_lock lock(g_null_slot_watches.mutex);
+	if (g_null_slot_watches.closed) return false;
+	if (keys[0] != 0u) g_null_slot_watches.precise[keys[0]].push_back(entry);
+	g_null_slot_watches.coarse[keys[1]].push_back(entry);
+	g_null_slot_watches.added.fetch_add(1, std::memory_order_relaxed);
+	return true;
+}
+
+void NullSlotWatchClose() {
+	std::scoped_lock lock(g_null_slot_watches.mutex);
+	g_null_slot_watches.closed = true;
+	g_null_slot_watches.precise.clear();
+	g_null_slot_watches.coarse.clear();
+}
+
+std::array<uint64_t, 2> NullSlotWatchCounts() {
+	return {g_null_slot_watches.added.load(std::memory_order_relaxed), g_null_slot_watches.fired.load(std::memory_order_relaxed)};
 }
 
 bool NullSlotRuntimeLive(const ResourcePlan& program, const std::vector<uint8_t>& kinds) {

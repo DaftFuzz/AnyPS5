@@ -1424,7 +1424,12 @@ struct PipelineCache::ProgramCache {
 		for (size_t i = 0; i < specialization.buffers.size() && i < plan.info.buffers.size(); i++) {
 			const auto& b = specialization.buffers[i];
 			if (!b.zero_stride_oob || static_cast<uint32_t>(b.descriptor_format) != 0u || b.descriptor_swizzle != 0u) continue;
-			for (const auto& guess: ShaderRecompiler::IR::NullSlotGuesses(plan, i)) {
+			const auto guesses = ShaderRecompiler::IR::NullSlotGuesses(plan, i);
+			if (guesses.empty() && ShaderRecompiler::IR::NullSlotPrewarmMode() == 2u) {
+				WatchNullSlot(params, input_info, push_cursor, static_state, plan, specialization, i);
+				continue;
+			}
+			for (const auto& guess: guesses) {
 				auto  variant = specialization;
 				auto& slot    = variant.buffers[i];
 				slot.packed_stride      = (slot.packed_stride & ~0x3fffu) | (1u << 31u) | 1u;
@@ -1435,6 +1440,48 @@ struct PipelineCache::ProgramCache {
 				QueueRuntimeCompile(params, input_info, push_cursor, static_state, &variant);
 			}
 		}
+	}
+
+	void WatchNullSlot(const ShaderParams& params, const ShaderComputeInputInfo& input_info, uint32_t push_cursor,
+	                   std::span<const uint32_t> static_state, const ShaderRecompiler::IR::ResourcePlan& plan,
+	                   const ShaderRecompiler::IR::ResourceSpecialization& specialization, size_t slot) {
+		const uint64_t base = PrecompileKey(ShaderType::Compute, params.hash, params.user_data_count,
+		                                    static_cast<uint32_t>(params.code.size()), static_state, push_cursor, specialization);
+		{
+			std::lock_guard lock(runtime_jobs_mutex);
+			if (!runtime_jobs_seen.insert(base ^ (0x57a7c4ull + (uint64_t {slot} << 48u))).second) return;
+		}
+		auto record          = std::make_shared<PrecompileStageRecord>();
+		record->stage        = ShaderType::Compute;
+		record->shader_hash  = params.hash;
+		const auto user_data = std::span(params.user_data).first(params.user_data_count);
+		record->user_data.assign(user_data.begin(), user_data.end());
+		record->code.assign(params.code.begin(), params.code.end());
+		record->back_code.assign(params.back_code.begin(), params.back_code.end());
+		if (PrecompileCodeHash(record->code, record->back_code) != params.hash) return;
+		record->compute       = input_info;
+		record->compute.stage = {};
+		record->static_key.assign(static_state.begin(), static_state.end());
+		record->push_data_start = push_cursor;
+		record->revision        = ShaderPrecompiler::Revision();
+		record->specialization  = specialization;
+		ShaderRecompiler::IR::NullSlotWatch(plan, slot, [this, record, slot](const std::array<uint32_t, 2>& value) {
+			auto  variant = *record;
+			auto& b       = variant.specialization.buffers[slot];
+			b.packed_stride      = (b.packed_stride & ~0x3fffu) | (1u << 31u) | 1u;
+			b.zero_stride_oob    = false;
+			b.descriptor_format  = static_cast<Prospero::BufferFormat>(value[0]);
+			b.descriptor_swizzle = value[1];
+			const uint64_t mark  = PrecompileKey(ShaderType::Compute, variant.shader_hash, static_cast<uint32_t>(variant.user_data.size()),
+			                                     static_cast<uint32_t>(variant.code.size()), variant.static_key, variant.push_data_start,
+			                                     variant.specialization);
+			{
+				std::lock_guard lock(runtime_jobs_mutex);
+				if (!runtime_jobs_seen.insert(mark).second) return;
+			}
+			g_null_slot_prewarm.fetch_add(1, std::memory_order_relaxed);
+			precompiler->EnqueueRuntime(std::move(variant));
+		});
 	}
 
 	void QueueRuntimeCompile(const ShaderParams& params, const ShaderComputeInputInfo& input_info, uint32_t push_cursor,
@@ -1755,6 +1802,7 @@ struct PipelineCache::ProgramCache {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {
+		ShaderRecompiler::IR::NullSlotWatchClose();
 		for (const auto& [key, entry]: programs) {
 			(void)key;
 			for (const auto& permutation: entry.permutations) {
@@ -3775,10 +3823,12 @@ void PipelineCache::ReportCompileJobs() const {
 	if (PerfEnabled()) {
 		ReportIndirectCover();
 		const auto u = [](const std::atomic<uint64_t>& v) { return static_cast<unsigned long long>(v.load(std::memory_order_relaxed)); };
-		std::fprintf(stderr, "PERF stage_compile graphics=%llu/%.0fms(reused %llu) compute=%llu/%.0fms(reused %llu) null_slot_prewarm=%llu graphics_create=%llu/%.0fms\n",
+		const auto watches = ShaderRecompiler::IR::NullSlotWatchCounts();
+		std::fprintf(stderr, "PERF stage_compile graphics=%llu/%.0fms(reused %llu) compute=%llu/%.0fms(reused %llu) null_slot_prewarm=%llu null_slot_watch=%llu/%llu graphics_create=%llu/%.0fms\n",
 		             u(g_stage_compile[0].count), static_cast<double>(u(g_stage_compile[0].us)) / 1000.0, u(g_stage_compile[0].reused),
 		             u(g_stage_compile[1].count), static_cast<double>(u(g_stage_compile[1].us)) / 1000.0, u(g_stage_compile[1].reused),
-		             u(g_null_slot_prewarm), u(g_graphics_create.count), static_cast<double>(u(g_graphics_create.us)) / 1000.0);
+		             u(g_null_slot_prewarm), static_cast<unsigned long long>(watches[0]), static_cast<unsigned long long>(watches[1]),
+		             u(g_graphics_create.count), static_cast<double>(u(g_graphics_create.us)) / 1000.0);
 	}
 	if (!PerfEnabled() || !CompileJobsEnabled()) return;
 	const auto& s = g_compile_scout;

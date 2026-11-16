@@ -180,6 +180,10 @@ bool ApplyNullFormattedShare(const ResourcePlan& program, const std::vector<uint
 bool NullSlotRuntimeLive(const ResourcePlan& program, const std::vector<uint8_t>& kinds);
 bool NullSlotRuntimeForStage(ShaderType stage);
 bool NullSlotPrewarmEnabled();
+uint32_t NullSlotPrewarmMode();
+bool NullSlotWatch(const ResourcePlan& program, size_t i, std::function<void(const std::array<uint32_t, 2>&)> fire);
+void NullSlotWatchClose();
+std::array<uint64_t, 2> NullSlotWatchCounts();
 uint32_t SamplerPadMode();
 size_t PadSamplerCandidates(ResourceSpecialization& specialization, std::vector<DescriptorValue>* descriptors);
 void ReportSamplerPad();
