@@ -53,6 +53,8 @@ constexpr auto actions = std::array{
     InputAction{"TouchRight", Pad::InputControl::TouchRight, Pad::PadButton::None},
     InputAction{"StickModifier", Pad::InputControl::StickModifier, Pad::PadButton::None},
     InputAction{"Shake", Pad::InputControl::Shake, Pad::PadButton::None},
+    InputAction{"TiltUp", Pad::InputControl::TiltUp, Pad::PadButton::None},
+    InputAction{"TiltDown", Pad::InputControl::TiltDown, Pad::PadButton::None},
     InputAction{"ToggleMouse", Pad::InputControl::ToggleMouse, Pad::PadButton::None},
     InputAction{"ToggleFullscreen", Pad::InputControl::ToggleFullscreen, Pad::PadButton::None},
     InputAction{"TogglePerformanceOverlay", Pad::InputControl::TogglePerformanceOverlay, Pad::PadButton::None},
@@ -145,7 +147,10 @@ enum class InputSetting {
     MouseDecayMs,
     StickModifierScale,
     KeyboardRampMs,
-    TriggerRampMs
+    TriggerRampMs,
+    TiltAngle,
+    TiltSpeed,
+    MotionStickButtons
 };
 
 struct InputSettingName {
@@ -165,7 +170,10 @@ constexpr auto settingNames = std::array{
     InputSettingName{"MouseDecayMs", InputSetting::MouseDecayMs},
     InputSettingName{"StickModifierScale", InputSetting::StickModifierScale},
     InputSettingName{"KeyboardRampMs", InputSetting::KeyboardRampMs},
-    InputSettingName{"TriggerRampMs", InputSetting::TriggerRampMs}
+    InputSettingName{"TriggerRampMs", InputSetting::TriggerRampMs},
+    InputSettingName{"TiltAngle", InputSetting::TiltAngle},
+    InputSettingName{"TiltSpeed", InputSetting::TiltSpeed},
+    InputSettingName{"MotionStickButtons", InputSetting::MotionStickButtons}
 };
 
 const InputSettingName* findSetting(std::string_view name) {
@@ -212,6 +220,22 @@ double parseNumber(std::string_view value, std::string_view name, double minimum
     return parsed;
 }
 
+std::uint32_t parseButtonChord(std::string_view value) {
+    if (upper(value) == "NONE") return 0;
+    std::uint32_t chord = 0;
+    while (true) {
+        const auto separator = value.find('+');
+        const auto name = trim(value.substr(0, separator));
+        const auto* action = findAction(name);
+        if (name.empty() || action == nullptr || action->control != Pad::InputControl::Button) {
+            throw std::runtime_error("motion stick buttons must be None or pad button names joined by '+', such as L1+R1");
+        }
+        chord |= static_cast<std::uint32_t>(action->button);
+        if (separator == std::string_view::npos) return chord;
+        value.remove_prefix(separator + 1);
+    }
+}
+
 void applySetting(Pad::InputSettings& settings, InputSetting setting, std::string_view value) {
     switch (setting) {
         case InputSetting::LeftStickDeadzone: settings.leftStickDeadzonePercent = parseDeadzonePercent(value); break;
@@ -226,6 +250,9 @@ void applySetting(Pad::InputSettings& settings, InputSetting setting, std::strin
         case InputSetting::StickModifierScale: settings.stickModifierScale = parseNumber(value, "stick modifier scale", 0.05, 1.0); break;
         case InputSetting::KeyboardRampMs: settings.keyboardRampMs = parseNumber(value, "keyboard ramp", 0.0, 2000.0); break;
         case InputSetting::TriggerRampMs: settings.triggerRampMs = parseNumber(value, "trigger ramp", 0.0, 2000.0); break;
+        case InputSetting::TiltAngle: settings.tiltAngle = parseNumber(value, "tilt angle", 5.0, 90.0); break;
+        case InputSetting::TiltSpeed: settings.tiltSpeed = parseNumber(value, "tilt speed", 30.0, 3600.0); break;
+        case InputSetting::MotionStickButtons: settings.motionStickButtons = parseButtonChord(value); break;
     }
 }
 

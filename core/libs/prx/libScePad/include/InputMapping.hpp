@@ -29,6 +29,9 @@ struct InputSettings {
     double stickModifierScale = 0.5;
     double keyboardRampMs = 0.0;
     double triggerRampMs = 0.0;
+    double tiltAngle = 70.0;
+    double tiltSpeed = 360.0;
+    std::uint32_t motionStickButtons = static_cast<std::uint32_t>(PadButton::L1) | static_cast<std::uint32_t>(PadButton::R1);
 };
 
 struct InputConfiguration {
@@ -70,6 +73,8 @@ inline constexpr std::array InputMapping{
     InputBinding{SDL_SCANCODE_TAB, MouseButton::None, InputControl::TouchRight},
     InputBinding{SDL_SCANCODE_F7, MouseButton::None, InputControl::ToggleMouse},
     InputBinding{SDL_SCANCODE_X, MouseButton::None, InputControl::Shake},
+    InputBinding{SDL_SCANCODE_PAGEUP, MouseButton::None, InputControl::TiltUp},
+    InputBinding{SDL_SCANCODE_PAGEDOWN, MouseButton::None, InputControl::TiltDown},
     InputBinding{SDL_SCANCODE_UNKNOWN, MouseButton::Middle, InputControl::ToggleMouse},
     InputBinding{SDL_SCANCODE_UNKNOWN, MouseButton::Left, InputControl::Button, PadButton::Square},
     InputBinding{SDL_SCANCODE_UNKNOWN, MouseButton::Right, InputControl::Button, PadButton::R2},

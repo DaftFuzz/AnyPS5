@@ -21,7 +21,7 @@ test('action names and pad button categories agree with the current native parse
 
 test('built-in conflict catalogue agrees with the current native bindings', () => {
     const source = readFileSync(new URL('../../../core/libs/prx/libScePad/include/InputMapping.hpp', import.meta.url), 'utf8');
-    const special = {RETURN: 'Return', SPACE: 'Space', ESCAPE: 'Escape', BACKSPACE: 'Backspace', TAB: 'Tab', UP: 'Up', RIGHT: 'Right', DOWN: 'Down', LEFT: 'Left', LALT: 'Left Alt', RALT: 'Right Alt', LSHIFT: 'Left Shift', RSHIFT: 'Right Shift', LCTRL: 'Left Ctrl', RCTRL: 'Right Ctrl'};
+    const special = {RETURN: 'Return', SPACE: 'Space', ESCAPE: 'Escape', BACKSPACE: 'Backspace', TAB: 'Tab', UP: 'Up', RIGHT: 'Right', DOWN: 'Down', LEFT: 'Left', LALT: 'Left Alt', RALT: 'Right Alt', LSHIFT: 'Left Shift', RSHIFT: 'Right Shift', LCTRL: 'Left Ctrl', RCTRL: 'Right Ctrl', PAGEUP: 'PageUp', PAGEDOWN: 'PageDown'};
     const native = Object.fromEntries(actions.map(action => [action, []]));
     for (const match of source.matchAll(/InputBinding\{SDL_SCANCODE_(\w+), MouseButton::(\w+), InputControl::(\w+)(?:, PadButton::(\w+))?(?:, (-?\d+))?\}/gu)) {
         const [, key, mouse, control, button, wheel] = match;

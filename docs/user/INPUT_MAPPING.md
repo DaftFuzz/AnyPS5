@@ -16,7 +16,7 @@ While a title has a mouse open (`sceMouseOpen`) and the window is focused, AnyPS
 
 Game-controller bindings are enabled automatically and are not affected by keyboard or mouse overrides in this file.
 
-Supported actions are `Cross`, `Circle`, `Triangle`, `Square`, `L1`, `R1`, `L2`, `R2`, `L3`, `R3`, `Options`, `Up`, `Right`, `Down`, `Left`, `LeftStickLeft`, `LeftStickRight`, `LeftStickUp`, `LeftStickDown`, `RightStickLeft`, `RightStickRight`, `RightStickUp`, `RightStickDown`, `TouchLeft`, `TouchRight`, `StickModifier`, `Shake`, `ToggleMouse`, `ToggleFullscreen` (F11), `TogglePerformanceOverlay` (F10, the [performance overlay](USAGE.md#performance-overlay)), and `Screenshot` (F12, saves the next displayed frame as described in [screenshots](USAGE.md#screenshots)). `ToggleFullscreen`, `TogglePerformanceOverlay` and `Screenshot` accept only keyboard keys.
+Supported actions are `Cross`, `Circle`, `Triangle`, `Square`, `L1`, `R1`, `L2`, `R2`, `L3`, `R3`, `Options`, `Up`, `Right`, `Down`, `Left`, `LeftStickLeft`, `LeftStickRight`, `LeftStickUp`, `LeftStickDown`, `RightStickLeft`, `RightStickRight`, `RightStickUp`, `RightStickDown`, `TouchLeft`, `TouchRight`, `StickModifier`, `Shake`, `TiltUp`, `TiltDown`, `ToggleMouse`, `ToggleFullscreen` (F11), `TogglePerformanceOverlay` (F10, the [performance overlay](USAGE.md#performance-overlay)), and `Screenshot` (F12, saves the next displayed frame as described in [screenshots](USAGE.md#screenshots)). `ToggleFullscreen`, `TogglePerformanceOverlay` and `Screenshot` accept only keyboard keys.
 
 ### Default bindings
 
@@ -40,6 +40,7 @@ Without an `anyps5-input.ini`, or for actions the file does not mention, these b
 | `RightStickLeft`, `RightStickRight`, `RightStickUp`, `RightStickDown` | F, H, T, G |
 | `TouchLeft`, `TouchRight` | Backspace, Tab |
 | `Shake` | X (reports a swinging acceleration and angular velocity while held) |
+| `TiltUp`, `TiltDown` | Page Up, Page Down (pitch the controller up or down while held, see [Tilt](#tilt)) |
 | `ToggleMouse` | Middle mouse button, F7 |
 | `ToggleFullscreen` | F11 |
 | `TogglePerformanceOverlay` | F10 |
@@ -74,6 +75,9 @@ The same file also accepts these settings, each at most once, in the form `Setti
 | `StickModifierScale` | Number from 0.05 to 1, the tilt of keyboard stick bindings while a `StickModifier` binding is held. | `0.5` |
 | `KeyboardRampMs` | Number from 0 to 2000, the milliseconds a keyboard stick binding takes to move the stick from the center to full tilt. 0 tilts at once. | `0` |
 | `TriggerRampMs` | Number from 0 to 2000, the milliseconds a key or mouse button bound to `L2` or `R2` takes to press the trigger from 0 to full. 0 presses it fully at once. | `0` |
+| `TiltAngle` | Number from 5 to 90, the pitch in degrees reached by `TiltUp`, `TiltDown` or a full motion-stick push. | `70` |
+| `TiltSpeed` | Number from 30 to 3600, the fastest the emulated pitch changes, in degrees per second. | `360` |
+| `MotionStickButtons` | `None`, or pad button names joined by `+`, the controller buttons held to drive the pitch with the right stick on a controller without a gyroscope. | `L1+R1` |
 
 ```ini
 LeftStickDeadzone = 12
@@ -113,6 +117,18 @@ With `TriggerRampMs` above 0, a key or mouse button bound to `L2` or `R2` presse
 ## Shake
 
 While the `Shake` input is held (X by default), the controller reports its acceleration and angular velocity swinging back and forth every 50 ms, for titles that ask the player to shake the controller. A controller's own motion sensors are used otherwise.
+
+## Tilt
+
+Titles that ask the player to tilt the controller up and down can be played without motion sensors. While `TiltUp` (Page Up) is held, the controller pitches up at `TiltSpeed` until it reaches `TiltAngle`; `TiltDown` (Page Down) pitches it down the same way, and releasing both levels it again at the same speed. The title reads a matching angular velocity about the controller's left-right axis, an acceleration with gravity turned by the pitch, and an orientation that follows both. A controller's own motion sensors take priority when they report.
+
+On a controller without a gyroscope, such as an Xbox controller, hold the `MotionStickButtons` (LB and RB by default) and push the right stick up or down: the pitch follows the stick, reaching `TiltAngle` at full push, moving no faster than `TiltSpeed`, and returning to level when the buttons are released. While the buttons are held they and the right stick are not passed to the title, so the camera doesn't move. Controllers with a gyroscope are not affected.
+
+```ini
+MotionStickButtons = L2+R2
+TiltAngle = 60
+TiltSpeed = 540
+```
 
 ## Mouse as the right stick
 

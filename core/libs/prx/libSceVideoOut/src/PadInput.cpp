@@ -76,6 +76,8 @@ void PadInput::openController(int deviceIndex) {
     slots[slot].nextRumbleRefresh = {};
     slots[slot].lightBar.Reset();
     slots[slot].triggerEffect.Reset();
+    slots[slot].stickTilt.Reset();
+    slots[slot].stickTiltTime = {};
     const char* name = SDL_GameControllerName(gc);
     APS5_LOG_OUT("Pad: connected game controller (slot %d): %s (type %d, sensors accel=%d gyro=%d, touchpads=%d, led=%d, trigger rumble=%d)",
         slot, name != nullptr ? name : "unknown", static_cast<int>(SDL_GameControllerGetType(gc)),
@@ -104,6 +106,8 @@ void PadInput::closeController(int slot) {
     slots[slot].state = {};
     slots[slot].outputState = {};
     slots[slot].outputPending = false;
+    slots[slot].stickTilt.Reset();
+    slots[slot].stickTiltTime = {};
     if (slot > 0) {
         PadSetPortConnected_nid_postfix(slot, false);
         UserServiceSetUserConnected_nid_postfix(slot, false);
@@ -247,6 +251,36 @@ PadInputState PadInput::sampleController(int slot) const {
     return result;
 }
 
+void PadInput::applyMotionStick(int slot, PadInputState& state) {
+    auto& entry = slots[slot];
+    const auto now = std::chrono::steady_clock::now();
+    const bool timed = entry.stickTiltTime != std::chrono::steady_clock::time_point{};
+    const double seconds = timed && now > entry.stickTiltTime ? std::chrono::duration<double>(now - entry.stickTiltTime).count() : 0.0;
+    if (!timed || now > entry.stickTiltTime) entry.stickTiltTime = now;
+    const auto& settings = keyboardMouse.Configuration().settings;
+    const std::uint32_t chord = settings.motionStickButtons;
+    const bool gyro = SDL_GameControllerHasSensor(entry.controller, SDL_SENSOR_GYRO) == SDL_TRUE;
+    const bool held = chord != 0 && !gyro && !state.hasMotion && entry.outputState.motionEnabled && (state.buttons & chord) == chord;
+    double target = 0.0;
+    if (held) {
+        const double offset = static_cast<double>(state.sticks[3]) - 128.0;
+        target = -offset / (offset < 0.0 ? 128.0 : 127.0) * settings.tiltAngle;
+        state.buttons &= ~chord;
+        if ((chord & static_cast<std::uint32_t>(Pad::PadButton::L2)) != 0) state.analogButtonsL2 = 0;
+        if ((chord & static_cast<std::uint32_t>(Pad::PadButton::R2)) != 0) state.analogButtonsR2 = 0;
+        state.sticks[2] = 128;
+        state.sticks[3] = 128;
+    }
+    entry.stickTilt.Advance(target, seconds, settings.tiltSpeed);
+    if (!state.hasMotion && entry.stickTilt.Active()) entry.stickTilt.Apply(state);
+}
+
+void PadInput::sample(int slot) {
+    PadInputState state = sampleController(slot);
+    applyMotionStick(slot, state);
+    slots[slot].state = state;
+}
+
 void PadInput::HandleEvent(const SDL_Event& event, DisplayWindow& window) {
     if (event.type == SDL_CONTROLLERDEVICEADDED) {
         openController(event.cdevice.which);
@@ -270,7 +304,7 @@ void PadInput::HandleEvent(const SDL_Event& event, DisplayWindow& window) {
         else if (event.type == SDL_CONTROLLERDEVICEREMAPPED) which = event.cdevice.which;
         for (int slot = 0; slot < PAD_MAX_CONTROLLERS; ++slot) {
             if (slots[slot].controller != nullptr && slots[slot].instanceId == which) {
-                slots[slot].state = sampleController(slot);
+                sample(slot);
                 publish(window.FrameNumber(), slot);
                 return;
             }
@@ -309,9 +343,7 @@ void PadInput::Update(const DisplayWindow& window) {
     if (anyController) SDL_GameControllerUpdate();
     applyOutput();
     for (int slot = 0; slot < PAD_MAX_CONTROLLERS; ++slot) {
-        if (slots[slot].controller != nullptr) {
-            slots[slot].state = sampleController(slot);
-        }
+        if (slots[slot].controller != nullptr) sample(slot);
     }
     if (keyboardMouse.MouseMode() && SDL_GetKeyboardFocus() == nullptr) {
         keyboardMouse.Release();

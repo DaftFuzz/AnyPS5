@@ -4,7 +4,7 @@ export const groups = [
     {name: 'Directional controls', actions: ['Up', 'Right', 'Down', 'Left']},
     {name: 'Left analog stick', actions: ['LeftStickLeft', 'LeftStickRight', 'LeftStickUp', 'LeftStickDown']},
     {name: 'Right analog stick', actions: ['RightStickLeft', 'RightStickRight', 'RightStickUp', 'RightStickDown']},
-    {name: 'Touch and utility', actions: ['Options', 'TouchLeft', 'TouchRight', 'StickModifier', 'Shake', 'ToggleMouse', 'ToggleFullscreen', 'TogglePerformanceOverlay', 'Screenshot']}
+    {name: 'Touch and utility', actions: ['Options', 'TouchLeft', 'TouchRight', 'StickModifier', 'Shake', 'TiltUp', 'TiltDown', 'ToggleMouse', 'ToggleFullscreen', 'TogglePerformanceOverlay', 'Screenshot']}
 ];
 
 export const actions = groups.flatMap(group => group.actions);
@@ -20,6 +20,7 @@ export const defaults = {
     LeftStickLeft: ['KEY:A'], LeftStickRight: ['KEY:D'], LeftStickUp: ['KEY:W'], LeftStickDown: ['KEY:S'],
     RightStickLeft: ['KEY:F'], RightStickRight: ['KEY:H'], RightStickUp: ['KEY:T'], RightStickDown: ['KEY:G'],
     TouchLeft: ['KEY:Backspace'], TouchRight: ['KEY:Tab'], StickModifier: [], Shake: ['KEY:X'],
+    TiltUp: ['KEY:PageUp'], TiltDown: ['KEY:PageDown'],
     ToggleMouse: ['KEY:F7', 'MOUSE:Middle'], ToggleFullscreen: ['KEY:F11'], TogglePerformanceOverlay: ['KEY:F10'], Screenshot: ['KEY:F12']
 };
 

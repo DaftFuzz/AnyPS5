@@ -107,6 +107,32 @@ std::array<double, 2> Pad::MouseStick::Deflection() const {
     return {speedX / speed * deflection, speedY / speed * deflection};
 }
 
+bool Pad::PitchTilt::Advance(double targetDegrees, double seconds, double degreesPerSecond) {
+    if (!(seconds > 0.0)) return false;
+    const double before = angle;
+    const double beforeRate = rate;
+    slew(angle, targetDegrees, degreesPerSecond * seconds);
+    rate = (angle - before) / seconds;
+    return angle != before || rate != beforeRate;
+}
+
+bool Pad::PitchTilt::Active() const {
+    return angle != 0.0 || rate != 0.0;
+}
+
+void Pad::PitchTilt::Apply(PadInputState& state) const {
+    constexpr double gravity = 9.80665;
+    const double radians = angle * RadiansPerDegree;
+    state.hasMotion = true;
+    state.accel = {0.0f, static_cast<float>(gravity * std::cos(radians)), static_cast<float>(-gravity * std::sin(radians))};
+    state.gyro = {static_cast<float>(rate * RadiansPerDegree), 0.0f, 0.0f};
+}
+
+void Pad::PitchTilt::Reset() {
+    angle = 0.0;
+    rate = 0.0;
+}
+
 std::uint8_t Pad::StickByte(double deflection) {
     const double clamped = std::clamp(deflection, -1.0, 1.0);
     return static_cast<std::uint8_t>(std::lround(clamped < 0.0 ? 128.0 + clamped * 128.0 : 128.0 + clamped * 127.0));
@@ -165,12 +191,23 @@ std::array<double, 2> Pad::KeyboardMouse::triggerTargets() const {
     return targets;
 }
 
+double Pad::KeyboardMouse::tiltTarget() const {
+    bool up = false;
+    bool down = false;
+    for (std::size_t index = 0; index < configuration.bindings.size(); ++index) {
+        if (!pressed[index]) continue;
+        if (configuration.bindings[index].control == InputControl::TiltUp) up = true;
+        if (configuration.bindings[index].control == InputControl::TiltDown) down = true;
+    }
+    return (static_cast<double>(up) - static_cast<double>(down)) * configuration.settings.tiltAngle;
+}
+
 bool Pad::KeyboardMouse::advanceAxes(Clock::time_point now) {
     const double seconds = axesAdvanced && now > lastAxisAdvance ? std::chrono::duration<double>(now - lastAxisAdvance).count() : 0.0;
     if (!axesAdvanced || now > lastAxisAdvance) lastAxisAdvance = now;
     axesAdvanced = true;
     if (seconds <= 0.0) return false;
-    bool moved = false;
+    bool moved = tilt.Advance(tiltTarget(), seconds, configuration.settings.tiltSpeed);
     if (configuration.settings.keyboardRampMs > 0.0) {
         const auto targets = stickInput().targets;
         const double travel = seconds * 1000.0 / configuration.settings.keyboardRampMs;
@@ -219,6 +256,7 @@ void Pad::KeyboardMouse::Release() {
     std::fill(wheelReleaseTimes.begin(), wheelReleaseTimes.end(), Clock::time_point{});
     stickAxes = {};
     triggerAxes = {};
+    tilt.Reset();
 }
 
 Pad::InputRequests Pad::KeyboardMouse::HandleEvent(const SDL_Event& event, Clock::time_point now) {
@@ -272,6 +310,7 @@ Pad::InputRequests Pad::KeyboardMouse::HandleEvent(const SDL_Event& event, Clock
 
 PadInputState Pad::KeyboardMouse::Compose(const PadInputState& controller) const {
     PadInputState state = controller;
+    if (!controller.hasMotion && tilt.Active()) tilt.Apply(state);
     for (std::size_t index = 0; index < configuration.bindings.size(); ++index) {
         if (!pressed[index]) continue;
         const auto& binding = configuration.bindings[index];
@@ -300,6 +339,8 @@ PadInputState Pad::KeyboardMouse::Compose(const PadInputState& controller) const
                 state.gyro = {0.0f, 0.0f, sign * ShakeAngularVelocity};
                 break;
             }
+            case InputControl::TiltUp: break;
+            case InputControl::TiltDown: break;
             case InputControl::ToggleMouse: break;
             case InputControl::ToggleFullscreen: break;
             case InputControl::TogglePerformanceOverlay: break;

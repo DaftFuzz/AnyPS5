@@ -21,6 +21,19 @@ inline constexpr double MouseSmoothingLimitMs = 30.0;
 inline constexpr std::chrono::milliseconds ShakeHalfPeriod{50};
 inline constexpr float ShakeAcceleration = 2.0f * 9.80665f;
 inline constexpr float ShakeAngularVelocity = 6.0f;
+inline constexpr double RadiansPerDegree = 3.14159265358979323846 / 180.0;
+
+class PitchTilt {
+public:
+    bool Advance(double targetDegrees, double seconds, double degreesPerSecond);
+    bool Active() const;
+    void Apply(PadInputState& state) const;
+    void Reset();
+
+private:
+    double angle = 0.0;
+    double rate = 0.0;
+};
 
 class MouseStick {
 public:
@@ -81,6 +94,7 @@ private:
 
     StickInput stickInput() const;
     std::array<double, 2> triggerTargets() const;
+    double tiltTarget() const;
     bool advanceAxes(Clock::time_point now);
 
     InputConfiguration configuration;
@@ -91,6 +105,7 @@ private:
     Clock::time_point lastAxisAdvance{};
     std::array<double, 4> stickAxes{};
     std::array<double, 2> triggerAxes{};
+    PitchTilt tilt;
     bool advanced = false;
     bool axesAdvanced = false;
     bool mouseMode = false;
