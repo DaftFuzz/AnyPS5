@@ -5273,7 +5273,7 @@ void BufferCache::ApplyEagerReadbacks(uint64_t vaddr, uint64_t size, bool wait) 
 			}
 			m_caller_stats.copy_exec_waits.fetch_add(1, std::memory_order_relaxed);
 			BarCopyTickWait(entry.copy_tick);
-			entry.done->store(true, std::memory_order_release);
+			HandbackLanded(entry);
 		}
 		if (!entry.done->load(std::memory_order_acquire)) {
 			if (!wait) {
@@ -5302,7 +5302,6 @@ void BufferCache::ApplyEagerReadbacks(uint64_t vaddr, uint64_t size, bool wait) 
 			const uint64_t lo = entry.start;
 			const uint64_t hi = entry.end;
 			if (HandbackRedoOn() || entry.predicted) RedoHandbackWrittenDuringFlight(entry); // KYTY_FIX_HANDBACK_REDO, KYTY_PERF_COPY_PREDICT
-			if (BarGpuCopyVerify() || (entry.predicted && CopyPredictFixed() == 2u)) VerifyCopyReadback(entry); // KYTY_PERF_BAR_GPU_COPY_VERIFY
 			entry = std::move(m_eager_readbacks.back());
 			m_eager_readbacks.pop_back();
 			InFlightRebuild();
@@ -5326,8 +5325,22 @@ void BufferCache::ApplyEagerReadbacks(uint64_t vaddr, uint64_t size, bool wait) 
 bool BufferCache::EagerDone(const EagerReadback& entry) const {
 	if (entry.done->load(std::memory_order_acquire)) return true;
 	if (entry.copy_tick == 0 || !BarCopyTickReached(entry.copy_tick)) return false;
-	entry.done->store(true, std::memory_order_release);
+	if (HandbackVerifyOn(entry) && !GuestGpu::IsGpuThread()) return false; // the GPU thread verifies it first
+	HandbackLanded(entry);
 	return true;
+}
+
+// KYTY_PERF_BAR_GPU_COPY_VERIFY (or KYTY_PERF_COPY_PREDICT=2 for a predicted copy): a hand-back copy is verified when the
+// GPU thread first finds it landed, before it is marked done. No path opens a page of a copy that is not done, so all its
+// pages are still GPU-modified and closed to the guest here: guest memory holds exactly what the copy wrote.
+bool BufferCache::HandbackVerifyOn(const EagerReadback& entry) {
+	return entry.copy_tick != 0 && (BarGpuCopyVerify() || (entry.predicted && CopyPredictFixed() == 2u));
+}
+
+void BufferCache::HandbackLanded(const EagerReadback& entry) const {
+	if (entry.done->load(std::memory_order_acquire)) return;
+	if (HandbackVerifyOn(entry) && GuestGpu::IsGpuThread()) const_cast<BufferCache*>(this)->VerifyCopyReadback(entry, true);
+	entry.done->store(true, std::memory_order_release);
 }
 
 void BufferCache::WaitCopyReadbacks(uint64_t vaddr, uint64_t size) {
@@ -5336,7 +5349,7 @@ void BufferCache::WaitCopyReadbacks(uint64_t vaddr, uint64_t size) {
 		if (entry.copy_tick == 0 || entry.end <= vaddr || vaddr + size <= entry.start || EagerDone(entry)) continue;
 		m_caller_stats.copy_exec_waits.fetch_add(1, std::memory_order_relaxed);
 		BarCopyTickWait(entry.copy_tick);
-		entry.done->store(true, std::memory_order_release);
+		HandbackLanded(entry);
 	}
 }
 
@@ -6636,7 +6649,7 @@ void BufferCache::RedoHandbackWrittenDuringFlight(const EagerReadback& entry) {
 	}
 }
 
-void BufferCache::VerifyCopyReadback(const EagerReadback& entry) {
+void BufferCache::VerifyCopyReadback(const EagerReadback& entry, bool at_landing) {
 	const auto&    bytes = entry.bytes;
 	const uint64_t view = LibKernel::Memory::GuestBackingBase();
 	if (view == 0) return;
@@ -6691,6 +6704,15 @@ void BufferCache::VerifyCopyReadback(const EagerReadback& entry) {
 		for (uint64_t lo = start; lo < end;) {
 			const uint64_t hi = std::min(end, (lo & ~(TRACKER_PAGE_SIZE - 1)) + TRACKER_PAGE_SIZE);
 			if (m_memory_tracker.IsRegionCpuModified(lo, hi - lo) || !m_memory_tracker.IsRegionGpuModified(lo, hi - lo)) {
+				if (at_landing) { // the invariant: no page of a copy that is not done is open
+					static std::atomic_uint open_lines {0};
+					if (open_lines.fetch_add(1, std::memory_order_relaxed) < 32u) {
+						std::fprintf(stderr, "HANDBACK_OPEN_BEFORE_DONE page=0x%llx gpu=%d cpu=%d write_tick=%llu frame=%u\n",
+						             static_cast<unsigned long long>(lo & ~(TRACKER_PAGE_SIZE - 1)),
+						             m_memory_tracker.IsRegionGpuModified(lo, hi - lo) ? 1 : 0, m_memory_tracker.IsRegionCpuModified(lo, hi - lo) ? 1 : 0,
+						             static_cast<unsigned long long>(entry.tick), DebugPresentCount().load());
+					}
+				}
 				std::memcpy(from_mapping.data() + (lo - start), reinterpret_cast<const uint8_t*>(view + backing + (lo - start)), hi - lo);
 				cpu_pages_skipped.fetch_add(1, std::memory_order_relaxed);
 			}
@@ -6700,7 +6722,7 @@ void BufferCache::VerifyCopyReadback(const EagerReadback& entry) {
 		if (std::memcmp(from_mapping.data(), reinterpret_cast<const uint8_t*>(view + backing), size) != 0) {
 			// After the compare: a differing page another thread opened (or the guest wrote) meanwhile is a race with the guest,
 			// not stale bytes; one still GPU-modified and CPU-clean is a mismatch (e.g. an older publish written after the copy).
-			bool     live_diff = false;
+			bool     live_diff = at_landing; // at landing the pages are closed: every difference is real
 			uint64_t raced_at  = 0;
 			for (uint64_t lo = start; lo < end && !live_diff;) {
 				const uint64_t hi = std::min(end, (lo & ~(TRACKER_PAGE_SIZE - 1)) + TRACKER_PAGE_SIZE);
