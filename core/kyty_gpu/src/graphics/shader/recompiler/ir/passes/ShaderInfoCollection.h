@@ -13,21 +13,22 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info);
 // attribute out of range and `count` the input count it was recorded with.
 [[nodiscard]] bool StageInputsFit(const Program& program, ShaderStageInputInfo input_info, uint32_t& index, uint32_t& count);
 
-// A background compile's scope (calling thread only): a record CollectShaderInfo would end the emulator on throws
-// ShaderInfoRejected instead, so the compile skips the record; the GPU thread's own compiles still stop as before.
-struct ShaderInfoRejected {
-	const char* message = nullptr;
-};
+// A background compile's scope (calling thread only): where CollectShaderInfo would end the emulator it stops checking
+// that instruction and marks the scope failed instead (CompileProgram then returns no SPIR-V and the compile skips the
+// record); the GPU thread's own compiles still stop as before.
 class ShaderInfoSoftFailScope {
 public:
 	ShaderInfoSoftFailScope();
 	~ShaderInfoSoftFailScope();
 	ShaderInfoSoftFailScope(const ShaderInfoSoftFailScope&)            = delete;
 	ShaderInfoSoftFailScope& operator=(const ShaderInfoSoftFailScope&) = delete;
+	[[nodiscard]] bool        Failed() const;
+	[[nodiscard]] const char* Message() const;
 
 private:
 	bool m_previous = false;
 };
+[[nodiscard]] bool ShaderInfoSoftFailed();
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 

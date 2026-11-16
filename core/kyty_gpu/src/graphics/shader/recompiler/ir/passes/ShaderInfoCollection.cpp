@@ -10,10 +10,16 @@
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
 
-thread_local bool t_soft_fail = false;
+thread_local bool        t_soft_fail    = false;
+thread_local bool        t_failed       = false;
+thread_local const char* t_fail_message = nullptr;
 
-[[noreturn]] void Fail(std::string_view message) {
-	if (t_soft_fail) throw ShaderInfoRejected {message.data()};
+void Fail(std::string_view message) {
+	if (t_soft_fail) {
+		if (!t_failed) t_fail_message = message.data();
+		t_failed = true;
+		return;
+	}
 	EXIT("shader info collection failed: %s", std::string(message).c_str());
 	std::abort();
 }
@@ -591,11 +597,25 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 } // namespace
 
 ShaderInfoSoftFailScope::ShaderInfoSoftFailScope(): m_previous(t_soft_fail) {
-	t_soft_fail = true;
+	t_soft_fail    = true;
+	t_failed       = false;
+	t_fail_message = nullptr;
 }
 
 ShaderInfoSoftFailScope::~ShaderInfoSoftFailScope() {
 	t_soft_fail = m_previous;
+}
+
+bool ShaderInfoSoftFailScope::Failed() const {
+	return t_failed;
+}
+
+const char* ShaderInfoSoftFailScope::Message() const {
+	return t_fail_message;
+}
+
+bool ShaderInfoSoftFailed() {
+	return t_soft_fail && t_failed;
 }
 
 bool StageInputsFit(const Program& program, ShaderStageInputInfo input_info, uint32_t& index, uint32_t& count) {
@@ -627,6 +647,7 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 		                                                : "shader info already collected");
 	}
 	ValidateOptions(program, input_info);
+	if (t_failed) return;
 	auto& info = program.info;
 	info.inputs.clear();
 	info.outputs.clear();
@@ -644,6 +665,7 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			Visit(program, input_info, inputs, inst);
+			if (t_failed) return;
 		}
 	}
 	for (uint32_t index = 0; index < inputs.user_data.size(); index++) {

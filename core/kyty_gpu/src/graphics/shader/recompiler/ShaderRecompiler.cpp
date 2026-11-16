@@ -980,6 +980,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	// elision; collect = shader info; emit = SPIR-V), one STARTUP_SLOW_COMPILE line for compiles of 200 ms or more.
 	const auto collect_begin   = startup_trace ? std::chrono::steady_clock::now() : emit_begin;
 	IR::CollectShaderInfo(ir, options.input_info);
+	if (IR::ShaderInfoSoftFailed()) return CompileResult {};
 	const auto spirv_begin     = startup_trace ? std::chrono::steady_clock::now() : emit_begin;
 	std::string ir_dump;
 	if (options.dump_ir) {
