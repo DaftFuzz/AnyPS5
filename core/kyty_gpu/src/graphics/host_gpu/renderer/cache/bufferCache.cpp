@@ -6729,12 +6729,13 @@ void BufferCache::VerifyCopyReadback(const EagerReadback& entry) {
 		if (!buffer.IsCoherent()) buffer.Invalidate(0, buffer.Size());
 		if (from_mapping.size() < size) from_mapping.resize(size);
 		CopyFromWriteCombined(from_mapping.data(), buffer.Mapped().data() + (start - buffer.CpuAddress()), size);
-		// Pages the guest wrote since another download opened them (that download waited for this copy first, which marked it
-		// done before this apply): guest memory holds newer bytes there, so they are not compared.
+		// Pages another download opened before this apply (it waited for this copy first, which marked it done): the guest
+		// may write them at any moment, its write fault possibly marking them CPU-dirty only later, so guest memory can hold
+		// newer bytes there and they are not compared. This entry's own pages stay GPU-modified until its apply.
 		static std::atomic<uint64_t> cpu_pages_skipped {0};
 		for (uint64_t lo = start; lo < end;) {
 			const uint64_t hi = std::min(end, (lo & ~(TRACKER_PAGE_SIZE - 1)) + TRACKER_PAGE_SIZE);
-			if (m_memory_tracker.IsRegionCpuModified(lo, hi - lo)) {
+			if (m_memory_tracker.IsRegionCpuModified(lo, hi - lo) || !m_memory_tracker.IsRegionGpuModified(lo, hi - lo)) {
 				std::memcpy(from_mapping.data() + (lo - start), reinterpret_cast<const uint8_t*>(view + backing + (lo - start)), hi - lo);
 				cpu_pages_skipped.fetch_add(1, std::memory_order_relaxed);
 			}
