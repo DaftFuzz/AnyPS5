@@ -78,6 +78,7 @@ vk::Result QueueSubmitLocked(GraphicContext& graphics, vk::CommandBuffer buffer,
 // What the recorder's worker needs to submit an ended render buffer.
 struct AsyncSubmitPacket {
 	GraphicContext*   graphics = nullptr;
+	MasterSemaphore*  master   = nullptr;
 	vk::CommandBuffer buffer;
 	SubmitInfo        submit;
 	uint64_t          tick         = 0;
@@ -100,6 +101,7 @@ void AsyncSubmitOnWorker(const void* blob) {
 		                  packet.debug_arg4);
 		EXIT("vkQueueSubmit failed on the record thread\n");
 	}
+	if (packet.master != nullptr) packet.master->NoteQueueSubmitted(packet.tick);
 }
 
 // Submission batching: fewer submissions while the GPU still runs work it was handed. A submission
@@ -531,6 +533,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		submit.AddSignal(m_master.Handle(), tick);
 		AsyncSubmitPacket packet;
 		packet.graphics     = &graphics;
+		packet.master       = &m_master;
 		packet.buffer       = buffer;
 		packet.submit       = submit;
 		packet.tick         = tick;
@@ -547,6 +550,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		tick = m_master.NextTick();
 		submit.AddSignal(m_master.Handle(), tick);
 		result = QueueSubmitLocked(graphics, buffer, submit);
+		if (result == vk::Result::eSuccess) m_master.NoteQueueSubmitted(tick);
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
 

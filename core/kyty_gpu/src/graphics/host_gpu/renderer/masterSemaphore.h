@@ -27,6 +27,15 @@ public:
 		return m_current_tick_p->fetch_add(1, std::memory_order_release);
 	}
 	[[nodiscard]] vk::Semaphore Handle() const noexcept { return m_semaphore; }
+	// The newest tick whose signalling submission vkQueueSubmit has accepted (the recorder's worker submits later than
+	// the tick is taken). A submission on another queue that waits for a tick must not run ahead of it: the driver may
+	// hold queue operations behind that wait while the signalling submission waits for the queue lock.
+	[[nodiscard]] uint64_t QueueSubmittedTick() const noexcept { return m_queue_submitted.load(std::memory_order_acquire); }
+	void                   NoteQueueSubmitted(uint64_t tick) noexcept {
+		uint64_t seen = m_queue_submitted.load(std::memory_order_relaxed);
+		while (seen < tick && !m_queue_submitted.compare_exchange_weak(seen, tick, std::memory_order_release, std::memory_order_relaxed)) {
+		}
+	}
 
 	// Refresh queries the timeline semaphore (a kernel call) at most once per 100 microseconds; in between it keeps the
 	// last known GPU tick, which only makes IsFree conservative for that long. RefreshNow and Wait always query.
@@ -54,6 +63,7 @@ public:
 private:
 	GraphicContext&       m_graphics;
 	vk::Semaphore         m_semaphore = nullptr;
+	std::atomic<uint64_t> m_queue_submitted {0};
 	// KYTY_PERF_PAD_HOT=1 (route-to-30 item 5; default 0, start value only): the GPU tick (written by the completion thread
 	// and every refresh), the current tick and the refresh time (written by the GPU thread) each on their own cache line
 	// instead of one shared line; only where they live changes.

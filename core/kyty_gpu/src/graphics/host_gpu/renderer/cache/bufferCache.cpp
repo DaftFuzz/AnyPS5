@@ -6018,7 +6018,7 @@ struct BarGpuCopier {
 	std::array<AsyncSlot, 8> slots {};
 	uint64_t                 issued = 0;
 	std::atomic<uint64_t>    reached {0}; // the newest value seen reached
-	uint64_t                 async_copies = 0, async_bytes = 0, async_no_slot = 0;
+	uint64_t                 async_copies = 0, async_bytes = 0, async_no_slot = 0, async_unsubmitted = 0;
 	int64_t  window_start = 0;
 };
 
@@ -6044,14 +6044,14 @@ void ReportBarGpuCopyLocked(BarGpuCopier& c) {
 	             ull(c.reads), ull(c.bytes >> 10u), ull(c.span_count), ms(c.record_ns), ms(c.wait_ns), ms(c.publish_ns),
 	             ull(c.fallback_size), ull(c.fallback_thread), ull(c.fallback_init), ull(c.verified), ull(c.mismatched),
 	             ull(c.polled), ull(c.direct), ull(c.direct_bytes >> 10u), ull(c.direct_declined));
-	if (c.async_copies != 0 || c.async_no_slot != 0) {
-		std::fprintf(stderr, "PERF copy_handback copies=%llu kb=%llu no_slot=%llu (per ~5 s)\n", ull(c.async_copies),
-		             ull(c.async_bytes >> 10u), ull(c.async_no_slot));
+	if (c.async_copies != 0 || c.async_no_slot != 0 || c.async_unsubmitted != 0) {
+		std::fprintf(stderr, "PERF copy_handback copies=%llu kb=%llu no_slot=%llu unsubmitted=%llu (per ~5 s)\n",
+		             ull(c.async_copies), ull(c.async_bytes >> 10u), ull(c.async_no_slot), ull(c.async_unsubmitted));
 	}
 	c.reads = c.bytes = c.span_count = c.record_ns = c.wait_ns = c.publish_ns = 0;
 	c.fallback_size = c.fallback_thread = c.fallback_init = c.verified = c.mismatched = c.polled = 0;
 	c.direct = c.direct_bytes = c.direct_declined = 0;
-	c.async_copies = c.async_bytes = c.async_no_slot = 0;
+	c.async_copies = c.async_bytes = c.async_no_slot = c.async_unsubmitted = 0;
 }
 
 // TryBarDownload, after its waits: the GPU copy and the publish of `intervals` of `buffer` (at guest address `base`);
@@ -6258,6 +6258,13 @@ uint64_t BarGpuCopyAsync(CommandScheduler& scheduler, Buffer& buffer, uint64_t n
 	auto&            c = Copier();
 	std::scoped_lock lock(c.mutex);
 	if (!c.ready || !c.timeline || !GuestGpu::IsGpuThread()) return 0;
+	// The write tick's own submission must be in the driver first: the recorder's worker may still hold it, and a
+	// second-queue wait on an unsubmitted tick lets the driver stall the present (queue lock held) that the worker's
+	// submission then waits behind (run 20261116-003452 hang dump). Declined: the caller takes the plain hand-back.
+	if (newest > scheduler.GetMasterSemaphore().QueueSubmittedTick()) {
+		c.async_unsubmitted++;
+		return 0;
+	}
 	BarGpuCopier::AsyncSlot* slot    = nullptr;
 	uint64_t                 counter = c.reached.load(std::memory_order_acquire);
 	for (int pass = 0; pass < 2 && slot == nullptr; pass++) {
