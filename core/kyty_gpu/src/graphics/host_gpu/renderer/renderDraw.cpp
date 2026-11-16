@@ -4172,6 +4172,10 @@ bool RenderExecutor::ResolveTaskInto(ResolvedDraw& slot, const ResolveTask& task
 		if ((t_ahead_helper.planned & 255u) == 0 && row < 2u) {
 			g_helper_plan_snap[row].Publish(t_ahead_helper, t_helper_plans_made, t_helper_packets);
 		}
+	} else if (ok && !task.dispatch && CompileJobsMode() >= 3u && !task.gpu_indirect && task.draw_count != 0 && task.draw_indirect == 0 &&
+	           slot.shaders == task.shaders && PipelineCache::FirstUsePrebuildWanted(*slot.stages)) {
+		m_context.GetPipelineCache().NotePrebuildDrop(PipelineCache::PrebuildDrop::ShortLead);
+		PlanFirstUsePrebuild(&slot, *task.context, *task.user_config, task.indexed, task.index_type, task.slice_offset);
 	}
 	if (task.writes_verdict != nullptr) {
 		const uint8_t verdict = ok ? PipelineCache::ResolvedWrites(*slot.stages) : 3u;
@@ -4416,8 +4420,13 @@ bool RenderExecutor::TakeAheadImages(const void* program, PeekStageImagesResult&
 void RenderExecutor::PlanFirstUsePrebuild(ResolvedDraw* slot, const HW::Context& ctx, const HW::UserConfig& ucfg, bool indexed,
                                           uint32_t index_type, uint32_t slice_offset) {
 	auto& state = slot->state;
-	if (state.programs.VertexStageCount() != 1u || state.vertex_info[0].logical_stage != ShaderType::Vertex) return;
-	if (ctx.GetColorControl().mode > static_cast<uint8_t>(CbColorMode::Normal) || DepthStencilCopyAsked(ctx)) return;
+	auto& pc    = m_context.GetPipelineCache();
+	if (state.programs.VertexStageCount() != 1u || state.vertex_info[0].logical_stage != ShaderType::Vertex) {
+		return pc.NotePrebuildDrop(PipelineCache::PrebuildDrop::Shape);
+	}
+	if (ctx.GetColorControl().mode > static_cast<uint8_t>(CbColorMode::Normal) || DepthStencilCopyAsked(ctx)) {
+		return pc.NotePrebuildDrop(PipelineCache::PrebuildDrop::ColorOp);
+	}
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
 	uint32_t              element  = 0;
 	if (indexed) {
@@ -4428,7 +4437,7 @@ void RenderExecutor::PlanFirstUsePrebuild(ResolvedDraw* slot, const HW::Context&
 			default: element = 0; break;
 		}
 	}
-	if (!GetDrawTopology(ucfg, topology) || (indexed && element == 0)) return;
+	if (!GetDrawTopology(ucfg, topology) || (indexed && element == 0)) return pc.NotePrebuildDrop(PipelineCache::PrebuildDrop::Topology);
 	std::array<RenderColorInfo, RENDER_COLOR_ATTACHMENTS_MAX> colors {};
 	uint32_t                                                  colors_ok = 0;
 	t_describe_soft = true;
@@ -4445,7 +4454,7 @@ void RenderExecutor::PlanFirstUsePrebuild(ResolvedDraw* slot, const HW::Context&
 	t_describe_failed               = false;
 	t_describe_soft                 = false;
 	const bool restart = indexed && ClassifyPrimitiveRestartRegs(ucfg, ctx, element) == PrimitiveRestartKind::Native;
-	m_context.GetPipelineCache().QueueFirstUsePrebuild(
+	pc.QueueFirstUsePrebuild(
 	    *slot->stages, std::span<const ShaderVertexInputInfo>(state.vertex_info.data(), 1), state.ps_active ? &state.ps_input_info : nullptr,
 	    ctx, ucfg, colors, colors_ok, DrawColorOutputMask(ctx), depth, depth_ok, topology, restart);
 }

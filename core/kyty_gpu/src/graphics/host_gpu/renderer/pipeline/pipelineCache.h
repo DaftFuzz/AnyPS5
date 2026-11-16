@@ -408,6 +408,8 @@ public:
 	// (colors_by_slot[slot], valid where colors_ok has the bit), its pipeline created; the GPU thread takes it when the
 	// pipeline it is about to create has exactly the same stage records and state (=4: both made and compared).
 	[[nodiscard]] static bool FirstUsePrebuildWanted(const ResolvedStages& results);
+	enum class PrebuildDrop : uint8_t { ShortLead, Shape, ColorOp, Topology, Stages, Code, Seen, Full, Count };
+	void NotePrebuildDrop(PrebuildDrop reason);
 	void QueueFirstUsePrebuild(const ResolvedStages& results, std::span<const ShaderVertexInputInfo> vertex_info,
 	                           const ShaderPixelInputInfo* ps_input_info, const HW::Context& ctx, const HW::UserConfig& user_config,
 	                           std::span<const RenderColorInfo> colors_by_slot, uint32_t colors_ok, uint32_t color_output_mask,

@@ -215,6 +215,7 @@ struct PipelineCache::FirstUsePrebuilds {
 	std::atomic<uint64_t> logged {0};
 	std::array<std::atomic<uint64_t>, 6> vs_why {}, ps_why {}; // static, push, buffers, images, samplers, none of these
 	std::atomic<uint64_t> absent_first_use {0}, abandoned {0}, boosted {0};
+	std::array<std::atomic<uint64_t>, static_cast<size_t>(PipelineCache::PrebuildDrop::Count)> drops {};
 	std::mutex                                              mutex;
 	std::unordered_set<uint64_t>                            seen;
 	std::unordered_multimap<uint64_t, std::shared_ptr<Job>> by_pair;
@@ -4200,6 +4201,12 @@ uint64_t PrebuildPair(uint64_t vs_hash, uint64_t ps_hash) {
 }
 } // namespace
 
+void PipelineCache::NotePrebuildDrop(PrebuildDrop reason) {
+	if (m_prebuilds != nullptr && reason < PrebuildDrop::Count) {
+		m_prebuilds->drops[static_cast<size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
 bool PipelineCache::FirstUsePrebuildWanted(const ResolvedStages& results) {
 	if (results.first_use.empty() || results.first_use_block) return false;
 	for (uint32_t i = 0; i < results.count; i++) {
@@ -4214,9 +4221,9 @@ void PipelineCache::QueueFirstUsePrebuild(const ResolvedStages& results, std::sp
                                           uint32_t colors_ok, uint32_t color_output_mask, const RenderDepthInfo& depth,
                                           bool depth_ok, vk::PrimitiveTopology topology, bool restart) {
 	if (m_precompiler == nullptr || !FirstUsePrebuildWanted(results) || colors_by_slot.size() != RENDER_COLOR_ATTACHMENTS_MAX) return;
-	if (vertex_info.size() != 1u || vertex_info[0].logical_stage != ShaderType::Vertex) return;
+	if (vertex_info.size() != 1u || vertex_info[0].logical_stage != ShaderType::Vertex) return NotePrebuildDrop(PrebuildDrop::Shape);
 	const bool ps_active = ps_input_info != nullptr;
-	if (results.order_count != (ps_active ? 2u : 1u)) return;
+	if (results.order_count != (ps_active ? 2u : 1u)) return NotePrebuildDrop(PrebuildDrop::Stages);
 	struct StageIn {
 		PrecompileStageRecord record;
 		bool                  first_use = false;
@@ -4246,7 +4253,7 @@ void PipelineCache::QueueFirstUsePrebuild(const ResolvedStages& results, std::sp
 			mark      = mark * 0x9e3779b97f4a7c15ull ^ XXH3_64bits(rec.specialization.images.data(), rec.specialization.images.size() * sizeof(rec.specialization.images[0]));
 		} else {
 			const auto& fu = results.first_use[static_cast<size_t>(-idx - 1)];
-			if (fu.back_size != 0u) return;
+			if (fu.back_size != 0u) return NotePrebuildDrop(PrebuildDrop::Code);
 			rec.stage       = fu.stage;
 			rec.shader_hash = fu.hash;
 			rec.user_data   = fu.user_data;
@@ -4255,18 +4262,18 @@ void PipelineCache::QueueFirstUsePrebuild(const ResolvedStages& results, std::sp
 			s.first_use     = true;
 		}
 		const auto* code = reinterpret_cast<const uint32_t*>(base);
-		if (code == nullptr || code_size == 0u) return;
+		if (code == nullptr || code_size == 0u) return NotePrebuildDrop(PrebuildDrop::Code);
 		rec.code.assign(code, code + code_size);
-		if (PrecompileCodeHash(rec.code, {}) != rec.shader_hash) return;
+		if (PrecompileCodeHash(rec.code, {}) != rec.shader_hash) return NotePrebuildDrop(PrebuildDrop::Code);
 		if (rec.stage == ShaderType::Pixel) {
-			if (!ps_active) return;
+			if (!ps_active) return NotePrebuildDrop(PrebuildDrop::Stages);
 			rec.pixel       = *ps_input_info;
 			rec.pixel.stage = {};
 			if (s.first_use) BuildStageStaticKey(rec.pixel, rec.static_key);
 			ps_hash = rec.shader_hash;
 			pixel_stages++;
 		} else {
-			if (rec.stage != ShaderType::Vertex) return;
+			if (rec.stage != ShaderType::Vertex) return NotePrebuildDrop(PrebuildDrop::Shape);
 			rec.vertex       = vertex_info[0];
 			rec.vertex.stage = {};
 			if (s.first_use) BuildStageStaticKey(rec.vertex, rec.static_key);
@@ -4278,7 +4285,7 @@ void PipelineCache::QueueFirstUsePrebuild(const ResolvedStages& results, std::sp
 		       XXH3_64bits(rec.user_data.data(), rec.user_data.size() * sizeof(uint32_t));
 		stages.push_back(std::move(s));
 	}
-	if (pixel_stages != (ps_active ? 1u : 0u) || vs_hash == 0u) return;
+	if (pixel_stages != (ps_active ? 1u : 0u) || vs_hash == 0u) return NotePrebuildDrop(PrebuildDrop::Stages);
 	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
 		if ((colors_ok & (1u << slot)) == 0) continue;
 		const auto format = colors_by_slot[slot].desc.view_info.format;
@@ -4290,10 +4297,18 @@ void PipelineCache::QueueFirstUsePrebuild(const ResolvedStages& results, std::sp
 	auto job       = std::make_shared<FirstUsePrebuilds::Job>();
 	{
 		std::lock_guard lock(prebuilds->mutex);
-		if (!prebuilds->seen.insert(mark).second) return;
-		if (prebuilds->pending >= 64u) {
+		static const uint32_t pending_max = [] {
+			const char* value = std::getenv("KYTY_PERF_PREBUILD_PENDING");
+			return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 512u;
+		}();
+		if (!prebuilds->seen.insert(mark).second) {
+			prebuilds->drops[static_cast<size_t>(PrebuildDrop::Seen)].fetch_add(1, std::memory_order_relaxed);
+			return;
+		}
+		if (prebuilds->pending >= pending_max) {
 			prebuilds->seen.erase(mark);
 			prebuilds->full.fetch_add(1, std::memory_order_relaxed);
+			prebuilds->drops[static_cast<size_t>(PrebuildDrop::Full)].fetch_add(1, std::memory_order_relaxed);
 			return;
 		}
 		prebuilds->pending++;
@@ -4484,7 +4499,8 @@ void PipelineCache::ReportFirstUsePrebuild() const {
 	             "adopted=%llu check_match=%llu waited=%llu wait_ms=%.0f cancelled=%llu absent=%llu "
 	             "differ[vs_key|ps_key|rendering|vertex_input|static|spirv]=%llu|%llu|%llu|%llu|%llu|%llu "
 	             "vs_why[static|push|buffers|images|samplers|other]=%llu|%llu|%llu|%llu|%llu|%llu "
-	             "ps_why=%llu|%llu|%llu|%llu|%llu|%llu absent_first_use=%llu abandoned=%llu boosted=%llu\n",
+	             "ps_why=%llu|%llu|%llu|%llu|%llu|%llu absent_first_use=%llu abandoned=%llu boosted=%llu "
+	             "plan[short_lead|shape|colorop|topology|stages|code|seen|full]=%llu|%llu|%llu|%llu|%llu|%llu|%llu|%llu\n",
 	             CompileJobsMode(), u(prebuilds->queued), u(prebuilds->full), u(prebuilds->built),
 	             static_cast<double>(u(prebuilds->build_us)) / 1000.0, u(prebuilds->plan_fail), u(prebuilds->stage_fail),
 	             u(prebuilds->key_fail), u(prebuilds->create_fail), u(prebuilds->adopted), u(prebuilds->check_match),
@@ -4494,7 +4510,8 @@ void PipelineCache::ReportFirstUsePrebuild() const {
 	             u(prebuilds->vs_why[1]), u(prebuilds->vs_why[2]), u(prebuilds->vs_why[3]), u(prebuilds->vs_why[4]),
 	             u(prebuilds->vs_why[5]), u(prebuilds->ps_why[0]), u(prebuilds->ps_why[1]), u(prebuilds->ps_why[2]),
 	             u(prebuilds->ps_why[3]), u(prebuilds->ps_why[4]), u(prebuilds->ps_why[5]), u(prebuilds->absent_first_use),
-	             u(prebuilds->abandoned), u(prebuilds->boosted));
+	             u(prebuilds->abandoned), u(prebuilds->boosted), u(prebuilds->drops[0]), u(prebuilds->drops[1]), u(prebuilds->drops[2]),
+	             u(prebuilds->drops[3]), u(prebuilds->drops[4]), u(prebuilds->drops[5]), u(prebuilds->drops[6]), u(prebuilds->drops[7]));
 	std::fflush(stderr);
 }
 
