@@ -296,6 +296,7 @@ public:
 	static void        InstallAhead(ResolvedStages& results, AheadSaved& saved);
 	static void        RestoreAhead(ResolvedStages& results, const AheadSaved& saved);
 	[[nodiscard]] static bool     StagesAdoptable(const ResolvedStages& results);
+	[[nodiscard]] static bool     StagePairMissing(const ResolvedStages& results, uint64_t& vs_hash, uint64_t& ps_hash);
 	// KYTY_PERF_DRAIN_FREE_WAIT: whether the resolved stages can write buffer memory: 1 none of them can (every stage has
 	// the permutation it will run and neither it nor its source plan writes a buffer, an image, a record-keyed range,
 	// through an address or by DMA), 2 a stage can, 3 not known (not adoptable, a stage without its permutation).

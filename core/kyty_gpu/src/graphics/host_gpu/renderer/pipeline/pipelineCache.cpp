@@ -2995,6 +2995,18 @@ bool PipelineCache::StagesAdoptable(const ResolvedStages& results) {
 	return results.adoptable && results.count != 0;
 }
 
+bool PipelineCache::StagePairMissing(const ResolvedStages& results, uint64_t& vs_hash, uint64_t& ps_hash) {
+	vs_hash        = 0;
+	ps_hash        = 0;
+	bool missing   = !results.adoptable;
+	for (uint32_t i = 0; i < std::min(results.count, 4u); i++) {
+		const auto& r = results.stages[i];
+		(r.stage == ShaderType::Pixel ? ps_hash : vs_hash) = r.shader_hash;
+		missing = missing || r.permutation == nullptr;
+	}
+	return missing && results.count != 0;
+}
+
 namespace {
 bool InfoWrites(const ShaderRecompiler::IR::ShaderInfo& info) {
 	return info.uses_dma || std::ranges::any_of(info.buffers, [](const auto& b) { return b.written; }) ||

@@ -3344,6 +3344,8 @@ struct MissPairEntry {
 };
 std::mutex                                  g_miss_pairs_mutex;
 std::unordered_map<uint64_t, MissPairEntry> g_miss_pairs;
+std::mutex                                    g_peek_pairs_mutex;
+std::unordered_map<uint64_t, PeekPairOutcome> g_peek_pairs;
 
 uint64_t MissPairKey(uint64_t vs_hash, uint64_t ps_hash) {
 	return vs_hash * 0x9e3779b97f4a7c15ull ^ ps_hash;
@@ -3359,6 +3361,29 @@ void NoteMissPair(uint64_t vs_hash, uint64_t ps_hash, MissPairState state) {
 	}
 	if (entry.state == MissPairState::Created && state != MissPairState::Created) return;
 	entry.state = state;
+}
+
+void NotePeekPair(uint64_t vs_hash, uint64_t ps_hash, PeekPairOutcome outcome) {
+	std::lock_guard lock(g_peek_pairs_mutex);
+	g_peek_pairs[MissPairKey(vs_hash, ps_hash)] = outcome;
+}
+
+const char* PeekPairName(uint64_t vs_hash, uint64_t ps_hash) {
+	std::lock_guard lock(g_peek_pairs_mutex);
+	const auto      found = g_peek_pairs.find(MissPairKey(vs_hash, ps_hash));
+	if (found == g_peek_pairs.end()) return "unseen";
+	switch (found->second) {
+		case PeekPairOutcome::GatedAdopt: return "gated_adopt";
+		case PeekPairOutcome::GatedOther: return "gated_other";
+		case PeekPairOutcome::Predicted: return "predicted";
+		case PeekPairOutcome::StandIn: return "standin";
+		case PeekPairOutcome::NoStandIn: return "no_standin";
+		case PeekPairOutcome::DescribeFailed: return "describe_failed";
+		case PeekPairOutcome::Found: return "found";
+		case PeekPairOutcome::AheadQueued: return "ahead_queued";
+		case PeekPairOutcome::Mesh: return "mesh_or_indirect";
+		default: return "unseen";
+	}
 }
 
 const char* MissPairName(uint64_t vs_hash, uint64_t ps_hash, double& queued_ms_ago) {

@@ -127,6 +127,9 @@ struct PrecompileGraphicsMiss {
 enum class MissPairState : uint8_t { None, Queued, Running, Known, Created, Failed };
 void                      NoteMissPair(uint64_t vs_hash, uint64_t ps_hash, MissPairState state);
 [[nodiscard]] const char* MissPairName(uint64_t vs_hash, uint64_t ps_hash, double& queued_ms_ago);
+enum class PeekPairOutcome : uint8_t { None, GatedAdopt, GatedOther, Predicted, StandIn, NoStandIn, DescribeFailed, Found, AheadQueued, Mesh };
+void                      NotePeekPair(uint64_t vs_hash, uint64_t ps_hash, PeekPairOutcome outcome);
+[[nodiscard]] const char* PeekPairName(uint64_t vs_hash, uint64_t ps_hash);
 
 // --export-hints <file> (PipelineCache, with --precompile-only): the shader journals of this mode written as a hints file
 // without the game's code (shaderPrecompile.cpp, before PrecompileHintsExport's body: the format). False when there is

@@ -36,6 +36,7 @@
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderPrecompile.h"
 #include "graphics/host_gpu/renderer/dispatchCensus.h"
 #include "graphics/host_gpu/renderer/cleanDraws.h"
 #include "graphics/guest_gpu/drawStateObserver.h"
@@ -4437,8 +4438,14 @@ void RenderExecutor::PeekAhead(ResolvedDraw* slot, const HW::Context& ctx, const
 		a.gated[2]++;
 		return;
 	}
+	uint64_t   pair_vs = 0, pair_ps = 0;
+	const bool pair_note = PipelineCache::StagePairMissing(*slot->stages, pair_vs, pair_ps);
+	const auto note      = [&](PeekPairOutcome outcome) {
+		if (pair_note) NotePeekPair(pair_vs, pair_ps, outcome);
+	};
 	if (!PipelineCache::StagesAdoptable(*slot->stages)) {
 		a.gated[3]++;
+		note(PeekPairOutcome::GatedAdopt);
 		return;
 	}
 	// N7.2: a GPU indirect packet passes the execution thread's early checks (ranges clamped without a write) or has no plan.
@@ -4446,14 +4453,17 @@ void RenderExecutor::PeekAhead(ResolvedDraw* slot, const HW::Context& ctx, const
 	if (gpu_indirect != nullptr) {
 		if (IndirectEarlyChecks(m_context.GetGraphics(), ucfg, ctx, *gpu_indirect, true, early) != nullptr || early.no_draw) {
 			a.gated[8]++;
+			note(PeekPairOutcome::GatedOther);
 			return;
 		}
 	} else if (count == 0 || instances == 0 || indirect != 0) {
 		a.gated[4]++;
+		note(PeekPairOutcome::GatedOther);
 		return;
 	}
 	if (ctx.GetColorControl().mode > static_cast<uint8_t>(CbColorMode::Normal) || DepthStencilCopyAsked(ctx)) {
 		a.gated[5]++;
+		note(PeekPairOutcome::GatedOther);
 		return;
 	}
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
@@ -4468,6 +4478,7 @@ void RenderExecutor::PeekAhead(ResolvedDraw* slot, const HW::Context& ctx, const
 	}
 	if (!GetDrawTopology(ucfg, topology) || (indexed && element == 0)) {
 		a.gated[6]++;
+		note(PeekPairOutcome::GatedOther);
 		return;
 	}
 	auto& pc = m_context.GetPipelineCache();
@@ -4480,6 +4491,7 @@ void RenderExecutor::PeekAhead(ResolvedDraw* slot, const HW::Context& ctx, const
 		if (CompileJobsMode() < 2u || !pc.PeekStandIn(*slot->stages)) {
 			--t_translator;
 			a.compile++;
+			note(PeekPairOutcome::NoStandIn);
 			return;
 		}
 		standin = true;
@@ -4491,9 +4503,11 @@ void RenderExecutor::PeekAhead(ResolvedDraw* slot, const HW::Context& ctx, const
 	bool  front = false;
 	if (state.vertex_info[0].stage.program == nullptr || state.vertex_info[0].stage.program->stage == ShaderType::Mesh) {
 		a.gated[7]++;
+		note(PeekPairOutcome::Mesh);
 	} else if (gpu_indirect != nullptr &&
 	           (state.programs.VertexStageCount() != 1u || state.vertex_info[0].stage.program->stage != ShaderType::Vertex)) {
 		a.gated[9]++; // N7.2: the packet goes to the CPU expansion after taking the slot (no key: nothing else is planned)
+		note(PeekPairOutcome::Mesh);
 	} else {
 		// The targets as PrepareDrawRenderState finds them, from the predicted pixel program's outputs.
 		const auto color_output_mask = DrawColorOutputMask(ctx);
@@ -4529,12 +4543,14 @@ void RenderExecutor::PeekAhead(ResolvedDraw* slot, const HW::Context& ctx, const
 		const bool describe_failed = std::exchange(t_describe_failed, false); // never left set (n5-1-uwagi.md 0.1)
 		if (describe_failed) {
 			a.describe_failed++;
+			note(PeekPairOutcome::DescribeFailed);
 			PipelineCache::RestoreAhead(*slot->stages, saved);
 			slot->ahead.planned = false;
 			--t_translator;
 			return;
 		}
 		if (standin) {
+			note(PeekPairOutcome::StandIn);
 			pc.QueueAheadGraphicsMiss(*slot->stages, slot->ahead.key, vertex_stages, state.ps_active ? &state.ps_input_info : nullptr);
 			PipelineCache::RestoreAhead(*slot->stages, saved);
 			--t_translator;
@@ -4546,6 +4562,9 @@ void RenderExecutor::PeekAhead(ResolvedDraw* slot, const HW::Context& ctx, const
 		if (slot->ahead.find.second == PipelineCache::PipelineFind::Missing && CompileJobsEnabled()) {
 			pc.QueueAheadGraphicsPipeline(slot->ahead.key, vertex_stages, state.ps_active ? &state.ps_input_info : nullptr,
 			                              state.programs);
+			note(PeekPairOutcome::AheadQueued);
+		} else {
+			note(front ? PeekPairOutcome::Found : PeekPairOutcome::Predicted);
 		}
 		// The stages' images and samplers, with the predicted programs.
 		for (uint32_t i = 0; i < PipelineCache::StageCount(*slot->stages); i++) {
