@@ -4247,6 +4247,20 @@ void RaiseThreadPriority(std::thread& thread) {
 #endif
 }
 } // namespace
+uint64_t CurrentBackgroundThreadHandle() {
+	thread_local HANDLE handle = [] {
+		HANDLE out = nullptr;
+		DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &out, THREAD_SET_INFORMATION, FALSE, 0);
+		return out;
+	}();
+	return reinterpret_cast<uint64_t>(handle);
+}
+void BoostBackgroundThread(uint64_t handle) {
+	if (handle != 0u) SetThreadPriority(reinterpret_cast<HANDLE>(handle), THREAD_PRIORITY_NORMAL);
+}
+void RestoreBackgroundThreadPriority() {
+	LowerCurrentThreadPriority();
+}
 } // namespace Libs::Graphics
 #else
 extern char** environ; // NOLINT(readability-redundant-declaration)
@@ -4256,5 +4270,10 @@ namespace {
 void LowerCurrentThreadPriority() {}
 void RaiseThreadPriority(std::thread& /*thread*/) {}
 } // namespace
+uint64_t CurrentBackgroundThreadHandle() {
+	return 0;
+}
+void BoostBackgroundThread(uint64_t /*handle*/) {}
+void RestoreBackgroundThreadPriority() {}
 } // namespace Libs::Graphics
 #endif

@@ -196,7 +196,9 @@ struct ResolvedStages {
 
 struct PipelineCache::FirstUsePrebuilds {
 	struct Job {
-		std::atomic<uint8_t>      state {0}; // 0 queued, 1 running, 2 finished, 3 cancelled by the GPU thread
+		std::atomic<uint8_t>      state {0}; // 0 queued, 1 running, 2 finished, 3 cancelled, 4 abandoned by the GPU thread
+		std::atomic<uint64_t>     thread {0};
+		std::atomic<bool>         boosted {false};
 		PrecompileGraphicsRecord  record;
 		uint64_t                  vs_spirv = 0, ps_spirv = 0;
 		std::unique_ptr<Pipeline> pipeline;
@@ -212,7 +214,7 @@ struct PipelineCache::FirstUsePrebuilds {
 	};
 	std::atomic<uint64_t> logged {0};
 	std::array<std::atomic<uint64_t>, 6> vs_why {}, ps_why {}; // static, push, buffers, images, samplers, none of these
-	std::atomic<uint64_t> absent_first_use {0};
+	std::atomic<uint64_t> absent_first_use {0}, abandoned {0}, boosted {0};
 	std::mutex                                              mutex;
 	std::unordered_set<uint64_t>                            seen;
 	std::unordered_multimap<uint64_t, std::shared_ptr<Job>> by_pair;
@@ -2158,6 +2160,7 @@ void PipelineCache::StopBackgroundCompiles() {
 	// KYTY_PERF_TABLE_ASYNC: its workers first (one may wait for a precompiler job: ShaderPrecompiler::BeforeCompile);
 	// nothing is queued after this.
 	if (m_table_workers != nullptr) m_table_workers->Stop();
+	if (m_prebuild_workers != nullptr) m_prebuild_workers->Stop();
 	m_table_workers_stopped = true;
 	if (m_precompiler != nullptr) m_precompiler->Stop();
 }
@@ -2283,6 +2286,7 @@ PipelineCache::~PipelineCache() {
 	// KYTY_PERF_TABLE_ASYNC: its workers first (they use the precompiler, the driver cache and the programs' modules);
 	// the pipelines they made that no draw took yet are destroyed with the others.
 	m_table_workers.reset();
+	m_prebuild_workers.reset();
 	m_gpl_workers.reset();
 	for (Pipeline* p: m_gpl_live) {
 		if (p->gpl == nullptr || p->gpl->state.load(std::memory_order_acquire) != 2u) continue;
@@ -4326,11 +4330,28 @@ void PipelineCache::QueueFirstUsePrebuild(const ResolvedStages& results, std::sp
 	}
 	{
 		const std::lock_guard lock(m_ahead_workers_mutex);
-		if (m_table_workers == nullptr) m_table_workers = std::make_unique<TableCompileWorkers>(TableAsyncThreads());
+		if (m_table_workers_stopped) return;
+		if (m_prebuild_workers == nullptr) {
+			static const uint32_t threads = [] {
+				const char* value = std::getenv("KYTY_PERF_PREBUILD_THREADS");
+				const auto  n     = value != nullptr ? std::strtoul(value, nullptr, 10) : 3ul;
+				return static_cast<uint32_t>(std::clamp<unsigned long>(n, 1ul, 16ul));
+			}();
+			m_prebuild_workers = std::make_unique<TableCompileWorkers>(threads, "Thread_Prebuild");
+		}
 	}
-	m_table_workers->Push([this, prebuilds, job, in] {
+	m_prebuild_workers->Push([this, prebuilds, job, in] {
 		const auto finish = [&](std::atomic<uint64_t>* counter) {
 			if (counter != nullptr) counter->fetch_add(1, std::memory_order_relaxed);
+			uint8_t running = 1;
+			const bool kept = job->state.compare_exchange_strong(running, 2, std::memory_order_acq_rel);
+			if (!kept && job->pipeline != nullptr) {
+				auto& p = *job->pipeline;
+				if (p.pipeline != nullptr) m_graphics.device.destroyPipeline(p.pipeline, nullptr);
+				if (p.pipeline_layout != nullptr) m_graphics.device.destroyPipelineLayout(p.pipeline_layout, nullptr);
+				if (p.descriptor_set_layout != nullptr) m_graphics.device.destroyDescriptorSetLayout(p.descriptor_set_layout, nullptr);
+				job->pipeline.reset();
+			}
 			if (job->pipeline == nullptr) {
 				for (auto module: job->modules) m_precompiler->DestroyModule(module);
 				job->modules.clear();
@@ -4339,7 +4360,7 @@ void PipelineCache::QueueFirstUsePrebuild(const ResolvedStages& results, std::sp
 				std::lock_guard lock(prebuilds->mutex);
 				prebuilds->pending--;
 			}
-			job->state.store(2, std::memory_order_release);
+			if (job->boosted.load(std::memory_order_acquire)) RestoreBackgroundThreadPriority();
 			job->state.notify_all();
 		};
 		uint8_t expected = 0;
@@ -4348,6 +4369,8 @@ void PipelineCache::QueueFirstUsePrebuild(const ResolvedStages& results, std::sp
 			prebuilds->pending--;
 			return;
 		}
+		RestoreBackgroundThreadPriority();
+		job->thread.store(CurrentBackgroundThreadHandle(), std::memory_order_release);
 		const auto begin = std::chrono::steady_clock::now();
 		uint32_t   cursor = in->push_start;
 		std::array<uint64_t, 2> keys {};
@@ -4461,7 +4484,7 @@ void PipelineCache::ReportFirstUsePrebuild() const {
 	             "adopted=%llu check_match=%llu waited=%llu wait_ms=%.0f cancelled=%llu absent=%llu "
 	             "differ[vs_key|ps_key|rendering|vertex_input|static|spirv]=%llu|%llu|%llu|%llu|%llu|%llu "
 	             "vs_why[static|push|buffers|images|samplers|other]=%llu|%llu|%llu|%llu|%llu|%llu "
-	             "ps_why=%llu|%llu|%llu|%llu|%llu|%llu absent_first_use=%llu\n",
+	             "ps_why=%llu|%llu|%llu|%llu|%llu|%llu absent_first_use=%llu abandoned=%llu boosted=%llu\n",
 	             CompileJobsMode(), u(prebuilds->queued), u(prebuilds->full), u(prebuilds->built),
 	             static_cast<double>(u(prebuilds->build_us)) / 1000.0, u(prebuilds->plan_fail), u(prebuilds->stage_fail),
 	             u(prebuilds->key_fail), u(prebuilds->create_fail), u(prebuilds->adopted), u(prebuilds->check_match),
@@ -4470,7 +4493,8 @@ void PipelineCache::ReportFirstUsePrebuild() const {
 	             u(prebuilds->differ[3]), u(prebuilds->differ[4]), u(prebuilds->differ[5]), u(prebuilds->vs_why[0]),
 	             u(prebuilds->vs_why[1]), u(prebuilds->vs_why[2]), u(prebuilds->vs_why[3]), u(prebuilds->vs_why[4]),
 	             u(prebuilds->vs_why[5]), u(prebuilds->ps_why[0]), u(prebuilds->ps_why[1]), u(prebuilds->ps_why[2]),
-	             u(prebuilds->ps_why[3]), u(prebuilds->ps_why[4]), u(prebuilds->ps_why[5]), u(prebuilds->absent_first_use));
+	             u(prebuilds->ps_why[3]), u(prebuilds->ps_why[4]), u(prebuilds->ps_why[5]), u(prebuilds->absent_first_use),
+	             u(prebuilds->abandoned), u(prebuilds->boosted));
 	std::fflush(stderr);
 }
 
@@ -4509,6 +4533,12 @@ std::unique_ptr<PipelineCache::Pipeline> PipelineCache::TakeFirstUsePrebuild(con
 	};
 	static constexpr const char* WhyNames[6] = {"static_key", "push_start", "buffers", "images", "samplers", "other"};
 	const bool check = CompileJobsMode() == 4u;
+	static const double wait_bound_ms = [] {
+		const char* value = std::getenv("KYTY_PERF_PREBUILD_WAIT_MS");
+		return value != nullptr ? std::strtod(value, nullptr) : 200.0;
+	}();
+	const auto wait_begin = std::chrono::steady_clock::now();
+	bool       waited     = false;
 	for (auto& job: candidates) {
 		uint8_t state = job->state.load(std::memory_order_acquire);
 		if (state == 0) {
@@ -4519,12 +4549,34 @@ std::unique_ptr<PipelineCache::Pipeline> PipelineCache::TakeFirstUsePrebuild(con
 			}
 			state = expected;
 		}
-		if (state == 1) {
-			const auto wait_begin = std::chrono::steady_clock::now();
-			while ((state = job->state.load(std::memory_order_acquire)) == 1) job->state.wait(1, std::memory_order_acquire);
-			prebuilds->waited.fetch_add(1, std::memory_order_relaxed);
-			prebuilds->wait_us.fetch_add(static_cast<uint64_t>(MillisecondsSince(wait_begin) * 1000.0), std::memory_order_relaxed);
+		if (state != 1) continue;
+		if (!job->boosted.exchange(true, std::memory_order_acq_rel)) {
+			BoostBackgroundThread(job->thread.load(std::memory_order_acquire));
+			prebuilds->boosted.fetch_add(1, std::memory_order_relaxed);
 		}
+		waited = true;
+		while ((state = job->state.load(std::memory_order_acquire)) == 1) {
+			if (!check && MillisecondsSince(wait_begin) >= wait_bound_ms) {
+				uint8_t running = 1;
+				if (job->state.compare_exchange_strong(running, 4, std::memory_order_acq_rel)) {
+					prebuilds->abandoned.fetch_add(1, std::memory_order_relaxed);
+					std::lock_guard lock(prebuilds->mutex);
+					const auto [first, last] = prebuilds->by_pair.equal_range(PrebuildPair(vs_hash, ps_hash));
+					for (auto it = first; it != last; ++it) {
+						if (it->second == job) {
+							prebuilds->by_pair.erase(it);
+							break;
+						}
+					}
+				}
+				break;
+			}
+			std::this_thread::sleep_for(std::chrono::microseconds(200));
+		}
+	}
+	if (waited) {
+		prebuilds->waited.fetch_add(1, std::memory_order_relaxed);
+		prebuilds->wait_us.fetch_add(static_cast<uint64_t>(MillisecondsSince(wait_begin) * 1000.0), std::memory_order_relaxed);
 	}
 	std::shared_ptr<FirstUsePrebuilds::Job> chosen;
 	std::shared_ptr<FirstUsePrebuilds::Job> closest;

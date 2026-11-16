@@ -155,6 +155,11 @@ void SetStageCompileOptions(ShaderRecompiler::CompileOptions& options);
 // normal priority, its pipeline creations labelled and given up on as a ShaderPrecompiler worker's (CreatePipelineInternal
 // leaves the pipeline null where the GPU thread would exit).
 void EnterBackgroundCompileThread(const char* name);
+// The calling background thread's handle for BoostBackgroundThread (0 where priorities are not set); a thread the
+// GPU thread waits for runs at normal priority until it calls RestoreBackgroundThreadPriority.
+[[nodiscard]] uint64_t CurrentBackgroundThreadHandle();
+void                   BoostBackgroundThread(uint64_t handle);
+void                   RestoreBackgroundThreadPriority();
 
 // The shader reuse (needs KYTY_SHADER_PRECOMPILE=1, off with --precompile-only): the background compiles keep what they
 // translate and compile instead of throwing it away (once a start re-translated ~3,600 recorded permutations

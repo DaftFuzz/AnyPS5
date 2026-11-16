@@ -501,6 +501,7 @@ private:
 	// KYTY_PERF_GPL: fast-linked pipelines of the maps whose optimized pipeline is not swapped in yet, and its workers.
 	std::vector<Pipeline*>               m_gpl_live;
 	std::unique_ptr<TableCompileWorkers> m_gpl_workers;
+	std::unique_ptr<TableCompileWorkers> m_prebuild_workers; // KYTY_PERF_COMPILE_JOBS>=3 (KYTY_PERF_PREBUILD_THREADS, default 3)
 	void                                 NoteGplPipeline(Pipeline& pipeline);
 	void                                 SwapGplPipelines(CommandScheduler& scheduler);
 	uint32_t m_last_eviction = 0;
