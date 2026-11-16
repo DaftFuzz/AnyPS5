@@ -138,6 +138,7 @@ constexpr SwitchInfo Switches[] = {
     {Switch::LogBuffer, "KYTY_PERF_LOG_BUFFER", 1},
     {Switch::DispatchPlan, "KYTY_PERF_DISPATCH_PLAN", 1},
     {Switch::DispatchPrep, "KYTY_PERF_DISPATCH_PREP", 1},
+    {Switch::InorderTrim, "KYTY_PERF_INORDER_TRIM", 1},
     // Project 15 way B P1 (test switch): a read-only buffer binding with a ready plan entry whose proof holds takes the
     // binding the helper computed (handle, aligned offset, range, offset byte, record stride) instead of RebindBuffers'.
 };

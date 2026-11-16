@@ -14,6 +14,7 @@
 #include "common/envDefaults.h"
 #include "common/envRead.h"
 #include "common/file.h"
+#include "common/inorderTrim.h"
 #include "common/liveAb.h"
 #include "graphics/guest_gpu/chunkCensus.h"
 #include "graphics/guest_gpu/chunkLead.h"
@@ -2930,7 +2931,8 @@ void RenderExecutor::PrepareDrawBindings(DrawPlan& plan, CommandBuffer& buffer, 
 		}
 	}
 	static const bool perf = std::getenv("KYTY_TRACE_PERF") != nullptr;
-	if (perf) {
+	thread_local uint32_t guard_checks = 0;
+	if (perf && Common::InorderTrim::ClockDue(guard_checks, 63u)) {
 		const auto now = std::chrono::steady_clock::now();
 		if (now - stats.window >= std::chrono::seconds(5)) {
 			std::fprintf(stderr, "PERF buffer_guard repeated=%llu passes=%llu unstable=%llu\n",

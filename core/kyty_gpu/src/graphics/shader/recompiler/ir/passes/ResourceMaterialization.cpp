@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/envRead.h"
+#include "common/inorderTrim.h"
 #include "common/liveAb.h"
 #include "common/workaroundHits.h"
 #include "common/shaderEnv.h"
@@ -2582,6 +2583,8 @@ void NullSlotGrow(ResourcePlan::NullFormattedLive& shared, size_t buffers) {
 	if (shared.live.size() < buffers) shared.live.resize(buffers, {0u, 0u});
 	if (shared.null_pending.size() < buffers) shared.null_pending.resize(buffers, 0u);
 	if (shared.slot_keys.size() < buffers) shared.slot_keys.resize(buffers, {0u, 0u});
+	if (shared.slot_table.size() < buffers) shared.slot_table.resize(buffers, {nullptr, nullptr});
+	if (shared.slot_table_value.size() < buffers) shared.slot_table_value.resize(buffers, {0u, 0u});
 }
 
 const std::array<uint64_t, 2>& NullSlotKeysOf(const ResourcePlan& program, ResourcePlan::NullFormattedLive& shared, size_t i) {
@@ -2669,15 +2672,66 @@ bool NullSlotOnLive(const ResourcePlan& program, ResourcePlan::NullFormattedLive
 		}
 		return true;
 	}
-	if ((NullSlotSeedEnabled() || NullSlotPrewarmEnabled()) && NullSlotUsable(value)) {
-		const auto keys = NullSlotKeysOf(program, shared, i);
-		{
+	if (!NullSlotSeedEnabled() && !NullSlotPrewarmEnabled()) return false;
+	namespace Trim  = Common::InorderTrim;
+	const bool trim = Trim::Possible() && NullSlotPrewarmMode() != 2u;
+	bool       memo = false;
+	if (trim && (Trim::On() || Trim::Check())) {
+		Trim::g_stats.share_slots.fetch_add(1, std::memory_order_relaxed);
+		const auto& entries = shared.slot_table[i];
+		if (entries[1] != nullptr && shared.slot_table_value[i] == value) {
 			std::scoped_lock lock(g_null_slot_table.mutex);
-			if (keys[0] != 0u) g_null_slot_table.precise[keys[0]] = value;
-			g_null_slot_table.coarse[keys[1]] = value;
+			memo = *entries[1] == value && (entries[0] == nullptr || *entries[0] == value);
 		}
-		if (NullSlotPrewarmMode() == 2u) NullSlotWatchFire(keys, value);
+		if (memo) {
+			Trim::g_stats.share_hits.fetch_add(1, std::memory_order_relaxed);
+			if (Trim::On()) return false;
+		}
 	}
+	if (!NullSlotUsable(value)) return false;
+	const auto keys = NullSlotKeysOf(program, shared, i);
+	{
+		std::scoped_lock lock(g_null_slot_table.mutex);
+		if (memo && Trim::Check()) {
+			const auto holds = [&](const NullSlot::Value& expected) {
+				const auto& entries = shared.slot_table[i];
+				bool        ok      = true;
+				if (keys[0] != 0u) {
+					const auto it = g_null_slot_table.precise.find(keys[0]);
+					ok = it != g_null_slot_table.precise.end() && it->second == expected && &it->second == entries[0];
+				} else {
+					ok = entries[0] == nullptr;
+				}
+				const auto it = g_null_slot_table.coarse.find(keys[1]);
+				return ok && it != g_null_slot_table.coarse.end() && it->second == expected && &it->second == entries[1];
+			};
+			auto&          s        = Trim::g_stats;
+			const uint64_t compared = s.share_compared.fetch_add(1, std::memory_order_relaxed);
+			if (Trim::Inject(compared)) {
+				s.injected.fetch_add(1, std::memory_order_relaxed);
+				if (!holds({value[0], value[1] ^ 1u})) s.detected.fetch_add(1, std::memory_order_relaxed);
+			} else if (!holds(value)) {
+				if (s.share_bad.fetch_add(1, std::memory_order_relaxed) < 16u) {
+					std::fprintf(stderr, "CHECK_INORDER_TRIM share bad hash=0x%016llx buffer=%zu value=%u/0x%x\n",
+					             static_cast<unsigned long long>(program.shader_hash), i, value[0], value[1]);
+				}
+			}
+		}
+		const NullSlot::Value* precise = nullptr;
+		if (keys[0] != 0u) {
+			auto& entry = g_null_slot_table.precise[keys[0]];
+			entry       = value;
+			precise     = &entry;
+		}
+		auto& coarse = g_null_slot_table.coarse[keys[1]];
+		coarse       = value;
+		if (trim) {
+			shared.slot_table[i]       = {precise, &coarse};
+			shared.slot_table_value[i] = value;
+		}
+	}
+	if (trim) Trim::g_stats.share_written.fetch_add(1, std::memory_order_relaxed);
+	if (NullSlotPrewarmMode() == 2u) NullSlotWatchFire(keys, value);
 	return false;
 }
 
@@ -3575,10 +3629,13 @@ bool ReadsUnchangedFast(const ReadLog& log, const SrtRuntime& runtime, FastAdopt
 	const bool     check   = AdoptRunsCheck();
 	const uint32_t mode    = check ? 2u : (Common::LiveAb::Gate(Common::LiveAb::Switch::AdoptRuns, AdoptRunsFixed()) != 0u ? 1u : 0u);
 	const bool     perf    = Common::EnvRead::PerfLines();
-	const auto     t0      = perf ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+	auto&          c       = g_adopt_runs;
+	const bool     sampled = perf && Common::InorderTrim::On();
+	const bool     timed   = perf && (!sampled || (c.total & 15u) == 0u);
+	if (sampled) Common::InorderTrim::NoteClock(!timed);
+	const auto     t0      = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 	const bool     ready   = log.RunsReady();
 	const auto     verify  = g_runs_verify_hook.load(std::memory_order_relaxed);
-	auto&          c       = g_adopt_runs;
 	bool           result  = false;
 	if (mode == 0u || hook == nullptr || verify == nullptr || !ready) {
 		result = ReadsUnchangedLogged(log, runtime, counted, hook);
@@ -3614,8 +3671,11 @@ bool ReadsUnchangedFast(const ReadLog& log, const SrtRuntime& runtime, FastAdopt
 	c.total++;
 	if (perf) {
 		c.calls[mode]++;
-		c.ns[mode] += static_cast<uint64_t>(
-		    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+		if (timed) {
+			c.ns[mode] += (sampled ? 16u : 1u) * static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+			                                                                std::chrono::steady_clock::now() - t0)
+			                                                                .count());
+		}
 	}
 	if (ready) {
 		c.ready++;

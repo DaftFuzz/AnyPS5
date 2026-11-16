@@ -20,6 +20,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/gpuPlacement.h"
+#include "common/inorderTrim.h"
 #include "common/liveAb.h"
 #include "common/threads.h"
 #include "common/debugCounters.h"
@@ -2654,6 +2655,8 @@ ServeInWaitStats g_serve;
 
 void ReportServeInWait() {
 	if (!PerfEnabled()) return;
+	thread_local uint32_t report_checks = 0;
+	if (!Common::InorderTrim::ClockDue(report_checks, 63u)) return;
 	auto&         s     = g_serve;
 	const int64_t now   = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 	int64_t       start = s.window_start.load(std::memory_order_relaxed);
@@ -5196,6 +5199,32 @@ void BufferCache::InFlightRebuild() {
 }
 
 void BufferCache::GpuDirtyAdd(uint64_t vaddr, uint64_t size) {
+	namespace Trim = Common::InorderTrim;
+	if (Trim::Possible()) {
+		auto& s = Trim::g_stats;
+		s.dirty_adds.fetch_add(1, std::memory_order_relaxed);
+		if (!GuestGpu::IsGpuThread()) {
+			s.dirty_foreign.fetch_add(1, std::memory_order_relaxed);
+		} else if ((Trim::On() || Trim::Check()) && m_gpu_modified_ranges.Contains(vaddr, size)) {
+			s.dirty_contained.fetch_add(1, std::memory_order_relaxed);
+			if (Trim::On()) return;
+			if (Trim::Check()) {
+				std::unique_lock lock(m_gpu_dirty_mutex);
+				const size_t   before   = m_gpu_modified_ranges.Count();
+				m_gpu_modified_ranges.Add(vaddr, size);
+				const bool     same     = m_gpu_modified_ranges.Count() == before && m_gpu_modified_ranges.Contains(vaddr, size);
+				const uint64_t compared = s.dirty_compared.fetch_add(1, std::memory_order_relaxed);
+				if (Trim::Inject(compared)) {
+					s.injected.fetch_add(1, std::memory_order_relaxed);
+					if (m_gpu_modified_ranges.Count() != before + 1u) s.detected.fetch_add(1, std::memory_order_relaxed);
+				} else if (!same && s.dirty_bad.fetch_add(1, std::memory_order_relaxed) < 16u) {
+					std::fprintf(stderr, "CHECK_INORDER_TRIM dirty bad addr=0x%llx size=0x%llx\n", static_cast<unsigned long long>(vaddr),
+					             static_cast<unsigned long long>(size));
+				}
+				return;
+			}
+		}
+	}
 	{
 		std::unique_lock lock(m_gpu_dirty_mutex);
 		m_gpu_modified_ranges.Add(vaddr, size);
@@ -5203,6 +5232,9 @@ void BufferCache::GpuDirtyAdd(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::GpuDirtySubtract(uint64_t vaddr, uint64_t size) {
+	if (Common::InorderTrim::Possible() && !GuestGpu::IsGpuThread()) {
+		Common::InorderTrim::g_stats.dirty_foreign.fetch_add(1, std::memory_order_relaxed);
+	}
 	NoteGpuCleanRange(vaddr, size); // the write memo
 	std::unique_lock lock(m_gpu_dirty_mutex);
 	m_gpu_modified_ranges.Subtract(vaddr, size);

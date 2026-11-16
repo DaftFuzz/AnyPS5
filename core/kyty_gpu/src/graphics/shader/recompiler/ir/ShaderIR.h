@@ -1238,6 +1238,8 @@ struct ResourcePlan {
 		std::vector<uint8_t>                 journal_checked;
 		std::vector<uint8_t>                 null_pending;
 		std::vector<std::array<uint64_t, 2>> slot_keys;
+		std::vector<std::array<const std::array<uint32_t, 2>*, 2>> slot_table;
+		std::vector<std::array<uint32_t, 2>>                       slot_table_value;
 	};
 	std::shared_ptr<NullFormattedLive> null_formatted_live = std::make_shared<NullFormattedLive>();
 };

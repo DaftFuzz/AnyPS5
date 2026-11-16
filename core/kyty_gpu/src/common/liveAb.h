@@ -64,6 +64,7 @@ enum class Switch : uint32_t {
 	LogBuffer,
 	DispatchPlan,
 	DispatchPrep,
+	InorderTrim,
 	Count
 };
 

@@ -10,6 +10,7 @@
 
 #include "common/assert.h"
 #include "common/envRead.h"
+#include "common/inorderTrim.h"
 #include "common/liveAb.h"
 #include "common/logging/log.h"
 #include "common/onceValue.h"
@@ -411,6 +412,11 @@ void RenderContext::PrepareBda() {
 void RenderContext::ReportBdaSyncEpoch() {
 	auto& counters = m_bda_epoch_counters;
 	counters.calls++;
+	if (Common::InorderTrim::On()) {
+		const bool due = (counters.calls & 63u) == 0u;
+		Common::InorderTrim::NoteClock(!due);
+		if (!due) return;
+	}
 	const auto now = std::chrono::steady_clock::now();
 	if (now - m_bda_epoch_log_time < std::chrono::seconds(10) || !Common::EnvRead::PerfLines()) {
 		return;

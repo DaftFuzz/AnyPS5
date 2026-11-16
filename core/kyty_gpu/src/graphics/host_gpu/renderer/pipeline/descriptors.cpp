@@ -15,6 +15,7 @@
 #include "common/emulatorConfig.h"
 #include "common/envDefaults.h"
 #include "common/envRead.h"
+#include "common/inorderTrim.h"
 #include "common/liveAb.h"
 #include "common/file.h"
 #include "common/logging/log.h"
@@ -5887,15 +5888,21 @@ class LayoutWalkTimer {
 public:
 	explicit LayoutWalkTimer(size_t images): m_on(PerfEnabled()) {
 		if (!m_on) return;
-		m_start = std::chrono::steady_clock::now();
-		g_layout_walks.fetch_add(1, std::memory_order_relaxed);
+		const uint64_t walk = g_layout_walks.fetch_add(1, std::memory_order_relaxed);
 		g_layout_walk_images.fetch_add(images, std::memory_order_relaxed);
+		if (Common::InorderTrim::On()) {
+			m_scale = 16u;
+			m_on    = (walk & 15u) == 0u;
+			Common::InorderTrim::NoteClock(!m_on);
+			if (!m_on) return;
+		}
+		m_start = std::chrono::steady_clock::now();
 	}
 	~LayoutWalkTimer() {
 		if (m_on)
-			g_layout_walk_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-			                                                     std::chrono::steady_clock::now() - m_start)
-			                                                     .count()),
+			g_layout_walk_ns.fetch_add(m_scale * static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+			                                                               std::chrono::steady_clock::now() - m_start)
+			                                                               .count()),
 			                           std::memory_order_relaxed);
 	}
 	LayoutWalkTimer(const LayoutWalkTimer&)            = delete;
@@ -5903,6 +5910,7 @@ public:
 
 private:
 	bool                                  m_on;
+	uint64_t                              m_scale = 1u;
 	std::chrono::steady_clock::time_point m_start {};
 };
 } // namespace

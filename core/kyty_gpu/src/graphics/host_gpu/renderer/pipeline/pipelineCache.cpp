@@ -12,6 +12,7 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/envRead.h"
+#include "common/inorderTrim.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/lookupMemo.h"
@@ -2548,9 +2549,12 @@ void PipelineCache::InitializeDriverCache() {
 // The driver cache is otherwise written only at shutdown; save it every two minutes so a
 // session that ends abnormally keeps its compiled pipelines.
 void PipelineCache::SaveIfDue() {
+	Common::InorderTrim::Report();
 	if (m_driver_cache == nullptr) {
 		return;
 	}
+	thread_local uint32_t save_checks = 0;
+	if (!Common::InorderTrim::ClockDue(save_checks, 255u)) return;
 	const auto now = std::chrono::steady_clock::now();
 	if (m_last_save.time_since_epoch().count() == 0) {
 		m_last_save = now;
