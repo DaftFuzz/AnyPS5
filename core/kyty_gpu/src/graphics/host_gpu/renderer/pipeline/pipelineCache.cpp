@@ -203,7 +203,16 @@ struct PipelineCache::FirstUsePrebuilds {
 		std::vector<vk::ShaderModule>                                             modules;
 		std::array<std::unique_ptr<ShaderRecompiler::IR::CompiledShaderInfo>, 2> infos;
 		std::unique_ptr<ShaderRecompiler::IR::ResourceSnapshot>                   no_resources;
+		struct Parts {
+			uint64_t static_hash = 0, buffers_hash = 0, images_hash = 0, samplers_hash = 0;
+			uint32_t push_start = 0;
+			bool     first_use  = false;
+		};
+		Parts vs_parts, ps_parts;
 	};
+	std::atomic<uint64_t> logged {0};
+	std::array<std::atomic<uint64_t>, 6> vs_why {}, ps_why {}; // static, push, buffers, images, samplers, none of these
+	std::atomic<uint64_t> absent_first_use {0};
 	std::mutex                                              mutex;
 	std::unordered_set<uint64_t>                            seen;
 	std::unordered_multimap<uint64_t, std::shared_ptr<Job>> by_pair;
@@ -213,6 +222,30 @@ struct PipelineCache::FirstUsePrebuilds {
 	std::atomic<uint64_t> adopted {0}, waited {0}, wait_us {0}, cancelled {0}, absent {0}, check_match {0}, build_us {0};
 	std::array<std::atomic<uint64_t>, 6> differ {}; // vertex key, pixel key, rendering, vertex input, static params, SPIR-V
 };
+
+namespace {
+std::array<uint64_t, 3> SpecializationPartHashes(const ShaderRecompiler::IR::ResourceSpecialization& s) {
+	std::vector<uint32_t> w;
+	std::array<uint64_t, 3> out {};
+	for (const auto& b: s.buffers) {
+		w.insert(w.end(), {b.packed_stride, static_cast<uint32_t>(b.descriptor_format), b.descriptor_swizzle, b.zero_stride_oob ? 1u : 0u,
+		                   b.scalar_empty ? 1u : 0u, b.indirect_root, b.indirect_mapping_offset, b.indirect_search_iterations});
+	}
+	out[0] = XXH3_64bits(w.data(), w.size() * sizeof(uint32_t));
+	w.clear();
+	for (const auto& i: s.images) {
+		w.insert(w.end(), {static_cast<uint32_t>(i.numeric_class), static_cast<uint32_t>(i.dimension), i.mip_count,
+		                   static_cast<uint32_t>(i.conversion_format), i.shader_swizzle, i.indirect_root, i.indirect_mapping_offset,
+		                   i.indirect_search_iterations, i.cube ? 1u : 0u, i.fmask ? 1u : 0u, i.bindless ? 1u : 0u,
+		                   i.bindless_stride_dwords, i.heap ? 1u : 0u});
+	}
+	out[1] = XXH3_64bits(w.data(), w.size() * sizeof(uint32_t));
+	w.clear();
+	for (const auto& m: s.samplers) w.insert(w.end(), {m.indirect_root, m.indirect_mapping_offset, m.indirect_search_iterations});
+	out[2] = XXH3_64bits(w.data(), w.size() * sizeof(uint32_t));
+	return out;
+}
+} // namespace
 
 ResolvedStages* NewResolvedStages() {
 	return new ResolvedStages;
@@ -1361,6 +1394,7 @@ struct PipelineCache::ProgramCache {
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
 		if (precompile_key != 0) {
 			RecordPrecompileStage(stage, params, input_info, compile_push_start, permutation, precompile_key);
+			if (first_use) precompile_stages[permutation.handle.id].first_use = true;
 		}
 		{
 			const double total = MillisecondsSince(translate_begin);
@@ -1452,7 +1486,15 @@ struct PipelineCache::ProgramCache {
 		record.revision        = ShaderPrecompiler::Revision();
 		precompiler->Record(record);
 		// Compute ones too: GetComputePipeline marks the key warm once the pipeline exists.
-		precompile_stages[permutation.handle.id] = {.key = key, .spirv_hash = last_spirv_hash};
+		const auto parts = SpecializationPartHashes(permutation.specialization);
+		precompile_stages[permutation.handle.id] = {
+		    .key           = key,
+		    .spirv_hash    = last_spirv_hash,
+		    .static_hash   = XXH3_64bits(lookup_key.static_state.data(), lookup_key.static_state.size() * sizeof(uint32_t)),
+		    .buffers_hash  = parts[0],
+		    .images_hash   = parts[1],
+		    .samplers_hash = parts[2],
+		    .push_start    = push_data_start};
 	}
 
 	void PrewarmLiveVariants(const ShaderParams& params, const ShaderComputeInputInfo& input_info, uint32_t push_cursor,
@@ -1883,6 +1925,10 @@ struct PipelineCache::ProgramCache {
 	struct PrecompileStage {
 		uint64_t key        = 0;
 		uint64_t spirv_hash = 0;
+		// KYTY_PERF_COMPILE_JOBS>=3: the parts of the key, to name what a prebuilt stage got differently.
+		uint64_t static_hash = 0, buffers_hash = 0, images_hash = 0, samplers_hash = 0;
+		uint32_t push_start  = 0;
+		bool     first_use   = false;
 	};
 	std::unordered_map<uint64_t, PrecompileStage> precompile_stages;
 	std::mutex                                    runtime_jobs_mutex;
@@ -3777,14 +3823,9 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	}
 	std::unique_ptr<Pipeline> prebuilt;
 	if (precompile_record && !shared_from.has_value() && CompileJobsMode() >= 3u && m_prebuilds != nullptr && vertex_info.size() == 1u) {
-		const auto spirv_of = [&](uint64_t id) -> uint64_t {
-			const auto found = m_program_cache->precompile_stages.find(id);
-			return found != m_program_cache->precompile_stages.end() ? found->second.spirv_hash : 0u;
-		};
 		const auto* ps_program = ps_active && ps_input_info->stage ? ps_input_info->stage.program : nullptr;
 		prebuilt = TakeFirstUsePrebuild(precompile, vs_input_info.stage.program->shader_hash,
-		                                ps_program != nullptr ? ps_program->shader_hash : 0u, spirv_of(vs_id),
-		                                ps_active ? spirv_of(ps_id) : 0u);
+		                                ps_program != nullptr ? ps_program->shader_hash : 0u, vs_id, ps_active ? ps_id : 0u);
 	}
 	if (prebuilt != nullptr) {
 		cached = std::move(prebuilt);
@@ -4338,6 +4379,16 @@ void PipelineCache::QueueFirstUsePrebuild(const ResolvedStages& results, std::sp
 			}
 			job->modules.push_back(modules[i]);
 			keys[i] = rec.Key();
+			{
+				auto&       parts  = rec.stage == ShaderType::Pixel ? job->ps_parts : job->vs_parts;
+				const auto  sp     = SpecializationPartHashes(rec.specialization);
+				parts.static_hash  = XXH3_64bits(rec.static_key.data(), rec.static_key.size() * sizeof(uint32_t));
+				parts.buffers_hash = sp[0];
+				parts.images_hash  = sp[1];
+				parts.samplers_hash = sp[2];
+				parts.push_start   = rec.push_data_start;
+				parts.first_use    = s.first_use;
+			}
 			job->infos[i]->bindings.AdvancePushData(cursor);
 		}
 		const bool ps_active = in->ps_active;
@@ -4408,20 +4459,32 @@ void PipelineCache::ReportFirstUsePrebuild() const {
 	std::fprintf(stderr,
 	             "PERF first_use_prebuild mode=%u queued=%llu full=%llu built=%llu build_ms=%.0f fail[plan|stage|key|create]=%llu|%llu|%llu|%llu "
 	             "adopted=%llu check_match=%llu waited=%llu wait_ms=%.0f cancelled=%llu absent=%llu "
-	             "differ[vs_key|ps_key|rendering|vertex_input|static|spirv]=%llu|%llu|%llu|%llu|%llu|%llu\n",
+	             "differ[vs_key|ps_key|rendering|vertex_input|static|spirv]=%llu|%llu|%llu|%llu|%llu|%llu "
+	             "vs_why[static|push|buffers|images|samplers|other]=%llu|%llu|%llu|%llu|%llu|%llu "
+	             "ps_why=%llu|%llu|%llu|%llu|%llu|%llu absent_first_use=%llu\n",
 	             CompileJobsMode(), u(prebuilds->queued), u(prebuilds->full), u(prebuilds->built),
 	             static_cast<double>(u(prebuilds->build_us)) / 1000.0, u(prebuilds->plan_fail), u(prebuilds->stage_fail),
 	             u(prebuilds->key_fail), u(prebuilds->create_fail), u(prebuilds->adopted), u(prebuilds->check_match),
 	             u(prebuilds->waited), static_cast<double>(u(prebuilds->wait_us)) / 1000.0, u(prebuilds->cancelled),
 	             u(prebuilds->absent), u(prebuilds->differ[0]), u(prebuilds->differ[1]), u(prebuilds->differ[2]),
-	             u(prebuilds->differ[3]), u(prebuilds->differ[4]), u(prebuilds->differ[5]));
+	             u(prebuilds->differ[3]), u(prebuilds->differ[4]), u(prebuilds->differ[5]), u(prebuilds->vs_why[0]),
+	             u(prebuilds->vs_why[1]), u(prebuilds->vs_why[2]), u(prebuilds->vs_why[3]), u(prebuilds->vs_why[4]),
+	             u(prebuilds->vs_why[5]), u(prebuilds->ps_why[0]), u(prebuilds->ps_why[1]), u(prebuilds->ps_why[2]),
+	             u(prebuilds->ps_why[3]), u(prebuilds->ps_why[4]), u(prebuilds->ps_why[5]), u(prebuilds->absent_first_use));
 	std::fflush(stderr);
 }
 
 std::unique_ptr<PipelineCache::Pipeline> PipelineCache::TakeFirstUsePrebuild(const PrecompileGraphicsRecord& record, uint64_t vs_hash,
-                                                                             uint64_t ps_hash, uint64_t vs_spirv, uint64_t ps_spirv) {
+                                                                             uint64_t ps_hash, uint64_t vs_id, uint64_t ps_id) {
 	auto prebuilds = m_prebuilds;
 	if (prebuilds == nullptr) return nullptr;
+	const auto& stages   = m_program_cache->precompile_stages;
+	const auto  vs_found = stages.find(vs_id);
+	const auto  ps_found = ps_id != 0u ? stages.find(ps_id) : stages.end();
+	const auto* vs_stage = vs_found != stages.end() ? &vs_found->second : nullptr;
+	const auto* ps_stage = ps_found != stages.end() ? &ps_found->second : nullptr;
+	const uint64_t vs_spirv = vs_stage != nullptr ? vs_stage->spirv_hash : 0u;
+	const uint64_t ps_spirv = ps_stage != nullptr ? ps_stage->spirv_hash : 0u;
 	std::vector<std::shared_ptr<FirstUsePrebuilds::Job>> candidates;
 	{
 		std::lock_guard lock(prebuilds->mutex);
@@ -4430,8 +4493,21 @@ std::unique_ptr<PipelineCache::Pipeline> PipelineCache::TakeFirstUsePrebuild(con
 	}
 	if (candidates.empty()) {
 		prebuilds->absent.fetch_add(1, std::memory_order_relaxed);
+		if ((vs_stage != nullptr && vs_stage->first_use) || (ps_stage != nullptr && ps_stage->first_use)) {
+			prebuilds->absent_first_use.fetch_add(1, std::memory_order_relaxed);
+		}
 		return nullptr;
 	}
+	const auto why = [](const FirstUsePrebuilds::Job::Parts& p, const auto* s) -> size_t {
+		if (s == nullptr) return 5;
+		if (p.static_hash != s->static_hash) return 0;
+		if (p.push_start != s->push_start) return 1;
+		if (p.buffers_hash != s->buffers_hash) return 2;
+		if (p.images_hash != s->images_hash) return 3;
+		if (p.samplers_hash != s->samplers_hash) return 4;
+		return 5;
+	};
+	static constexpr const char* WhyNames[6] = {"static_key", "push_start", "buffers", "images", "samplers", "other"};
 	const bool check = CompileJobsMode() == 4u;
 	for (auto& job: candidates) {
 		uint8_t state = job->state.load(std::memory_order_acquire);
@@ -4451,6 +4527,7 @@ std::unique_ptr<PipelineCache::Pipeline> PipelineCache::TakeFirstUsePrebuild(con
 		}
 	}
 	std::shared_ptr<FirstUsePrebuilds::Job> chosen;
+	std::shared_ptr<FirstUsePrebuilds::Job> closest;
 	int                                     best_differ = -1;
 	for (auto& job: candidates) {
 		if (job->state.load(std::memory_order_acquire) != 2 || job->pipeline == nullptr) continue;
@@ -4473,11 +4550,29 @@ std::unique_ptr<PipelineCache::Pipeline> PipelineCache::TakeFirstUsePrebuild(con
 			chosen = job;
 			break;
 		}
-		if (best_differ < 0 || d > best_differ) best_differ = d;
+		if (best_differ < 0 || d > best_differ) {
+			best_differ = d;
+			closest     = job;
+		}
 	}
 	if (chosen == nullptr) {
 		if (best_differ >= 0) {
 			prebuilds->differ[static_cast<size_t>(best_differ)].fetch_add(1, std::memory_order_relaxed);
+			if (best_differ <= 1 && closest != nullptr) {
+				const bool   vs_side = best_differ == 0;
+				const auto&  parts   = vs_side ? closest->vs_parts : closest->ps_parts;
+				const auto*  stage   = vs_side ? vs_stage : ps_stage;
+				const size_t w       = why(parts, stage);
+				(vs_side ? prebuilds->vs_why : prebuilds->ps_why)[w].fetch_add(1, std::memory_order_relaxed);
+				if (prebuilds->logged.fetch_add(1, std::memory_order_relaxed) < 32u) {
+					std::fprintf(stderr,
+					             "FIRST_USE_PREBUILD_DIFFER stage=%s hash=0x%016llx part=%s worker_first_use=%d gpu_first_use=%d "
+					             "push=%u/%u\n",
+					             vs_side ? "vs" : "ps", static_cast<unsigned long long>(vs_side ? vs_hash : ps_hash), WhyNames[w],
+					             parts.first_use ? 1 : 0, stage != nullptr && stage->first_use ? 1 : 0, parts.push_start,
+					             stage != nullptr ? stage->push_start : 0u);
+				}
+			}
 		} else {
 			prebuilds->absent.fetch_add(1, std::memory_order_relaxed);
 		}

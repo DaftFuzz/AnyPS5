@@ -416,7 +416,7 @@ public:
 private:
 	Pipeline* TakeAheadGraphicsPipeline(const GraphicsPipelineKey& key);
 	std::unique_ptr<Pipeline> TakeFirstUsePrebuild(const PrecompileGraphicsRecord& record, uint64_t vs_hash, uint64_t ps_hash,
-	                                               uint64_t vs_spirv, uint64_t ps_spirv);
+	                                               uint64_t vs_id, uint64_t ps_id);
 	std::mutex m_ahead_workers_mutex;
 	std::unordered_set<uint64_t> m_ahead_miss_seen;
 	struct FirstUsePrebuilds;
