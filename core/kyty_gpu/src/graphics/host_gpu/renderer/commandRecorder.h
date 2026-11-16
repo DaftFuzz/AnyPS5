@@ -84,6 +84,8 @@ inline void DrainBeforeDestroy() {
 	}
 }
 
+void DescribeWorker(char* out, size_t size);
+
 } // namespace Libs::Graphics::CommandRecorder
 
 #endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_COMMANDRECORDER_H_

@@ -733,6 +733,7 @@ GuestGpu::GuestGpu(RenderContext& renderer)
 	m_resolve_helper2 = std::jthread([this] { ResolveHelperThread(1); }); // project 15 N5.2: the second helper
 	m_thread   = std::jthread(ThreadRun, this);
 	StallWatch::StartIfEnabled(); // KYTY_DIAG_STALL_WATCH (diagnostic)
+	StallWatch::StartGapDumpIfEnabled();
 }
 
 GuestGpu::~GuestGpu() {
@@ -1002,6 +1003,7 @@ bool GuestGpu::WaitForOperations() {
 		}
 		if (PendingCommands().load(std::memory_order_acquire) != 0) {
 			const Common::SlowFrame::Scope slow_commands(Common::SlowFrame::Commands); // KYTY_TRACE_SLOW_FRAMES
+			const StallWatch::ExecOpMark   commands_mark(StallWatch::ExecCommands, 0);
 			if (ChunkLead::PeekCensusOn()) { // (way B measurement: the commands served while idle)
 				const uint64_t t0 = ChunkLead::Tsc();
 				RunCommands();
@@ -1336,6 +1338,8 @@ void GuestGpu::ExecutionThread() {
 		const bool      cover_on = floor_pass >= 0 && floor_pass <= ChunkLead::BucketOtherDraws;
 		const CoverSnap cover0   = cover_on ? cover_snap() : CoverSnap {};
 		ChunkLead::t_floor_bucket = cover_on ? floor_pass : -1;
+		std::optional<StallWatch::ExecOpMark> exec_mark;
+		exec_mark.emplace(static_cast<uint32_t>(operation->kind), operation->sequence);
 		if (PassCensus::Enabled()) {
 			// KYTY_TRACE_PASS_CENSUS (PASS_EXEC): execution time per marker pass, less the card waits inside.
 			const auto kind  = operation->kind;
@@ -1370,6 +1374,7 @@ void GuestGpu::ExecutionThread() {
 		} else {
 			operation->processor->Execute(*operation);
 		}
+		exec_mark.reset();
 		if (floor_total) {
 			floor_total.reset();
 			ChunkLead::t_floor_wait = PassCensus::t_wait_ns - ChunkLead::t_floor_wait; // the card waits inside the operation
@@ -1440,6 +1445,7 @@ void GuestGpu::ExecutionThread() {
 		m_executed.Publish(sequence);
 		if (PendingCommands().load(std::memory_order_acquire) != 0) {
 			const Common::SlowFrame::Scope slow_commands(Common::SlowFrame::Commands); // KYTY_TRACE_SLOW_FRAMES
+			const StallWatch::ExecOpMark   commands_mark(StallWatch::ExecCommands, sequence);
 			if (ChunkLead::PeekCensusOn()) { // (way B measurement: the commands served between operations)
 				const uint64_t t0 = ChunkLead::Tsc(), w0 = PassCensus::t_wait_ns;
 				RunCommands();

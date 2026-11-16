@@ -1725,6 +1725,20 @@ bool RecordedByWorker(vk::CommandBuffer buffer) noexcept {
 	return detail::g_active && g_recorder != nullptr && !g_recorder->Stopped() && !t_replaying && handle != nullptr && handle == g_routed.load(std::memory_order_relaxed);
 }
 
+void DescribeWorker(char* out, size_t size) {
+	const void*   worker_run = g_worker_run.load(std::memory_order_relaxed);
+	const int64_t now        = QueueLockSite::NowNs();
+	const int64_t worker_ms =
+	    worker_run != nullptr ? (now - g_worker_since_ns.load(std::memory_order_relaxed)) / 1000000 : 0;
+	const char*   lock_site = QueueLockSite::site.load(std::memory_order_acquire);
+	const int64_t lock_ms =
+	    lock_site != nullptr ? (now - QueueLockSite::since_ns.load(std::memory_order_relaxed)) / 1000000 : 0;
+	std::snprintf(out, size, "recorder=%d worker_in=%s worker_call=%s worker_ms=%lld queue_lock=%s held_ms=%lld",
+	              detail::g_active && g_recorder != nullptr ? 1 : 0, CodeName(worker_run).c_str(),
+	              CodeName(worker_run != nullptr ? g_worker_call.load(std::memory_order_relaxed) : nullptr).c_str(),
+	              static_cast<long long>(worker_ms), lock_site != nullptr ? lock_site : "-", static_cast<long long>(lock_ms));
+}
+
 bool QueueDescriptorWrites(VkDevice device, uint32_t count, const VkWriteDescriptorSet* writes) {
 	if (count == 0 || writes == nullptr || !AsyncSubmit()) {
 		return false;

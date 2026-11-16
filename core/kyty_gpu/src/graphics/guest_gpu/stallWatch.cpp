@@ -1,5 +1,6 @@
 #include "graphics/guest_gpu/stallWatch.h"
 
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/debugSample.h"
 
 #include <windows.h>
@@ -213,6 +214,116 @@ void Run() {
 }
 
 } // namespace
+
+namespace {
+
+constexpr int GapDumpLimit = 10;
+
+const char* ExecKindName(uint32_t kind) {
+	static constexpr const char* Names[] = {"draw_index", "draw_auto", "draw_indirect", "dispatch_direct", "dispatch_indirect",
+	                                        "callback",   "state_callback"};
+	if (kind == ExecCommands) return "commands";
+	return kind < sizeof(Names) / sizeof(Names[0]) ? Names[kind] : "unknown";
+}
+
+long long SinceMs(int64_t since, int64_t now) {
+	return since != 0 ? static_cast<long long>((now - since) / 1000000) : -1;
+}
+
+void WriteGapDump(const char* path) {
+	using MiniDumpWriteDumpFn = BOOL(WINAPI*)(HANDLE, DWORD, HANDLE, int, void*, void*, void*);
+	static HMODULE dbghelp = LoadLibraryA("dbghelp.dll");
+	const auto     write   = dbghelp != nullptr
+	                             ? reinterpret_cast<MiniDumpWriteDumpFn>(reinterpret_cast<void*>(GetProcAddress(dbghelp, "MiniDumpWriteDump")))
+	                             : nullptr;
+	if (write == nullptr) {
+		std::fprintf(stderr, "GAP_DUMP failed: dbghelp.dll MiniDumpWriteDump unavailable\n");
+		return;
+	}
+	HANDLE file = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (file == INVALID_HANDLE_VALUE) {
+		std::fprintf(stderr, "GAP_DUMP failed: cannot create %s\n", path);
+		return;
+	}
+	constexpr int MiniDumpWithHandleData = 0x4, MiniDumpWithUnloadedModules = 0x20, MiniDumpWithThreadInfo = 0x1000;
+	const auto    t0 = std::chrono::steady_clock::now();
+	const BOOL    ok = write(GetCurrentProcess(), GetCurrentProcessId(), file,
+	                         MiniDumpWithHandleData | MiniDumpWithUnloadedModules | MiniDumpWithThreadInfo, nullptr, nullptr, nullptr);
+	CloseHandle(file);
+	std::fprintf(stderr, "GAP_DUMP %s %s write_ms=%lld\n", ok ? "wrote" : "failed", path,
+	             static_cast<long long>(
+	                 std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count()));
+}
+
+void GapCapture(uint32_t frame, long long gap_ms, int number, int in_gap) {
+	const int64_t now      = std::chrono::steady_clock::now().time_since_epoch().count();
+	const int64_t op_since = g_exec_op_since.load(std::memory_order_acquire);
+	char          recorder[512] {};
+	CommandRecorder::DescribeWorker(recorder, sizeof(recorder));
+	std::fprintf(stderr,
+	             "GAP_DUMP frame=%u gap_ms=%lld dump=%d/%d in_gap=%d exec_op=%s exec_seq=%llu exec_op_ms=%lld exec_idle_ms=%lld "
+	             "exec_driver_ms=%lld %s\n",
+	             frame, gap_ms, number, GapDumpLimit, in_gap,
+	             op_since != 0 ? ExecKindName(g_exec_op_kind.load(std::memory_order_relaxed)) : "-",
+	             static_cast<unsigned long long>(op_since != 0 ? g_exec_op_sequence.load(std::memory_order_relaxed) : 0),
+	             SinceMs(op_since, now), SinceMs(g_exec_idle_since.load(std::memory_order_acquire), now),
+	             SinceMs(g_exec_driver_since.load(std::memory_order_acquire), now), recorder);
+	std::fflush(stderr);
+	const char* dir = std::getenv("KYTY_HANG_DUMP_DIR");
+	char        path[MAX_PATH + 96];
+	std::snprintf(path, sizeof(path), "%s%skyty-gap-%lu-%02d-f%u-%llds.dmp", dir != nullptr ? dir : "",
+	              dir != nullptr && dir[0] != '\0' ? "\\" : "", static_cast<unsigned long>(GetCurrentProcessId()), number, frame,
+	              gap_ms / 1000);
+	WriteGapDump(path);
+	std::fflush(stderr);
+}
+
+void GapRun(long long seconds) {
+	SetThreadDescription(GetCurrentThread(), L"Kyty.GapDump");
+	const long long limit_ms   = seconds * 1000;
+	uint32_t        last_frame = DebugPresentCount().load(std::memory_order_relaxed);
+	auto            last_move  = std::chrono::steady_clock::now();
+	int             dumps      = 0;
+	int             in_gap     = 0;
+	while (dumps < GapDumpLimit) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(250));
+		const uint32_t frame = DebugPresentCount().load(std::memory_order_relaxed);
+		const auto     now   = std::chrono::steady_clock::now();
+		const auto     ms = static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(now - last_move).count());
+		if (frame != last_frame) {
+			if (in_gap != 0) std::fprintf(stderr, "GAP_DUMP_END frame=%u gap_ms=%lld\n", frame, ms);
+			last_frame = frame;
+			last_move  = now;
+			in_gap     = 0;
+			continue;
+		}
+		if (frame == 0) continue;
+		if ((in_gap == 0 && ms >= limit_ms) || (in_gap == 1 && ms >= 2 * limit_ms)) {
+			in_gap++;
+			dumps++;
+			GapCapture(frame, ms, dumps, in_gap);
+		}
+	}
+	std::fprintf(stderr, "GAP_DUMP limit of %d dumps reached; watchdog stopped\n", GapDumpLimit);
+	std::fflush(stderr);
+}
+
+} // namespace
+
+void StartGapDumpIfEnabled() {
+	const char* value = std::getenv("KYTY_GAP_DUMP_SECONDS");
+	if (value == nullptr) return;
+	const long long seconds = std::atoll(value);
+	if (seconds <= 0) {
+		std::fprintf(stderr, "GAP_DUMP off: KYTY_GAP_DUMP_SECONDS=%s is not a positive number of seconds\n", value);
+		return;
+	}
+	g_gap_dump_on.store(true, std::memory_order_relaxed);
+	const char* dir = std::getenv("KYTY_HANG_DUMP_DIR");
+	std::fprintf(stderr, "GAP_DUMP on: a minidump when no frame is presented for %lld s (again at %lld s), at most %d, into %s\n",
+	             seconds, 2 * seconds, GapDumpLimit, dir != nullptr ? dir : "the working directory");
+	std::thread(GapRun, seconds).detach();
+}
 
 void StartIfEnabled() {
 	const char* value = std::getenv("KYTY_DIAG_STALL_WATCH");

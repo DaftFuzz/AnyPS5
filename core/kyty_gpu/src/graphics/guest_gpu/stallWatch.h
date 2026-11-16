@@ -29,6 +29,31 @@ struct DriverCallMark {
 	}
 };
 
+void StartGapDumpIfEnabled();
+
+inline std::atomic<bool>     g_gap_dump_on {false};
+inline std::atomic<uint32_t> g_exec_op_kind {0};
+inline std::atomic<uint64_t> g_exec_op_sequence {0};
+inline std::atomic<int64_t>  g_exec_op_since {0};
+
+constexpr uint32_t ExecCommands = 0xffu;
+
+struct ExecOpMark {
+	bool on;
+	ExecOpMark(uint32_t kind, uint64_t sequence): on(g_gap_dump_on.load(std::memory_order_relaxed)) {
+		if (!on) return;
+		g_exec_op_kind.store(kind, std::memory_order_relaxed);
+		g_exec_op_sequence.store(sequence, std::memory_order_relaxed);
+		g_exec_op_since.store(static_cast<int64_t>(std::chrono::steady_clock::now().time_since_epoch().count()),
+		                      std::memory_order_release);
+	}
+	~ExecOpMark() {
+		if (on) g_exec_op_since.store(0, std::memory_order_release);
+	}
+	ExecOpMark(const ExecOpMark&)            = delete;
+	ExecOpMark& operator=(const ExecOpMark&) = delete;
+};
+
 } // namespace Libs::Graphics::StallWatch
 
 #endif // EMULATOR_SRC_GRAPHICS_GUEST_GPU_STALLWATCH_H_
