@@ -2793,6 +2793,7 @@ void ReportNullShareJournalPerf() {
 	             n(s.runtime_live), n(s.caused), n(s.avoided), n(s.seed_hits), n(s.seed_misses), n(s.check_live),
 	             n(s.check_unknown));
 	ReportSamplerPad();
+	ReportLoopProofMemo();
 }
 
 // `tape` (when set) evaluates the plan's values instead of SrtWalker; `quiet` mutes its diagnostics.

@@ -295,6 +295,29 @@ std::optional<std::pair<uint32_t, uint32_t>> FixedWriteRange(const Inst& inst, c
 	return std::pair {static_cast<uint32_t>(begin), static_cast<uint32_t>(begin + bytes)};
 }
 
+uint32_t LoopProofMemoMode() {
+	static const uint32_t mode = [] {
+		const char*    value = Common::ShaderEnv::Read("KYTY_PERF_LOOP_PROOF_MEMO");
+		const uint32_t m     = value != nullptr && (value[0] == '1' || value[0] == '2') ? static_cast<uint32_t>(value[0] - '0') : 0u;
+		if (m != 0u) std::fprintf(stderr, "PERF_LOOP_PROOF_MEMO enabled (mode %u)\n", m);
+		return m;
+	}();
+	return mode;
+}
+
+struct LoopProofMemoCounters {
+	std::atomic<uint64_t> hits {0}, misses {0}, checks {0}, bad {0}, logged {0};
+};
+inline LoopProofMemoCounters g_loop_proof_memo;
+
+void ReportLoopProofMemoImpl() {
+	if (LoopProofMemoMode() == 0u) return;
+	const auto& c = g_loop_proof_memo;
+	std::fprintf(stderr, "PERF loop_proof_memo mode=%u hits=%llu misses=%llu checks=%llu bad=%llu\n", LoopProofMemoMode(),
+	             static_cast<unsigned long long>(c.hits.load()), static_cast<unsigned long long>(c.misses.load()),
+	             static_cast<unsigned long long>(c.checks.load()), static_cast<unsigned long long>(c.bad.load()));
+}
+
 // Hashes of the LoopBoundProof decision-diagram tables. Ordered maps of these keys took most of the
 // translation time of the shaders with record-keyed buffers (40395313 6 s, 7ff41f74 23 s), in
 // lexicographic key compares and tree teardown.
@@ -2355,12 +2378,41 @@ private:
 			if (!GuardedOnEntry(use != nullptr ? use : increment_block, stops, [&](const EdgePredicate& edge) {
 				return edge.positive && Implies(edge.condition, Value(use_of_key.user));
 			})) continue;
-			LoopBoundProof proof(m_program, *phi, *compare);
 			// The image bound and the increment guard are separate obligations: a
 			// skipped image alone does not prevent signed induction wraparound.
-			if (GuardedOnEntry(increment_block, stops, [&](const EdgePredicate& edge) {
-				return proof.Excludes(edge.condition, edge.positive);
-			})) return compare;
+			const auto prove = [&] {
+				LoopBoundProof proof(m_program, *phi, *compare);
+				return GuardedOnEntry(increment_block, stops, [&](const EdgePredicate& edge) {
+					return proof.Excludes(edge.condition, edge.positive);
+				});
+			};
+			const auto mode = LoopProofMemoMode();
+			bool       guarded = false;
+			if (mode == 0u) {
+				guarded = prove();
+			} else {
+				const std::pair<const Inst*, const Inst*> memo_key {phi, compare};
+				if (const auto it = m_increment_guard_memo.find(memo_key); it != m_increment_guard_memo.end()) {
+					guarded = it->second;
+					g_loop_proof_memo.hits.fetch_add(1, std::memory_order_relaxed);
+					if (mode == 2u) {
+						const bool fresh = prove();
+						g_loop_proof_memo.checks.fetch_add(1, std::memory_order_relaxed);
+						if (fresh != guarded) {
+							g_loop_proof_memo.bad.fetch_add(1, std::memory_order_relaxed);
+							if (g_loop_proof_memo.logged.fetch_add(1, std::memory_order_relaxed) < 16u)
+								std::fprintf(stderr, "LOOP_PROOF_MEMO_CHECK bad hash=0x%016llx memo=%d fresh=%d\n",
+								             static_cast<unsigned long long>(m_program.shader_hash), guarded ? 1 : 0, fresh ? 1 : 0);
+							guarded = fresh;
+						}
+					}
+				} else {
+					guarded = prove();
+					g_loop_proof_memo.misses.fetch_add(1, std::memory_order_relaxed);
+					m_increment_guard_memo.emplace(memo_key, guarded);
+				}
+			}
+			if (guarded) return compare;
 		}
 		return {};
 	}
@@ -4295,6 +4347,12 @@ private:
 	bool                                       m_keep_table_reads = false;
 	mutable std::vector<std::vector<uint8_t>>  m_dominators;
 	mutable std::unordered_map<const Block*, size_t> m_dominator_index;
+	struct InstPairHash {
+		size_t operator()(const std::pair<const Inst*, const Inst*>& key) const {
+			return std::hash<const void*> {}(key.first) * 31u ^ std::hash<const void*> {}(key.second);
+		}
+	};
+	mutable std::unordered_map<std::pair<const Inst*, const Inst*>, bool, InstPairHash> m_increment_guard_memo;
 	std::vector<IndirectDescriptorPlan>             m_indirect_descriptors;
 	std::map<const Inst*, Value>              m_descriptor_values;
 	std::unordered_map<const Inst*, Value>    m_lane_projections; // composed V#s (ProjectLaneUniform)
@@ -4310,6 +4368,10 @@ private:
 
 void TrackResources(Program& program, const Decoder::Program& decoded, const CFG::Graph& native_cfg) {
 	Tracker(program, decoded, native_cfg).Run();
+}
+
+void ReportLoopProofMemo() {
+	ReportLoopProofMemoImpl();
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

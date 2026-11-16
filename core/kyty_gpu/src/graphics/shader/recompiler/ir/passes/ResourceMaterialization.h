@@ -183,6 +183,7 @@ bool NullSlotPrewarmEnabled();
 uint32_t SamplerPadMode();
 size_t PadSamplerCandidates(ResourceSpecialization& specialization, std::vector<DescriptorValue>* descriptors);
 void ReportSamplerPad();
+void ReportLoopProofMemo();
 std::vector<std::array<uint32_t, 2>> NullSlotGuesses(const ResourcePlan& program, size_t i);
 // Project 15 S2d: what ApplyNullFormattedShare does to `specialization` (the null buffers take the shared format),
 // without its writes (the live formats and the journal stay as they are). Under the plan's share lock.

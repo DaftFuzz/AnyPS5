@@ -2743,6 +2743,7 @@ void ShaderPrecompiler::ReportDone(std::vector<vk::ShaderModule>& unused) {
 		             static_cast<unsigned long long>(g_reuse.plans.load()),
 		             static_cast<unsigned long long>(g_reuse.plan_us.load() / 1000u),
 		             static_cast<unsigned long long>(g_reuse.compile_us.load() / 1000u));
+		ShaderRecompiler::IR::ReportLoopProofMemo();
 		if (m_disk != nullptr) {
 			std::fprintf(stderr,
 			             "PERF shader_reuse_disk entries=%zu plans=%zu hits=%llu plan_hits=%llu plan_translations=%llu stores=%llu "
