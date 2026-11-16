@@ -12,8 +12,19 @@
 #include "graphics/host_gpu/renderer/gpuTimer.h"
 #include "graphics/host_gpu/renderer/recordPackets.h"
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 #include <mutex>
 #include <optional>
+#include <string>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -120,6 +131,71 @@ void Bump(std::atomic<uint64_t>& counter, uint64_t amount = 1) noexcept {
 
 // The worker's thread token (null before it starts): queue calls made by the worker itself do not wait for it.
 std::atomic<const void*> g_worker_token {nullptr};
+
+// The hang marker: the packet function the worker is running (null between packets), the CommitCall/EnqueueCall
+// function inside it, and since when (QueueLockSite::NowNs). Read by the RECORD_THREAD warning.
+std::atomic<const void*> g_worker_run {nullptr};
+std::atomic<const void*> g_worker_call {nullptr};
+std::atomic<int64_t>     g_worker_since_ns {0};
+std::atomic<bool>        g_hang_dumped {false};
+
+// "module+0xoffset" of a code address (resolve with the module's .map), or the plain address.
+std::string CodeName(const void* address) {
+	if (address == nullptr) return "-";
+#if defined(_WIN32)
+	HMODULE module = nullptr;
+	if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+	                       static_cast<LPCSTR>(address), &module) != 0 &&
+	    module != nullptr) {
+		char path[MAX_PATH] = {};
+		GetModuleFileNameA(module, path, MAX_PATH);
+		const char* name = std::strrchr(path, '\\');
+		char        text[MAX_PATH + 32];
+		std::snprintf(text, sizeof(text), "%s+0x%llx", name != nullptr ? name + 1 : path,
+		              static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(address) - reinterpret_cast<uintptr_t>(module)));
+		return text;
+	}
+#endif
+	char text[32];
+	std::snprintf(text, sizeof(text), "0x%llx", static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(address)));
+	return text;
+}
+
+// A wait on the worker that lasted 30 s: one minidump of every thread's stack per process, into KYTY_HANG_DUMP_DIR (else
+// the working directory).
+void WriteHangDump(const char* reason) {
+#if defined(_WIN32)
+	if (g_hang_dumped.exchange(true)) return;
+	using MiniDumpWriteDumpFn = BOOL(WINAPI*)(HANDLE, DWORD, HANDLE, int, void*, void*, void*);
+	HMODULE dbghelp = LoadLibraryA("dbghelp.dll");
+	const auto write = dbghelp != nullptr
+	                       ? reinterpret_cast<MiniDumpWriteDumpFn>(reinterpret_cast<void*>(GetProcAddress(dbghelp, "MiniDumpWriteDump")))
+	                       : nullptr;
+	if (write == nullptr) {
+		std::fprintf(stderr, "RECORD_THREAD hang dump: dbghelp.dll MiniDumpWriteDump unavailable\n");
+		return;
+	}
+	const char* dir = std::getenv("KYTY_HANG_DUMP_DIR");
+	char        path[MAX_PATH + 64];
+	std::snprintf(path, sizeof(path), "%s%skyty-hang-%lu-%s.dmp", dir != nullptr ? dir : "", dir != nullptr ? "\\" : "",
+	              static_cast<unsigned long>(GetCurrentProcessId()), reason);
+	HANDLE file = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (file == INVALID_HANDLE_VALUE) {
+		std::fprintf(stderr, "RECORD_THREAD hang dump: cannot create %s\n", path);
+		return;
+	}
+	constexpr int MiniDumpWithDataSegs = 0x1, MiniDumpWithHandleData = 0x4, MiniDumpWithUnloadedModules = 0x20,
+	              MiniDumpWithThreadInfo = 0x1000;
+	const BOOL ok = write(GetCurrentProcess(), GetCurrentProcessId(), file,
+	                      MiniDumpWithDataSegs | MiniDumpWithHandleData | MiniDumpWithUnloadedModules | MiniDumpWithThreadInfo,
+	                      nullptr, nullptr, nullptr);
+	CloseHandle(file);
+	std::fprintf(stderr, "RECORD_THREAD hang dump: %s %s\n", ok ? "wrote" : "failed", path);
+	std::fflush(stderr);
+#else
+	(void)reason;
+#endif
+}
 
 // Set while the worker replays packets: commands it makes are not routed again.
 thread_local bool t_replaying = false;
@@ -336,7 +412,11 @@ private:
 			} else {
 				EXIT_IF(header.size < HeaderBytes || header.size > MaxPacket ||
 				        position + header.size > available);
+				g_worker_run.store(reinterpret_cast<const void*>(header.run), std::memory_order_relaxed);
+				g_worker_call.store(nullptr, std::memory_order_relaxed);
+				g_worker_since_ns.store(QueueLockSite::NowNs(), std::memory_order_relaxed);
 				header.run(start + header.closure_offset);
+				g_worker_run.store(nullptr, std::memory_order_relaxed);
 				position += header.size;
 			}
 			if (position - stored >= 65536u) {
@@ -401,8 +481,9 @@ private:
 	// is reported (the worker waits for no one, so it means the driver does not return).
 	template <typename Done>
 	void WaitUntil(Done&& done, Reason reason) {
-		auto     next_warning = Clock::now() + StallWarning;
-		uint32_t spins        = 0;
+		const auto wait_start   = Clock::now();
+		auto       next_warning = wait_start + StallWarning;
+		uint32_t   spins        = 0;
 		while (!done()) {
 			if (++spins < 256u) {
 				_mm_pause();
@@ -423,14 +504,24 @@ private:
 					                                 QueueLockSite::since_ns.load(std::memory_order_relaxed)) /
 					                                    1000000
 					                              : 0;
+					const void*   worker_run = g_worker_run.load(std::memory_order_relaxed);
+					const int64_t worker_ms  = worker_run != nullptr
+					                               ? (QueueLockSite::NowNs() - g_worker_since_ns.load(std::memory_order_relaxed)) / 1000000
+					                               : 0;
 					std::fprintf(stderr,
 					             "RECORD_THREAD warning: still waiting for the recording thread (%s): "
-					             "read=%" PRIu64 " published=%" PRIu64 " pending=%" PRIu64 " sleeping=%d queue_lock=%s held_ms=%lld\n",
+					             "read=%" PRIu64 " published=%" PRIu64 " pending=%" PRIu64 " sleeping=%d queue_lock=%s held_ms=%lld "
+					             "worker_in=%s worker_call=%s worker_ms=%lld waited_ms=%lld\n",
 					             ReasonNames[static_cast<size_t>(reason)],
 					             m_read.load(std::memory_order_relaxed),
 					             m_write.load(std::memory_order_relaxed), m_pending,
 					             m_sleeping.load(std::memory_order_relaxed) ? 1 : 0, lock_site != nullptr ? lock_site : "-",
-					             static_cast<long long>(lock_ms));
+					             static_cast<long long>(lock_ms), CodeName(worker_run).c_str(),
+					             CodeName(worker_run != nullptr ? g_worker_call.load(std::memory_order_relaxed) : nullptr).c_str(),
+					             static_cast<long long>(worker_ms),
+					             static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(now - wait_start).count()));
+					std::fflush(stderr);
+					if (now - wait_start >= std::chrono::seconds(30)) WriteHangDump(ReasonNames[static_cast<size_t>(reason)]);
 				}
 			}
 		}
@@ -1594,7 +1685,10 @@ void EnqueueCall(void (*call)(const void* blob), const void* blob, size_t bytes)
 	EXIT_IF(g_recorder == nullptr || call == nullptr || bytes == 0 || bytes > UINT32_MAX);
 	Packet      packet(ArrayBytes<uint8_t>(static_cast<uint32_t>(bytes)));
 	const auto* copy = packet.Copy(static_cast<const uint8_t*>(blob), static_cast<uint32_t>(bytes));
-	packet.Commit([=] { call(copy); });
+	packet.Commit([=] {
+		g_worker_call.store(reinterpret_cast<const void*>(call), std::memory_order_relaxed);
+		call(copy);
+	});
 	g_recorder->PublishPending();
 }
 
@@ -1618,7 +1712,10 @@ void* ReserveCall(vk::CommandBuffer buffer, size_t bytes) {
 void CommitCall(void (*call)(const void* blob)) {
 	EXIT_IF(!g_open_call.has_value() || call == nullptr);
 	const void* blob = g_open_blob;
-	g_open_call->Commit([=] { call(blob); });
+	g_open_call->Commit([=] {
+		g_worker_call.store(reinterpret_cast<const void*>(call), std::memory_order_relaxed);
+		call(blob);
+	});
 	g_open_call.reset();
 	g_open_blob = nullptr;
 }

@@ -1822,10 +1822,10 @@ struct PipelineCache::TableCompileJob {
 // (src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp, CompileWorkers), GPL-2.0.
 class PipelineCache::TableCompileWorkers {
 public:
-	explicit TableCompileWorkers(uint32_t count) {
+	explicit TableCompileWorkers(uint32_t count, const char* name = "Thread_TableCompile") {
 		for (uint32_t i = 0; i < count; i++) {
-			m_threads.emplace_back([this, i] {
-				EnterBackgroundCompileThread(fmt::format("Thread_TableCompile{}", i).c_str());
+			m_threads.emplace_back([this, i, name] {
+				EnterBackgroundCompileThread(fmt::format("{}{}", name, i).c_str());
 				Run();
 			});
 		}
@@ -2136,6 +2136,16 @@ PipelineCache::~PipelineCache() {
 	// KYTY_PERF_TABLE_ASYNC: its workers first (they use the precompiler, the driver cache and the programs' modules);
 	// the pipelines they made that no draw took yet are destroyed with the others.
 	m_table_workers.reset();
+	m_gpl_workers.reset();
+	for (Pipeline* p: m_gpl_live) {
+		if (p->gpl == nullptr || p->gpl->state.load(std::memory_order_acquire) != 2u) continue;
+		auto& made = p->gpl->optimized;
+		if (made.pipeline != nullptr) m_graphics.device.destroyPipeline(made.pipeline, nullptr);
+		if (made.pipeline_layout != nullptr) m_graphics.device.destroyPipelineLayout(made.pipeline_layout, nullptr);
+		if (made.descriptor_set_layout != nullptr) m_graphics.device.destroyDescriptorSetLayout(made.descriptor_set_layout, nullptr);
+		made = Pipeline {};
+	}
+	m_gpl_live.clear();
 	const std::unique_lock pipelines_lock(m_pipelines_mutex);
 	for (auto& [key, job]: m_table_pending) {
 		if (job->done.load(std::memory_order_acquire) && !job->failed && job->pipeline != nullptr) {
@@ -2163,6 +2173,7 @@ PipelineCache::~PipelineCache() {
 	}
 	destroy(m_graphics_pipelines);
 	destroy(m_compute_pipelines);
+	GplDestroyLibraries(m_graphics);
 	if (m_driver_cache != nullptr) {
 		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
 	}
@@ -3407,7 +3418,93 @@ void PipelineCache::RecreateGraphicsPipeline(Pipeline& pipeline, const GraphicsP
 	CreatePipelineInternal(m_graphics, pipeline, key.rendering, key.vertex_input, vertex_info, ps_input_info, programs,
 	                       key.static_params, m_driver_cache);
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr || pipeline.pipeline_layout == nullptr);
+	NoteGplPipeline(pipeline);
 	m_recreated++;
+}
+
+void PipelineCache::NoteGplPipeline(Pipeline& pipeline) {
+	if (pipeline.gpl != nullptr) m_gpl_live.push_back(&pipeline);
+}
+
+void PipelineCache::SwapGplPipelines(CommandScheduler& scheduler) {
+	if (m_gpl_live.empty()) return;
+	struct Retired {
+		vk::Pipeline                 pipeline;
+		vk::PipelineLayout           layout;
+		vk::DescriptorSetLayout      set_layout;
+		vk::DescriptorUpdateTemplate push_template;
+	};
+	std::vector<Retired> retired;
+	size_t               kept = 0;
+	for (Pipeline* p: m_gpl_live) {
+		const auto pending = p->gpl;
+		if (pending == nullptr) continue;
+		const auto state = pending->state.load(std::memory_order_acquire);
+		if (state == 0u) {
+			if (m_gpl_workers == nullptr) {
+				m_gpl_workers = std::make_unique<TableCompileWorkers>(2u, "Thread_GplOptimize");
+				std::fprintf(stderr, "PERF_GPL optimize workers=2\n");
+			}
+			pending->state.store(1u, std::memory_order_release);
+			GplCountOptimize(GplOptimizeEvent::Queued, 0);
+			m_gpl_workers->Push([this, pending] {
+				const auto begin = std::chrono::steady_clock::now();
+				t_gpl_monolithic = true;
+				CreatePipelineInternal(m_graphics, pending->optimized, pending->rendering, pending->vertex_input,
+				                       std::span<const ShaderVertexInputInfo>(pending->vertex_info.data(), pending->vertex_count),
+				                       pending->ps_active ? &pending->ps_input_info : nullptr, pending->programs,
+				                       pending->static_params, m_driver_cache);
+				t_gpl_monolithic = false;
+				pending->us = static_cast<uint64_t>(
+				    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin).count());
+				pending->state.store(2u, std::memory_order_release);
+			});
+			m_gpl_live[kept++] = p;
+			continue;
+		}
+		if (state == 1u) {
+			m_gpl_live[kept++] = p;
+			continue;
+		}
+		auto&      made = pending->optimized;
+		const bool same = made.pipeline != nullptr && made.pipeline_layout != nullptr && made.descriptor_set_layout != nullptr &&
+		                  made.gpl == nullptr && made.uses_bindless == p->uses_bindless &&
+		                  made.uses_push_descriptors == p->uses_push_descriptors && made.uses_image_heap == p->uses_image_heap &&
+		                  made.color_count == p->color_count && made.cull_dynamic == p->cull_dynamic &&
+		                  made.split == p->split && made.pixel_set_layout == p->pixel_set_layout &&
+		                  made.push_stages == p->push_stages;
+		if (same) {
+			retired.push_back({p->pipeline, p->pipeline_layout, p->descriptor_set_layout, p->push_template});
+			{
+				const std::unique_lock pipelines_lock(m_pipelines_mutex);
+				p->pipeline              = made.pipeline;
+				p->pipeline_layout       = made.pipeline_layout;
+				p->descriptor_set_layout = made.descriptor_set_layout;
+				p->push_template         = nullptr;
+				p->push_template_bytes   = 0;
+			}
+			GplCountOptimize(GplOptimizeEvent::Swapped, pending->us);
+		} else {
+			retired.push_back({made.pipeline, made.pipeline_layout, made.descriptor_set_layout, nullptr});
+			if (made.pipeline != nullptr) {
+				std::fprintf(stderr, "PERF_GPL optimized pipeline differs from its fast-linked one: vs=0x%016llx (kept fast-linked)\n",
+				             static_cast<unsigned long long>(pending->vertex_info[0].stage.program->shader_hash));
+			}
+			GplCountOptimize(GplOptimizeEvent::Failed, pending->us);
+		}
+		made   = Pipeline {};
+		p->gpl = nullptr;
+	}
+	m_gpl_live.resize(kept);
+	if (retired.empty()) return;
+	scheduler.DeferOperation([device = m_graphics.device, retired = std::move(retired)] {
+		for (const auto& r: retired) {
+			if (r.pipeline != nullptr) device.destroyPipeline(r.pipeline, nullptr);
+			if (r.push_template != nullptr) device.destroyDescriptorUpdateTemplate(r.push_template, nullptr);
+			if (r.layout != nullptr) device.destroyPipelineLayout(r.layout, nullptr);
+			if (r.set_layout != nullptr) device.destroyDescriptorSetLayout(r.set_layout, nullptr);
+		}
+	});
 }
 
 PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
@@ -3525,6 +3622,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	if (inserted && shared_from.has_value()) m_shared_keys.emplace(*shared_from, iter->first);
 	pipelines_lock.unlock();
 	EXIT_IF(!inserted);
+	NoteGplPipeline(*iter->second);
 	NoteSharedPipeline(iter->first);
 	ReportShare();
 	// (Upstream 959bee479 checkpoints the driver cache here; ours saves it with SaveIfDue, m_pipelines_since_save.)
@@ -3671,6 +3769,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipelineAsync(
 		auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(finished));
 		pipelines_lock.unlock();
 		EXIT_IF(!inserted);
+		NoteGplPipeline(*iter->second);
 		NoteSharedPipeline(iter->first);
 		stats.draws++;
 		return iter->second.get();
@@ -3905,6 +4004,7 @@ PipelineCache::Pipeline* PipelineCache::TakeAheadGraphicsPipeline(const Graphics
 	finished->last_used = static_cast<uint32_t>(DebugPresentCount().load());
 	auto [iter, inserted] = m_graphics_pipelines.emplace(key, std::move(finished));
 	EXIT_IF(!inserted);
+	NoteGplPipeline(*iter->second);
 	return iter->second.get();
 }
 
@@ -3981,6 +4081,7 @@ constexpr uint32_t PipelineSweepFrames = 300;
 } // namespace
 
 void PipelineCache::EvictIdlePipelines(CommandScheduler& scheduler) {
+	SwapGplPipelines(scheduler);
 	const auto now = static_cast<uint32_t>(DebugPresentCount().load());
 	if (now - m_last_eviction < std::min(PipelineSweepFrames, PipelineIdleFrames())) return;
 	m_last_eviction = now;
@@ -3996,7 +4097,8 @@ void PipelineCache::EvictIdlePipelines(CommandScheduler& scheduler) {
         for (auto& [key, pointer]: map) {
             auto& p = *pointer;
             if (p.pipeline == nullptr) continue;
-            if (now - p.last_used < PipelineIdleFrames()) {
+            if (now - p.last_used < PipelineIdleFrames() ||
+                (p.gpl != nullptr && p.gpl->state.load(std::memory_order_acquire) != 0u)) {
                 live++;
                 continue;
             }

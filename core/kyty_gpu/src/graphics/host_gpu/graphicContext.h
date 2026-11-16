@@ -69,6 +69,8 @@ struct GraphicContext {
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               unused_attachments_enabled            = false;
 	bool                               maintenance8_enabled                  = false;
+	// KYTY_PERF_GPL: VK_EXT_graphics_pipeline_library with fast linking and pipelineCreationCacheControl are enabled.
+	bool                               graphics_pipeline_library_enabled     = false;
 	bool                               robust_buffer_access_enabled          = false;
 	bool                               occlusion_queries_enabled             = false;
 	bool                               occlusion_query_precise_enabled       = false;

@@ -1,9 +1,13 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include "common/assert.h"
+#include "common/envRead.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 
 #include <array>
+#include <mutex>
+#include <unordered_map>
+#include <xxhash.h>
 
 VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE
 
@@ -125,6 +129,35 @@ void RequireVulkanSuccess(vk::Result result, const char* operation) {
 	}
 }
 
+namespace {
+
+struct ModuleContentRegistry {
+	std::mutex                                                    mutex;
+	std::unordered_map<VkShaderModule, ShaderModuleContentHash> hashes;
+};
+
+ModuleContentRegistry& ModuleContents() {
+	static ModuleContentRegistry registry;
+	return registry;
+}
+
+void NoteModuleContent(vk::ShaderModule module, std::span<const uint32_t> code) {
+	if (module == nullptr || Common::EnvRead::Gpl() == 0u) return;
+	const auto hash = XXH3_128bits(code.data(), code.size_bytes());
+	auto&      registry = ModuleContents();
+	const std::lock_guard lock(registry.mutex);
+	registry.hashes[static_cast<VkShaderModule>(module)] = {hash.low64, hash.high64 ^ code.size_bytes()};
+}
+
+} // namespace
+
+ShaderModuleContentHash ModuleContentHash(vk::ShaderModule module) {
+	auto&                 registry = ModuleContents();
+	const std::lock_guard lock(registry.mutex);
+	const auto            found = registry.hashes.find(static_cast<VkShaderModule>(module));
+	return found != registry.hashes.end() ? found->second : ShaderModuleContentHash {};
+}
+
 vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device) {
 	vk::ShaderModuleCreateInfo create_info {};
 	create_info.codeSize    = code.size_bytes();
@@ -132,6 +165,7 @@ vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device) {
 	vk::ShaderModule module = nullptr;
 	RequireVulkanSuccess(device.createShaderModule(&create_info, nullptr, &module),
 	                     "create SPIR-V shader module");
+	NoteModuleContent(module, code);
 	return module;
 }
 
@@ -143,6 +177,7 @@ vk::ShaderModule TryCompileSPV(std::span<const uint32_t> code, vk::Device device
 	if (device.createShaderModule(&create_info, nullptr, &module) != vk::Result::eSuccess) {
 		return nullptr;
 	}
+	NoteModuleContent(module, code);
 	return module;
 }
 

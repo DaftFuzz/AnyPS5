@@ -27,6 +27,15 @@ public:
 		return m_current_tick_p->fetch_add(1, std::memory_order_release);
 	}
 	[[nodiscard]] vk::Semaphore Handle() const noexcept { return m_semaphore; }
+	// The newest tick whose signalling submission vkQueueSubmit has accepted (the recorder's worker submits later than
+	// the tick is taken). A submission on another queue that waits for a tick must not run ahead of it: the driver may
+	// hold queue operations behind that wait while the signalling submission waits for the queue lock.
+	[[nodiscard]] uint64_t QueueSubmittedTick() const noexcept { return m_queue_submitted.load(std::memory_order_acquire); }
+	void                   NoteQueueSubmitted(uint64_t tick) noexcept {
+		uint64_t seen = m_queue_submitted.load(std::memory_order_relaxed);
+		while (seen < tick && !m_queue_submitted.compare_exchange_weak(seen, tick, std::memory_order_release, std::memory_order_relaxed)) {
+		}
+	}
 
 	// Refresh queries the timeline semaphore (a kernel call) at most once per 100 microseconds; in between it keeps the
 	// last known GPU tick, which only makes IsFree conservative for that long. RefreshNow and Wait always query.
@@ -63,6 +72,7 @@ private:
 	std::atomic<uint64_t>             m_gpu_tick_packed {0};
 	std::atomic<uint64_t>             m_current_tick_packed {1};
 	std::atomic<int64_t>              m_last_refresh_packed {0};
+	std::atomic<uint64_t>             m_queue_submitted {0};
 	alignas(64) std::atomic<uint64_t> m_gpu_tick_padded {0};
 	alignas(64) std::atomic<uint64_t> m_current_tick_padded {1};
 	alignas(64) std::atomic<int64_t>  m_last_refresh_padded {0};

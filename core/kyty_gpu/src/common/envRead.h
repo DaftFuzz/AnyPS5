@@ -97,6 +97,27 @@ namespace Common::EnvRead {
 	return on;
 }
 
+// KYTY_PERF_GPL: 1 graphics pipeline libraries (a compile miss links from stage libraries, the optimized pipeline is
+// swapped in at a frame boundary), 2 the same with every new pipeline linked from libraries (check mode), 0 off.
+[[nodiscard]] inline uint32_t Gpl() {
+	static const uint32_t mode = [] {
+		const char* value = ShaderEnv::Read("KYTY_PERF_GPL");
+		return value != nullptr && (value[0] == '1' || value[0] == '2') ? static_cast<uint32_t>(value[0] - '0') : 0u;
+	}();
+	return mode;
+}
+
+// KYTY_PERF_GPL_SPLIT=1 with KYTY_PERF_GPL: graphics descriptors in one set per stage group (set 0 the vertex stages,
+// set 1 the pixel stage, set 2 the bindless table), push constants for every graphics stage, so a stage library depends
+// only on its own bindings.
+[[nodiscard]] inline bool GplSplit() {
+	static const bool on = [] {
+		const char* value = ShaderEnv::Read("KYTY_PERF_GPL_SPLIT");
+		return Gpl() != 0u && value != nullptr && value[0] == '1';
+	}();
+	return on;
+}
+
 [[nodiscard]] inline bool ProxyCounts() {
 	return std::getenv("KYTY_TRACE_PROXY_COUNTS") != nullptr;
 }

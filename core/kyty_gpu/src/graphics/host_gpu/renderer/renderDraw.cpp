@@ -3351,6 +3351,7 @@ void RenderExecutor::CommitPreparedDraw(DrawPlan& plan) {
 	if (state.ps_active && state.ps_input_info.HasObjprimOutput()) {
 		vk::ShaderStageFlags objprim_stages = vk::ShaderStageFlagBits::eFragment;
 		for (const auto& stage: vertex_stages) objprim_stages |= NativeShaderStage(stage.logical_stage);
+		if (pipeline.split) objprim_stages = pipeline.push_stages;
 		const uint32_t object_id = plan.regs.object_id;
 		vk_buffer.pushConstants(pipeline.pipeline_layout, objprim_stages,
 		                        uint32_t {state.ps_input_info.objprim_push_dword} * 4u, sizeof(object_id),
@@ -3362,6 +3363,7 @@ void RenderExecutor::CommitPreparedDraw(DrawPlan& plan) {
 	if (const auto planes = vertex_stages.empty() ? 0u : vertex_stages.back().user_clip_planes; planes != 0) {
 		vk::ShaderStageFlags ucp_stages = vk::ShaderStageFlagBits::eFragment;
 		for (const auto& stage: vertex_stages) ucp_stages |= NativeShaderStage(stage.logical_stage);
+		if (pipeline.split) ucp_stages = pipeline.push_stages;
 		vk_buffer.pushConstants(pipeline.pipeline_layout, ucp_stages,
 		                        ShaderRecompiler::IR::PushData::UserClipPlaneDword * sizeof(uint32_t),
 		                        std::bit_width(planes) * 4u * sizeof(uint32_t), plan.regs.user_clip_planes.data());
@@ -3375,8 +3377,9 @@ void RenderExecutor::CommitPreparedDraw(DrawPlan& plan) {
 		    static_cast<uint32_t>(index_source.address >> 32u)};
 		static_assert(std::size(draw_data) == ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
 		vk_buffer.pushConstants(pipeline.pipeline_layout,
-		                        vk::ShaderStageFlagBits::eMeshEXT |
-		                            vk::ShaderStageFlagBits::eFragment,
+		                        pipeline.split ? pipeline.push_stages
+		                                       : vk::ShaderStageFlags(vk::ShaderStageFlagBits::eMeshEXT |
+		                                                              vk::ShaderStageFlagBits::eFragment),
 		                        0, sizeof(draw_data), draw_data);
 	} else {
 		const DispatchSubTimer index_census(DispatchSub::CIndex); // KYTY_TRACE_DRAW_CENSUS
