@@ -4413,6 +4413,43 @@ bool RenderExecutor::TakeAheadImages(const void* program, PeekStageImagesResult&
 	return false;
 }
 
+void RenderExecutor::PlanFirstUsePrebuild(ResolvedDraw* slot, const HW::Context& ctx, const HW::UserConfig& ucfg, bool indexed,
+                                          uint32_t index_type, uint32_t slice_offset) {
+	auto& state = slot->state;
+	if (state.programs.VertexStageCount() != 1u || state.vertex_info[0].logical_stage != ShaderType::Vertex) return;
+	if (ctx.GetColorControl().mode > static_cast<uint8_t>(CbColorMode::Normal) || DepthStencilCopyAsked(ctx)) return;
+	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
+	uint32_t              element  = 0;
+	if (indexed) {
+		switch (static_cast<Prospero::IndexType>(index_type)) {
+			case Prospero::IndexType::kIndex16: element = 2; break;
+			case Prospero::IndexType::kIndex32: element = 4; break;
+			case Prospero::IndexType::kIndex8: element = 1; break;
+			default: element = 0; break;
+		}
+	}
+	if (!GetDrawTopology(ucfg, topology) || (indexed && element == 0)) return;
+	std::array<RenderColorInfo, RENDER_COLOR_ATTACHMENTS_MAX> colors {};
+	uint32_t                                                  colors_ok = 0;
+	t_describe_soft = true;
+	for (uint32_t target = 0; target < RENDER_COLOR_ATTACHMENTS_MAX; target++) {
+		t_describe_failed = false;
+		if (DescribeRenderColorTarget(ctx, colors[target], slice_offset, target, false) && !t_describe_failed) {
+			colors_ok |= 1u << target;
+		}
+	}
+	t_describe_failed = false;
+	RenderDepthInfo depth {};
+	const bool      depth_described = DescribeRenderDepthTarget(m_context.GetGraphics(), ctx, depth);
+	const bool      depth_ok        = depth_described && !t_describe_failed;
+	t_describe_failed               = false;
+	t_describe_soft                 = false;
+	const bool restart = indexed && ClassifyPrimitiveRestartRegs(ucfg, ctx, element) == PrimitiveRestartKind::Native;
+	m_context.GetPipelineCache().QueueFirstUsePrebuild(
+	    *slot->stages, std::span<const ShaderVertexInputInfo>(state.vertex_info.data(), 1), state.ps_active ? &state.ps_input_info : nullptr,
+	    ctx, ucfg, colors, colors_ok, DrawColorOutputMask(ctx), depth, depth_ok, topology, restart);
+}
+
 void RenderExecutor::PeekAhead(ResolvedDraw* slot, const HW::Context& ctx, const HW::UserConfig& ucfg, const HW::Shader& shaders,
                                bool indexed, uint32_t count, uint32_t instances, uint32_t index_type, uint32_t slice_offset,
                                uint64_t indirect, uint32_t distance, uint64_t index_address,
@@ -4446,6 +4483,10 @@ void RenderExecutor::PeekAhead(ResolvedDraw* slot, const HW::Context& ctx, const
 	if (!PipelineCache::StagesAdoptable(*slot->stages)) {
 		a.gated[3]++;
 		note(PeekPairOutcome::GatedAdopt);
+		if (CompileJobsMode() >= 3u && gpu_indirect == nullptr && count != 0 && instances != 0 && indirect == 0 &&
+		    PipelineCache::FirstUsePrebuildWanted(*slot->stages)) {
+			PlanFirstUsePrebuild(slot, ctx, ucfg, indexed, index_type, slice_offset);
+		}
 		return;
 	}
 	// N7.2: a GPU indirect packet passes the execution thread's early checks (ranges clamped without a write) or has no plan.

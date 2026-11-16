@@ -166,6 +166,19 @@ struct ResolvedStages {
 	std::array<ShaderProgram, 4>                                   ahead_handles {};
 	std::array<const void*, 4>                                     standin_permutations {};
 	std::array<bool, 4>                                            standin_missing {};
+	// KYTY_PERF_COMPILE_JOBS>=3: the graphics stages without a program (first use), in resolve order with the others.
+	struct FirstUseStage {
+		ShaderType            stage = ShaderType::Vertex;
+		uint64_t              hash  = 0;
+		uint64_t              base  = 0;
+		uint32_t              code_size = 0;
+		uint32_t              back_size = 0;
+		std::vector<uint32_t> user_data;
+	};
+	std::vector<FirstUseStage> first_use;
+	std::array<int8_t, 4>      order {};
+	uint32_t                   order_count     = 0;
+	bool                       first_use_block = false;
 
 	void Reset() {
 		ahead_valid       = false;
@@ -175,6 +188,9 @@ struct ResolvedStages {
 		adoptable   = false;
 		reads       = Reads::Unchecked;
 		log.Clear();
+		first_use.clear();
+		order_count     = 0;
+		first_use_block = false;
 	}
 };
 
@@ -185,7 +201,7 @@ void DeleteResolvedStages(ResolvedStages* stages) {
 	delete stages;
 }
 [[nodiscard]] bool ResolvedStagesEmpty(const ResolvedStages& stages) noexcept {
-	return stages.count == 0;
+	return stages.count == 0 && stages.first_use.empty();
 }
 
 void SetResolveCheck(bool on) {
@@ -1581,12 +1597,27 @@ struct PipelineCache::ProgramCache {
 				if (entry == nullptr && precompiler != nullptr && CompileJobsEnabled()) {
 					QueueRuntimeCompile(params, input_info, push_data_cursor, ahead_key.static_state, nullptr);
 				}
+			} else {
+				if (entry == nullptr && precompiler != nullptr && CompileJobsMode() >= 3u && results.order_count < 4u &&
+				    results.first_use.size() < 4u) {
+					auto& fu     = results.first_use.emplace_back();
+					fu.stage     = stage;
+					fu.hash      = params.hash;
+					fu.base      = params.Base();
+					fu.code_size = static_cast<uint32_t>(params.code.size());
+					fu.back_size = static_cast<uint32_t>(params.back_code.size());
+					fu.user_data.assign(params.user_data.begin(), params.user_data.begin() + params.user_data_count);
+					results.order[results.order_count++] = static_cast<int8_t>(-static_cast<int>(results.first_use.size()));
+				} else {
+					results.first_use_block = true;
+				}
 			}
 			return;
 		}
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			input_info.indirect_draw_resource_sgprs = entry->indirect_draw_resource_sgprs;
 		}
+		if (results.order_count < 4u) results.order[results.order_count++] = static_cast<int8_t>(results.count);
 		auto& r           = results.stages[results.count++];
 		r.stage           = stage;
 		r.plan            = &entry->resource_plan;
@@ -3723,6 +3754,20 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		}
 		m_precompiler->BeforeCompile(precompile.Key());
 	}
+	std::unique_ptr<Pipeline> prebuilt;
+	if (precompile_record && !shared_from.has_value() && CompileJobsMode() >= 3u && m_prebuilds != nullptr && vertex_info.size() == 1u) {
+		const auto spirv_of = [&](uint64_t id) -> uint64_t {
+			const auto found = m_program_cache->precompile_stages.find(id);
+			return found != m_program_cache->precompile_stages.end() ? found->second.spirv_hash : 0u;
+		};
+		const auto* ps_program = ps_active && ps_input_info->stage ? ps_input_info->stage.program : nullptr;
+		prebuilt = TakeFirstUsePrebuild(precompile, vs_input_info.stage.program->shader_hash,
+		                                ps_program != nullptr ? ps_program->shader_hash : 0u, spirv_of(vs_id),
+		                                ps_active ? spirv_of(ps_id) : 0u);
+	}
+	if (prebuilt != nullptr) {
+		cached = std::move(prebuilt);
+	} else {
 	GuestGpu::NoteCompileDepth("graphics", vertex_info.front().stage.program->shader_hash);
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
 	{
@@ -3739,6 +3784,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	}
 	m_pipelines_since_save++;
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
+	}
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
@@ -3805,8 +3851,8 @@ void TableAsyncReport(TableAsyncStats& s, size_t pending, size_t queued) {
 uint32_t CompileJobsMode() {
 	static const uint32_t mode = [] {
 		const char*    value = std::getenv("KYTY_PERF_COMPILE_JOBS");
-		const uint32_t m     = value != nullptr && (value[0] == '1' || value[0] == '2') ? static_cast<uint32_t>(value[0] - '0') : 0u;
-		if (m != 0u) std::fprintf(stderr, "PERF_COMPILE_JOBS on (mode %u)\n", m);
+		const uint32_t m     = value != nullptr && value[0] >= '1' && value[0] <= '4' ? static_cast<uint32_t>(value[0] - '0') : 0u;
+		if (m != 0u) std::fprintf(stderr, "PERF_COMPILE_JOBS on (mode %u%s)\n", m, m == 3u ? ": first-use prebuild" : m == 4u ? ": first-use prebuild check" : "");
 		return m;
 	}();
 	return mode;
@@ -3835,6 +3881,7 @@ struct AheadGraphicsStats {
 void PipelineCache::ReportCompileJobs() const {
 	if (PerfEnabled()) {
 		ReportIndirectCover();
+		ReportFirstUsePrebuild();
 		const auto u = [](const std::atomic<uint64_t>& v) { return static_cast<unsigned long long>(v.load(std::memory_order_relaxed)); };
 		const auto watches = ShaderRecompiler::IR::NullSlotWatchCounts();
 		std::fprintf(stderr, "PERF stage_compile graphics=%llu/%.0fms(reused %llu) compute=%llu/%.0fms(reused %llu) null_slot_prewarm=%llu null_slot_watch=%llu/%llu miss_reject[shape|stages|seen|code]=%llu|%llu|%llu|%llu graphics_create=%llu/%.0fms\n",
@@ -4079,6 +4126,393 @@ void PipelineCache::QueueAheadGraphicsMiss(const ResolvedStages& results, const 
 	for (uint32_t i = 0; i < results.count; i++) (results.stages[i].stage == ShaderType::Pixel ? miss_ps : miss_vs) = results.stages[i].shader_hash;
 	NoteMissPair(miss_vs, miss_ps, MissPairState::Queued);
 	m_precompiler->EnqueueGraphicsMiss(std::move(miss));
+}
+
+struct PipelineCache::FirstUsePrebuilds {
+	struct Job {
+		std::atomic<uint8_t>      state {0}; // 0 queued, 1 running, 2 finished, 3 cancelled by the GPU thread
+		PrecompileGraphicsRecord  record;
+		uint64_t                  vs_spirv = 0, ps_spirv = 0;
+		std::unique_ptr<Pipeline> pipeline;
+		std::vector<vk::ShaderModule>                                                 modules;
+		std::array<std::unique_ptr<ShaderRecompiler::IR::CompiledShaderInfo>, 2>     infos;
+		std::unique_ptr<ShaderRecompiler::IR::ResourceSnapshot>                       no_resources;
+	};
+	std::mutex                                             mutex;
+	std::unordered_set<uint64_t>                           seen;
+	std::unordered_multimap<uint64_t, std::shared_ptr<Job>> by_pair;
+	std::vector<std::shared_ptr<Job>>                      kept;
+	uint32_t                                               pending = 0;
+	std::atomic<uint64_t> queued {0}, full {0}, plan_fail {0}, stage_fail {0}, key_fail {0}, create_fail {0}, built {0};
+	std::atomic<uint64_t> adopted {0}, waited {0}, wait_us {0}, cancelled {0}, absent {0}, check_match {0}, build_us {0};
+	std::array<std::atomic<uint64_t>, 6> differ {}; // vertex key, pixel key, rendering, vertex input, static params, SPIR-V
+};
+
+namespace {
+uint64_t PrebuildPair(uint64_t vs_hash, uint64_t ps_hash) {
+	return vs_hash * 0x9e3779b97f4a7c15ull ^ ps_hash;
+}
+} // namespace
+
+bool PipelineCache::FirstUsePrebuildWanted(const ResolvedStages& results) {
+	if (results.first_use.empty() || results.first_use_block) return false;
+	for (uint32_t i = 0; i < results.count; i++) {
+		if (!results.stages[i].ok) return false;
+	}
+	return results.order_count == results.count + results.first_use.size();
+}
+
+void PipelineCache::QueueFirstUsePrebuild(const ResolvedStages& results, std::span<const ShaderVertexInputInfo> vertex_info,
+                                          const ShaderPixelInputInfo* ps_input_info, const HW::Context& ctx,
+                                          const HW::UserConfig& user_config, std::span<const RenderColorInfo> colors_by_slot,
+                                          uint32_t colors_ok, uint32_t color_output_mask, const RenderDepthInfo& depth,
+                                          bool depth_ok, vk::PrimitiveTopology topology, bool restart) {
+	if (m_precompiler == nullptr || !FirstUsePrebuildWanted(results) || colors_by_slot.size() != RENDER_COLOR_ATTACHMENTS_MAX) return;
+	if (vertex_info.size() != 1u || vertex_info[0].logical_stage != ShaderType::Vertex) return;
+	const bool ps_active = ps_input_info != nullptr;
+	if (results.order_count != (ps_active ? 2u : 1u)) return;
+	struct StageIn {
+		PrecompileStageRecord record;
+		bool                  first_use = false;
+		uint64_t              base      = 0;
+	};
+	std::vector<StageIn> stages;
+	uint64_t             vs_hash = 0, ps_hash = 0;
+	uint64_t             mark    = XXH3_64bits(&topology, sizeof(topology)) ^ (uint64_t {color_output_mask} << 40u) ^ (restart ? 0x77u : 0u);
+	uint32_t             pixel_stages = 0;
+	for (uint32_t k = 0; k < results.order_count; k++) {
+		const int idx = results.order[k];
+		StageIn   s;
+		auto&     rec = s.record;
+		uint64_t  base = 0;
+		uint32_t  code_size = 0;
+		if (idx >= 0) {
+			const auto& r = results.stages[static_cast<uint32_t>(idx)];
+			rec.stage       = r.stage;
+			rec.shader_hash = r.shader_hash;
+			rec.user_data.assign(r.user_data.begin(), r.user_data.begin() + r.user_data_count);
+			rec.static_key  = r.static_key;
+			rec.specialization = r.specialization;
+			if (!r.null_share_kinds.empty()) ShaderRecompiler::IR::PeekNullFormattedShare(*r.plan, r.null_share_kinds, rec.specialization);
+			base      = r.shader_base;
+			code_size = r.code_size;
+			mark      = mark * 0x9e3779b97f4a7c15ull ^ XXH3_64bits(rec.specialization.buffers.data(), rec.specialization.buffers.size() * sizeof(rec.specialization.buffers[0]));
+			mark      = mark * 0x9e3779b97f4a7c15ull ^ XXH3_64bits(rec.specialization.images.data(), rec.specialization.images.size() * sizeof(rec.specialization.images[0]));
+		} else {
+			const auto& fu = results.first_use[static_cast<size_t>(-idx - 1)];
+			if (fu.back_size != 0u) return;
+			rec.stage       = fu.stage;
+			rec.shader_hash = fu.hash;
+			rec.user_data   = fu.user_data;
+			base            = fu.base;
+			code_size       = fu.code_size;
+			s.first_use     = true;
+		}
+		const auto* code = reinterpret_cast<const uint32_t*>(base);
+		if (code == nullptr || code_size == 0u) return;
+		rec.code.assign(code, code + code_size);
+		if (PrecompileCodeHash(rec.code, {}) != rec.shader_hash) return;
+		if (rec.stage == ShaderType::Pixel) {
+			if (!ps_active) return;
+			rec.pixel       = *ps_input_info;
+			rec.pixel.stage = {};
+			if (s.first_use) BuildStageStaticKey(rec.pixel, rec.static_key);
+			ps_hash = rec.shader_hash;
+			pixel_stages++;
+		} else {
+			if (rec.stage != ShaderType::Vertex) return;
+			rec.vertex       = vertex_info[0];
+			rec.vertex.stage = {};
+			if (s.first_use) BuildStageStaticKey(rec.vertex, rec.static_key);
+			vs_hash = rec.shader_hash;
+		}
+		rec.revision = ShaderPrecompiler::Revision();
+		s.base       = base;
+		mark         = mark * 0x9e3779b97f4a7c15ull ^ rec.shader_hash ^ XXH3_64bits(rec.static_key.data(), rec.static_key.size() * sizeof(uint32_t)) ^
+		       XXH3_64bits(rec.user_data.data(), rec.user_data.size() * sizeof(uint32_t));
+		stages.push_back(std::move(s));
+	}
+	if (pixel_stages != (ps_active ? 1u : 0u) || vs_hash == 0u) return;
+	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+		if ((colors_ok & (1u << slot)) == 0) continue;
+		const auto format = colors_by_slot[slot].desc.view_info.format;
+		mark = mark * 0x9e3779b97f4a7c15ull ^ (static_cast<uint64_t>(format) << 8u) ^ slot;
+	}
+	mark ^= static_cast<uint64_t>(depth.format) << 20u;
+	if (m_prebuilds == nullptr) {
+		const std::lock_guard lock(m_ahead_workers_mutex);
+		if (m_prebuilds == nullptr) m_prebuilds = std::make_shared<FirstUsePrebuilds>();
+	}
+	auto prebuilds = m_prebuilds;
+	auto job       = std::make_shared<FirstUsePrebuilds::Job>();
+	{
+		std::lock_guard lock(prebuilds->mutex);
+		if (!prebuilds->seen.insert(mark).second) return;
+		if (prebuilds->pending >= 64u) {
+			prebuilds->seen.erase(mark);
+			prebuilds->full.fetch_add(1, std::memory_order_relaxed);
+			return;
+		}
+		prebuilds->pending++;
+		prebuilds->by_pair.emplace(PrebuildPair(vs_hash, ps_hash), job);
+	}
+	prebuilds->queued.fetch_add(1, std::memory_order_relaxed);
+	struct Inputs {
+		std::vector<StageIn>                                        stages;
+		HW::Context                                                 ctx;
+		HW::UserConfig                                              user_config;
+		std::array<RenderColorInfo, RENDER_COLOR_ATTACHMENTS_MAX>   colors {};
+		uint32_t                                                    colors_ok = 0, color_output_mask = 0, push_start = 0;
+		RenderDepthInfo                                             depth {};
+		bool                                                        depth_ok = false, restart = false, ps_active = false;
+		vk::PrimitiveTopology                                       topology {};
+		ShaderVertexInputInfo                                       vertex;
+		ShaderPixelInputInfo                                        pixel;
+	};
+	auto in              = std::make_shared<Inputs>(Inputs {.stages = std::move(stages), .ctx = ctx, .user_config = user_config});
+	std::copy(colors_by_slot.begin(), colors_by_slot.end(), in->colors.begin());
+	in->colors_ok         = colors_ok;
+	in->color_output_mask = color_output_mask;
+	in->push_start        = results.push_start;
+	in->depth             = depth;
+	in->depth_ok          = depth_ok;
+	in->restart           = restart;
+	in->ps_active         = ps_active;
+	in->topology          = topology;
+	in->vertex            = vertex_info[0];
+	in->vertex.stage      = {};
+	if (ps_active) {
+		in->pixel       = *ps_input_info;
+		in->pixel.stage = {};
+	}
+	{
+		const std::lock_guard lock(m_ahead_workers_mutex);
+		if (m_table_workers == nullptr) m_table_workers = std::make_unique<TableCompileWorkers>(TableAsyncThreads());
+	}
+	m_table_workers->Push([this, prebuilds, job, in] {
+		const auto finish = [&](std::atomic<uint64_t>* counter) {
+			if (counter != nullptr) counter->fetch_add(1, std::memory_order_relaxed);
+			if (job->pipeline == nullptr) {
+				for (auto module: job->modules) m_precompiler->DestroyModule(module);
+				job->modules.clear();
+			}
+			{
+				std::lock_guard lock(prebuilds->mutex);
+				prebuilds->pending--;
+			}
+			job->state.store(2, std::memory_order_release);
+			job->state.notify_all();
+		};
+		uint8_t expected = 0;
+		if (!job->state.compare_exchange_strong(expected, 1)) {
+			std::lock_guard lock(prebuilds->mutex);
+			prebuilds->pending--;
+			return;
+		}
+		const auto begin = std::chrono::steady_clock::now();
+		uint32_t   cursor = in->push_start;
+		std::array<uint64_t, 2> keys {};
+		std::array<uint64_t, 2> spirv {};
+		std::array<vk::ShaderModule, 2> modules {};
+		uint32_t vi = 0, pi = 1;
+		for (uint32_t i = 0; i < in->stages.size(); i++) {
+			auto& s   = in->stages[i];
+			auto& rec = s.record;
+			rec.push_data_start = cursor;
+			if (rec.stage == ShaderType::Pixel) {
+				pi = i;
+			} else {
+				vi = i;
+			}
+			if (s.first_use) {
+				const bool prepared = m_precompiler->PrepareFirstUseStage(
+				    rec, s.base, [](const ShaderRecompiler::IR::ResourcePlan& plan, PrecompileStageRecord& record) {
+					    if (record.stage == ShaderType::Vertex) {
+						    record.vertex.indirect_draw_resource_sgprs = IndirectDrawSgprsFeedResources(plan, record.vertex.indirect_draw);
+					    }
+				    });
+				if (!prepared) return finish(&prebuilds->plan_fail);
+			}
+			job->infos[i] = std::make_unique<ShaderRecompiler::IR::CompiledShaderInfo>();
+			if (!m_precompiler->CompilePrebuildStage(rec, modules[i], *job->infos[i], spirv[i])) {
+				if (modules[i] != nullptr) job->modules.push_back(modules[i]);
+				return finish(&prebuilds->stage_fail);
+			}
+			job->modules.push_back(modules[i]);
+			keys[i] = rec.Key();
+			job->infos[i]->bindings.AdvancePushData(cursor);
+		}
+		const bool ps_active = in->ps_active;
+		job->no_resources    = std::make_unique<ShaderRecompiler::IR::ResourceSnapshot>();
+		ShaderVertexInputInfo vertex = in->stages[vi].record.vertex;
+		vertex.stage                 = {.program = job->infos[vi].get(), .resources = job->no_resources.get()};
+		ShaderPixelInputInfo pixel   = in->pixel;
+		if (ps_active) {
+			pixel       = in->stages[pi].record.pixel;
+			pixel.stage = {.program = job->infos[pi].get(), .resources = job->no_resources.get()};
+		}
+		uint32_t mrt_mask = 0, objprim_mask = 0;
+		if (ps_active) {
+			for (const auto& output: job->infos[pi]->info.outputs) {
+				if (output.kind == ShaderRecompiler::IR::StageOutputKind::Mrt ||
+				    output.kind == ShaderRecompiler::IR::StageOutputKind::ObjectPrimitiveId) {
+					mrt_mask |= 1u << output.location;
+				} else if (output.kind == ShaderRecompiler::IR::StageOutputKind::ObjPrimId) {
+					objprim_mask |= 1u << output.location;
+				}
+			}
+		}
+		mrt_mask = (mrt_mask & in->color_output_mask) | objprim_mask;
+		std::array<RenderColorInfo, RENDER_COLOR_ATTACHMENTS_MAX> colors {};
+		uint32_t                                                  color_count = 0;
+		for (uint32_t target = 0; target < RENDER_COLOR_ATTACHMENTS_MAX; target++) {
+			if ((mrt_mask & (1u << target)) == 0) continue;
+			if ((in->colors_ok & (1u << target)) == 0) return finish(&prebuilds->key_fail);
+			colors[color_count++] = in->colors[target];
+		}
+		if (!in->depth_ok) return finish(&prebuilds->key_fail);
+		GraphicsPrograms programs;
+		programs.vertex[0] = {.id = ~uint64_t {0} - 5u, .module = modules[vi]};
+		if (ps_active) programs.pixel = {.id = ~uint64_t {0} - 6u, .module = modules[pi]};
+		t_describe_soft   = true;
+		t_describe_failed = false;
+		const auto key = MakeGraphicsPipelineKeyFrom(std::span {colors.data(), color_count}, in->depth,
+		                                             std::span<const ShaderVertexInputInfo>(&vertex, 1), in->ctx, in->user_config,
+		                                             ps_active ? &pixel : nullptr, in->topology, in->restart, programs, true);
+		t_describe_soft = false;
+		if (std::exchange(t_describe_failed, false)) return finish(&prebuilds->key_fail);
+		auto pipeline = std::make_unique<Pipeline>();
+		CreatePipelineInternal(m_graphics, *pipeline, key.rendering, key.vertex_input, std::span<const ShaderVertexInputInfo>(&vertex, 1),
+		                       ps_active ? &pixel : nullptr, programs, key.static_params, m_driver_cache);
+		if (pipeline->pipeline == nullptr || pipeline->pipeline_layout == nullptr) {
+			if (pipeline->pipeline != nullptr) m_graphics.device.destroyPipeline(pipeline->pipeline, nullptr);
+			if (pipeline->pipeline_layout != nullptr) m_graphics.device.destroyPipelineLayout(pipeline->pipeline_layout, nullptr);
+			if (pipeline->descriptor_set_layout != nullptr) m_graphics.device.destroyDescriptorSetLayout(pipeline->descriptor_set_layout, nullptr);
+			return finish(&prebuilds->create_fail);
+		}
+		job->record.vertex[0]     = keys[vi];
+		job->record.pixel         = ps_active ? keys[pi] : 0u;
+		job->record.rendering     = key.rendering;
+		job->record.vertex_input  = key.vertex_input;
+		job->record.static_params = key.static_params;
+		job->vs_spirv             = spirv[vi];
+		job->ps_spirv             = ps_active ? spirv[pi] : 0u;
+		job->pipeline             = std::move(pipeline);
+		prebuilds->build_us.fetch_add(static_cast<uint64_t>(MillisecondsSince(begin) * 1000.0), std::memory_order_relaxed);
+		finish(&prebuilds->built);
+	});
+}
+
+void PipelineCache::ReportFirstUsePrebuild() const {
+	const auto prebuilds = m_prebuilds;
+	if (prebuilds == nullptr || CompileJobsMode() < 3u) return;
+	const auto u = [](const std::atomic<uint64_t>& v) { return static_cast<unsigned long long>(v.load(std::memory_order_relaxed)); };
+	std::fprintf(stderr,
+	             "PERF first_use_prebuild mode=%u queued=%llu full=%llu built=%llu build_ms=%.0f fail[plan|stage|key|create]=%llu|%llu|%llu|%llu "
+	             "adopted=%llu check_match=%llu waited=%llu wait_ms=%.0f cancelled=%llu absent=%llu "
+	             "differ[vs_key|ps_key|rendering|vertex_input|static|spirv]=%llu|%llu|%llu|%llu|%llu|%llu\n",
+	             CompileJobsMode(), u(prebuilds->queued), u(prebuilds->full), u(prebuilds->built),
+	             static_cast<double>(u(prebuilds->build_us)) / 1000.0, u(prebuilds->plan_fail), u(prebuilds->stage_fail),
+	             u(prebuilds->key_fail), u(prebuilds->create_fail), u(prebuilds->adopted), u(prebuilds->check_match),
+	             u(prebuilds->waited), static_cast<double>(u(prebuilds->wait_us)) / 1000.0, u(prebuilds->cancelled),
+	             u(prebuilds->absent), u(prebuilds->differ[0]), u(prebuilds->differ[1]), u(prebuilds->differ[2]),
+	             u(prebuilds->differ[3]), u(prebuilds->differ[4]), u(prebuilds->differ[5]));
+	std::fflush(stderr);
+}
+
+std::unique_ptr<PipelineCache::Pipeline> PipelineCache::TakeFirstUsePrebuild(const PrecompileGraphicsRecord& record, uint64_t vs_hash,
+                                                                             uint64_t ps_hash, uint64_t vs_spirv, uint64_t ps_spirv) {
+	auto prebuilds = m_prebuilds;
+	if (prebuilds == nullptr) return nullptr;
+	std::vector<std::shared_ptr<FirstUsePrebuilds::Job>> candidates;
+	{
+		std::lock_guard lock(prebuilds->mutex);
+		const auto [first, last] = prebuilds->by_pair.equal_range(PrebuildPair(vs_hash, ps_hash));
+		for (auto it = first; it != last; ++it) candidates.push_back(it->second);
+	}
+	if (candidates.empty()) {
+		prebuilds->absent.fetch_add(1, std::memory_order_relaxed);
+		return nullptr;
+	}
+	const bool check = CompileJobsMode() == 4u;
+	for (auto& job: candidates) {
+		uint8_t state = job->state.load(std::memory_order_acquire);
+		if (state == 0) {
+			uint8_t expected = 0;
+			if (job->state.compare_exchange_strong(expected, 3)) {
+				prebuilds->cancelled.fetch_add(1, std::memory_order_relaxed);
+				continue;
+			}
+			state = expected;
+		}
+		if (state == 1) {
+			const auto wait_begin = std::chrono::steady_clock::now();
+			while ((state = job->state.load(std::memory_order_acquire)) == 1) job->state.wait(1, std::memory_order_acquire);
+			prebuilds->waited.fetch_add(1, std::memory_order_relaxed);
+			prebuilds->wait_us.fetch_add(static_cast<uint64_t>(MillisecondsSince(wait_begin) * 1000.0), std::memory_order_relaxed);
+		}
+	}
+	std::shared_ptr<FirstUsePrebuilds::Job> chosen;
+	int                                     best_differ = -1;
+	for (auto& job: candidates) {
+		if (job->state.load(std::memory_order_acquire) != 2 || job->pipeline == nullptr) continue;
+		const auto& r = job->record;
+		int         d = -1;
+		if (r.vertex != record.vertex) {
+			d = 0;
+		} else if (r.pixel != record.pixel) {
+			d = 1;
+		} else if (!(r.rendering == record.rendering)) {
+			d = 2;
+		} else if (!(r.vertex_input == record.vertex_input)) {
+			d = 3;
+		} else if (!(r.static_params == record.static_params)) {
+			d = 4;
+		} else if (job->vs_spirv != vs_spirv || job->ps_spirv != ps_spirv || vs_spirv == 0u) {
+			d = 5;
+		}
+		if (d < 0) {
+			chosen = job;
+			break;
+		}
+		if (best_differ < 0 || d > best_differ) best_differ = d;
+	}
+	if (chosen == nullptr) {
+		if (best_differ >= 0) {
+			prebuilds->differ[static_cast<size_t>(best_differ)].fetch_add(1, std::memory_order_relaxed);
+		} else {
+			prebuilds->absent.fetch_add(1, std::memory_order_relaxed);
+		}
+		return nullptr;
+	}
+	std::unique_ptr<Pipeline> pipeline;
+	{
+		std::lock_guard lock(prebuilds->mutex);
+		const auto [first, last] = prebuilds->by_pair.equal_range(PrebuildPair(vs_hash, ps_hash));
+		for (auto it = first; it != last; ++it) {
+			if (it->second == chosen) {
+				prebuilds->by_pair.erase(it);
+				break;
+			}
+		}
+		pipeline = std::move(chosen->pipeline);
+		if (!check && pipeline->gpl != nullptr) prebuilds->kept.push_back(chosen);
+	}
+	if (check) {
+		prebuilds->check_match.fetch_add(1, std::memory_order_relaxed);
+		if (pipeline->pipeline != nullptr) m_graphics.device.destroyPipeline(pipeline->pipeline, nullptr);
+		if (pipeline->pipeline_layout != nullptr) m_graphics.device.destroyPipelineLayout(pipeline->pipeline_layout, nullptr);
+		if (pipeline->descriptor_set_layout != nullptr) m_graphics.device.destroyDescriptorSetLayout(pipeline->descriptor_set_layout, nullptr);
+		for (auto module: chosen->modules) m_precompiler->DestroyModule(module);
+		chosen->modules.clear();
+		return nullptr;
+	}
+	if (pipeline->gpl == nullptr) {
+		for (auto module: chosen->modules) m_precompiler->DestroyModule(module);
+		chosen->modules.clear();
+	}
+	prebuilds->adopted.fetch_add(1, std::memory_order_relaxed);
+	return pipeline;
 }
 
 void PipelineCache::QueueAheadGraphicsPipeline(const GraphicsPipelineKey& key, std::span<const ShaderVertexInputInfo> vertex_info,

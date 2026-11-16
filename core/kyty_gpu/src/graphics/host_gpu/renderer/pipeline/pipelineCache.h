@@ -93,6 +93,7 @@ inline thread_local uint32_t t_compute_program_path = 0;
 
 struct GraphicContext;
 class ShaderPrecompiler;
+struct PrecompileGraphicsRecord;
 class PrecompileWarmList;
 struct RenderColorInfo;
 struct RenderDepthInfo;
@@ -402,11 +403,25 @@ public:
 	[[nodiscard]] bool PeekStandIn(ResolvedStages& results);
 	void QueueAheadGraphicsMiss(const ResolvedStages& results, const GraphicsPipelineKey& key,
 	                            std::span<const ShaderVertexInputInfo> vertex_info, const ShaderPixelInputInfo* ps_input_info);
+	// KYTY_PERF_COMPILE_JOBS>=3: a draw whose stages include one without a program (results.first_use), planned on a
+	// worker: its stages compiled, its key made from the copied registers and the targets described for every slot
+	// (colors_by_slot[slot], valid where colors_ok has the bit), its pipeline created; the GPU thread takes it when the
+	// pipeline it is about to create has exactly the same stage records and state (=4: both made and compared).
+	[[nodiscard]] static bool FirstUsePrebuildWanted(const ResolvedStages& results);
+	void QueueFirstUsePrebuild(const ResolvedStages& results, std::span<const ShaderVertexInputInfo> vertex_info,
+	                           const ShaderPixelInputInfo* ps_input_info, const HW::Context& ctx, const HW::UserConfig& user_config,
+	                           std::span<const RenderColorInfo> colors_by_slot, uint32_t colors_ok, uint32_t color_output_mask,
+	                           const RenderDepthInfo& depth, bool depth_ok, vk::PrimitiveTopology topology, bool restart);
 
 private:
 	Pipeline* TakeAheadGraphicsPipeline(const GraphicsPipelineKey& key);
+	std::unique_ptr<Pipeline> TakeFirstUsePrebuild(const PrecompileGraphicsRecord& record, uint64_t vs_hash, uint64_t ps_hash,
+	                                               uint64_t vs_spirv, uint64_t ps_spirv);
 	std::mutex m_ahead_workers_mutex;
 	std::unordered_set<uint64_t> m_ahead_miss_seen;
+	struct FirstUsePrebuilds;
+	std::shared_ptr<FirstUsePrebuilds> m_prebuilds;
+	void ReportFirstUsePrebuild() const;
 
 	GraphicContext&               m_graphics;
 	std::unique_ptr<ProgramCache> m_program_cache;

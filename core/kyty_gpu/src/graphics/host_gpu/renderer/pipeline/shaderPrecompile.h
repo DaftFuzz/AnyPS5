@@ -15,6 +15,7 @@
 #include <deque>
 #include <cstdio>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -344,6 +345,14 @@ public:
 	void EnqueueFirstUse(PrecompileStageRecord record, uint64_t shader_base, uint64_t program);
 	void EnqueueGraphicsMiss(std::unique_ptr<PrecompileGraphicsMiss> miss);
 	void ReportRuntimePerf() const;
+	// KYTY_PERF_COMPILE_JOBS>=3 (any thread): a graphics stage of a program the GPU thread has not translated yet, its
+	// specialization materialized ahead from guest memory as the GPU thread's first use would (the journal's null share
+	// seeded); `adjust` runs on the record after the plan is extracted. Then its module, info and SPIR-V hash.
+	bool PrepareFirstUseStage(PrecompileStageRecord& record, uint64_t shader_base,
+	                          const std::function<void(const ShaderRecompiler::IR::ResourcePlan&, PrecompileStageRecord&)>& adjust);
+	bool CompilePrebuildStage(const PrecompileStageRecord& record, vk::ShaderModule& module,
+	                          ShaderRecompiler::IR::CompiledShaderInfo& info, uint64_t& spirv_hash);
+	void DestroyModule(vk::ShaderModule module);
 
 private:
 	struct RuntimeJob {
@@ -414,7 +423,7 @@ private:
 	// `key`: the record's key. `need_module`: false for a warm job's permutation (no pipeline is made from it).
 	bool CompileModule(const PrecompileStageRecord& record, uint64_t key, bool need_module, vk::ShaderModule& module,
 	                   ShaderRecompiler::IR::CompiledShaderInfo& info, size_t& spirv_words, bool forced_lds = false,
-	                   bool* replaced = nullptr);
+	                   bool* replaced = nullptr, uint64_t* spirv_hash_out = nullptr);
 	void Compile(const PrecompileStageRecord& record, uint64_t key, bool warm, bool forced_lds = false);
 	// The shader reuse (workers). `any_size`: wanted also with the store at its budget.
 	[[nodiscard]] bool ReuseWanted(uint64_t key, bool any_size = false) const;

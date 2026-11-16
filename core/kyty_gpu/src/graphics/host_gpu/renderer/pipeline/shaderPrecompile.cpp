@@ -2769,7 +2769,7 @@ void ShaderPrecompiler::ReportDone(std::vector<vk::ShaderModule>& unused) {
 // permutation already.
 bool ShaderPrecompiler::CompileModule(const PrecompileStageRecord& record, uint64_t key, bool need_module,
                                       vk::ShaderModule& module, ShaderRecompiler::IR::CompiledShaderInfo& info,
-                                      size_t& spirv_words, bool forced_lds, bool* replaced) {
+                                      size_t& spirv_words, bool forced_lds, bool* replaced, uint64_t* spirv_hash_out) {
 	const Common::StartupTrace::Scope startup_scope(Common::StartupTrace::Counter::ShaderBackground);
 	const auto make_module = [&](const std::vector<uint32_t>& spirv) -> vk::ShaderModule {
 		if (Common::ShaderEnv::Read("KYTY_DIAG_SPIRV_REPLACE") != nullptr) {
@@ -2840,6 +2840,7 @@ bool ShaderPrecompiler::CompileModule(const PrecompileStageRecord& record, uint6
 		} else {
 			(disk_plan.has_value() ? g_reuse.disk_plan_hits : g_reuse.disk_hits).fetch_add(1, std::memory_order_relaxed);
 			spirv_words = disk_spirv.size();
+			if (spirv_hash_out != nullptr) *spirv_hash_out = XXH3_64bits(disk_spirv.data(), disk_spirv.size() * sizeof(uint32_t));
 			if (need_module) {
 				module = make_module(disk_spirv);
 				if (module == nullptr) {
@@ -2951,6 +2952,7 @@ bool ShaderPrecompiler::CompileModule(const PrecompileStageRecord& record, uint6
 		g_reuse.plan_us.fetch_add(static_cast<uint64_t>((translate_ms - translated_ms) * 1000.0),
 		                          std::memory_order_relaxed);
 		spirv_words = disk_spirv.size();
+		if (spirv_hash_out != nullptr) *spirv_hash_out = XXH3_64bits(disk_spirv.data(), disk_spirv.size() * sizeof(uint32_t));
 		if (need_module) {
 			module = make_module(disk_spirv);
 			if (module == nullptr) {
@@ -2978,6 +2980,7 @@ bool ShaderPrecompiler::CompileModule(const PrecompileStageRecord& record, uint6
 	g_reuse.compile_us.fetch_add(static_cast<uint64_t>(compile_ms * 1000.0), std::memory_order_relaxed);
 	spirv_words           = result.spirv.size();
 	const auto spirv_hash = XXH3_64bits(result.spirv.data(), result.spirv.size() * sizeof(uint32_t));
+	if (spirv_hash_out != nullptr) *spirv_hash_out = spirv_hash;
 	if (!forced_lds && record.revision == Revision() && record.spirv_hash != 0u && spirv_hash != record.spirv_hash) {
 		// The same build made other SPIR-V from the recorded inputs: an input is missing from the record (or a
 		// SPIR-V-changing KYTY_ switch differs from the recording run).
@@ -3481,6 +3484,77 @@ bool ShaderPrecompiler::MaterializeFirstUse(PrecompileStageRecord& record, uint6
 	ShaderRecompiler::IR::PeekNullFormattedShare(plan, plan.scratch[Slot].null_share_kinds, specialization);
 	record.specialization = std::move(specialization);
 	return true;
+}
+
+bool ShaderPrecompiler::PrepareFirstUseStage(
+    PrecompileStageRecord& record, uint64_t shader_base,
+    const std::function<void(const ShaderRecompiler::IR::ResourcePlan&, PrecompileStageRecord&)>& adjust) {
+	ShaderVertexInputInfo vertex = record.vertex;
+	ShaderPixelInputInfo  pixel  = record.pixel;
+	ShaderStageInputInfo  stage_input {};
+	if (record.stage == ShaderType::Pixel) {
+		stage_input.pixel = &pixel;
+	} else {
+		stage_input.vertex = &vertex;
+	}
+	ShaderRecompiler::CompileOptions options;
+	options.stage       = record.stage;
+	options.shader_hash = record.shader_hash;
+	options.user_data   = record.user_data;
+	options.back_code   = record.back_code;
+	options.input_info  = stage_input;
+	SetStageCompileOptions(options);
+	static const auto profile = ShaderCompileProfile(m_graphics);
+	options.profile           = &profile;
+	auto source               = ShaderRecompiler::PrepareShaderSource(record.code, options);
+	if (!source.calls.empty() || source.unsupported_call_pc != UINT32_MAX) return false;
+	auto translated = ShaderRecompiler::TranslateProgram(source.decoded, options);
+	if (uint32_t bad_index = 0, input_count = 0;
+	    !ShaderRecompiler::IR::StageInputsFit(translated.program, stage_input, bad_index, input_count)) {
+		return false;
+	}
+	auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+	{
+		const PrecompileReuseIdentity identity = {.stage           = record.stage,
+		                                          .shader_hash     = record.shader_hash,
+		                                          .user_data_count = static_cast<uint32_t>(record.user_data.size()),
+		                                          .code            = record.code,
+		                                          .back_code       = record.back_code,
+		                                          .static_key      = record.static_key,
+		                                          .lds_storage     = false};
+		std::vector<std::array<uint32_t, 2>> journal_live;
+		std::vector<uint8_t>                 journal_multi;
+		if (NullShareJournal(identity, plan.info.buffers.size(), journal_live, journal_multi)) {
+			ShaderRecompiler::IR::SeedNullFormattedShare(plan, journal_live, journal_multi);
+		}
+	}
+	if (adjust) adjust(plan, record);
+	ShaderRecompiler::IR::SrtRuntime runtime {
+	    .user_data                  = std::span<const uint32_t>(record.user_data),
+	    .shader_base                = shader_base,
+	    .read_specialization_memory = &ShaderRecompiler::IR::AheadReadMemory,
+	};
+	constexpr uint32_t Slot                    = 5;
+	ShaderRecompiler::IR::t_ahead_scratch_slot = Slot;
+	ShaderRecompiler::IR::ResourceSnapshot       snapshot;
+	ShaderRecompiler::IR::ResourceSpecialization specialization;
+	ShaderRecompiler::IR::ReadLog                log;
+	if (!ShaderRecompiler::IR::MaterializeResourcesAhead(plan, runtime, snapshot, specialization, log)) return false;
+	ShaderRecompiler::IR::PeekNullFormattedShare(plan, plan.scratch[Slot].null_share_kinds, specialization);
+	record.specialization = std::move(specialization);
+	return true;
+}
+
+bool ShaderPrecompiler::CompilePrebuildStage(const PrecompileStageRecord& record, vk::ShaderModule& module,
+                                             ShaderRecompiler::IR::CompiledShaderInfo& info, uint64_t& spirv_hash) {
+	size_t words = 0;
+	spirv_hash   = 0;
+	if (!CompileModule(record, record.Key(), true, module, info, words, false, nullptr, &spirv_hash)) return false;
+	return module != nullptr && spirv_hash != 0u;
+}
+
+void ShaderPrecompiler::DestroyModule(vk::ShaderModule module) {
+	if (module != nullptr) m_graphics.device.destroyShaderModule(module, nullptr);
 }
 
 void ShaderPrecompiler::EnqueueGraphicsMiss(std::unique_ptr<PrecompileGraphicsMiss> miss) {
