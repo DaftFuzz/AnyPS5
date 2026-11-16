@@ -4239,7 +4239,7 @@ void PipelineCache::QueueFirstUsePrebuild(const ResolvedStages& results, std::sp
 		const auto format = colors_by_slot[slot].desc.view_info.format;
 		mark = mark * 0x9e3779b97f4a7c15ull ^ (static_cast<uint64_t>(format) << 8u) ^ slot;
 	}
-	mark ^= static_cast<uint64_t>(depth.format) << 20u;
+	mark ^= static_cast<uint64_t>(depth.desc.view_info.format) << 20u;
 	auto prebuilds = m_prebuilds;
 	if (prebuilds == nullptr) return;
 	auto job       = std::make_shared<FirstUsePrebuilds::Job>();
