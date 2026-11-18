@@ -107,13 +107,18 @@ namespace Common::EnvRead {
 	return mode;
 }
 
-// KYTY_PERF_GPL_SPLIT=1 with KYTY_PERF_GPL: graphics descriptors in one set per stage group (set 0 the vertex stages,
+// KYTY_PERF_GPL_SPLIT=force with KYTY_PERF_GPL: graphics descriptors in one set per stage group (set 0 the vertex stages,
 // set 1 the pixel stage, set 2 the bindless table), push constants for every graphics stage, so a stage library depends
 // only on its own bindings.
 [[nodiscard]] inline bool GplSplit() {
 	static const bool on = [] {
-		const char* value = ShaderEnv::Read("KYTY_PERF_GPL_SPLIT");
-		return Gpl() != 0u && value != nullptr && value[0] == '1';
+		const char* value  = ShaderEnv::Read("KYTY_PERF_GPL_SPLIT");
+		const bool  forced = value != nullptr && std::strcmp(value, "force") == 0;
+		if (Gpl() != 0u && value != nullptr && value[0] == '1') {
+			std::fprintf(stderr, "PERF_GPL_SPLIT=1 ignored: split set layouts need independent sets, and with them the GPU reads "
+			                     "outside its descriptor memory (device lost); KYTY_PERF_GPL_SPLIT=force still turns it on\n");
+		}
+		return Gpl() != 0u && forced;
 	}();
 	return on;
 }
